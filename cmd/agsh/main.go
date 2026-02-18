@@ -131,11 +131,14 @@ func main() {
 	}
 }
 
-// runSubtaskDispatcher subscribes to SubTask and ExecutionResult messages on the bus.
-// For each SubTask it spawns a paired Executor+AgentValidator goroutine set.
-// abortTaskCh receives task IDs to cancel; the matching executor/agentval goroutines are
-// stopped immediately when a task abort is requested.
+// runSubtaskDispatcher subscribes to DispatchManifest, SubTask, and ExecutionResult
+// messages on the bus. Subtasks are dispatched in sequence-number order: all subtasks
+// sharing the same sequence number run in parallel, and the next sequence group is only
+// started once the current group fully completes. Outputs from each completed group are
+// appended to the context of the next group so later subtasks can see earlier results
+// (e.g. a "locate file" subtask feeds its path to an "extract audio" subtask).
 func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Executor, av *agentval.AgentValidator, abortTaskCh <-chan string) {
+	manifestCh := b.Subscribe(types.MsgDispatchManifest)
 	subTaskCh := b.Subscribe(types.MsgSubTask)
 	execResultCh := b.Subscribe(types.MsgExecutionResult)
 
@@ -144,15 +147,95 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 		correctionCh chan types.CorrectionSignal
 	}
 
-	// Per-task cancellable contexts so we can abort all goroutines for a given task.
-	type taskCtxEntry struct {
-		ctx    context.Context
-		cancel context.CancelFunc
+	// taskDispatch tracks the sequential dispatch state for one parent task.
+	type taskDispatch struct {
+		ctx        context.Context
+		cancel     context.CancelFunc
+		expected   int                     // total subtasks from manifest (-1 = not yet received)
+		bySeq      map[int][]types.SubTask // sequence number -> subtasks
+		inFlight   int                     // subtasks currently executing
+		currentSeq int                     // sequence group now running (0 = not started)
+		prevOutputs []string               // outputs collected from completed sequence groups
 	}
-	taskCtxs := make(map[string]*taskCtxEntry) // parentTaskID -> entry
 
+	// completionSignal is sent by each agentval goroutine on finish.
+	type completionSignal struct {
+		parentTaskID string
+		output       any
+	}
+	completionCh := make(chan completionSignal, 32)
+
+	dispatches := make(map[string]*taskDispatch) // parentTaskID -> dispatch state
 	var mu sync.Mutex
-	states := make(map[string]*subtaskState) // subtask_id -> state
+	states := make(map[string]*subtaskState) // subtaskID -> executor/agentval channels
+
+	// spawnSubtask launches one executor+agentval pair.
+	spawnSubtask := func(td *taskDispatch, st types.SubTask) {
+		resultC := make(chan types.ExecutionResult, 8)
+		correctionC := make(chan types.CorrectionSignal, 8)
+		mu.Lock()
+		states[st.SubTaskID] = &subtaskState{resultCh: resultC, correctionCh: correctionC}
+		mu.Unlock()
+
+		log.Printf("[DISPATCHER] spawning executor+agentval for subtask=%s (seq=%d)", st.SubTaskID, st.Sequence)
+		subTask := st
+		go exec.RunSubTask(td.ctx, subTask, correctionC)
+		go func() {
+			outcome := av.Run(td.ctx, subTask, resultC, correctionC)
+			mu.Lock()
+			delete(states, subTask.SubTaskID)
+			mu.Unlock()
+			completionCh <- completionSignal{parentTaskID: subTask.ParentTaskID, output: outcome.Output}
+		}()
+		td.inFlight++
+	}
+
+	// dispatchSeq launches all subtasks for a given sequence number,
+	// enriching their Context with outputs from previous sequences.
+	dispatchSeq := func(td *taskDispatch, seq int) {
+		subtasks := td.bySeq[seq]
+		td.currentSeq = seq
+		prevCtx := ""
+		if len(td.prevOutputs) > 0 {
+			prevCtx = "\n\nOutputs from prior steps (use these directly — do not re-run discovery):\n" +
+				strings.Join(td.prevOutputs, "\n---\n")
+		}
+		log.Printf("[DISPATCHER] dispatching sequence=%d (%d subtasks)", seq, len(subtasks))
+		for _, st := range subtasks {
+			if prevCtx != "" {
+				st.Context = st.Context + prevCtx
+			}
+			spawnSubtask(td, st)
+		}
+	}
+
+	// minSeqAbove returns the smallest sequence number strictly above floor, or -1.
+	minSeqAbove := func(td *taskDispatch, floor int) int {
+		best := -1
+		for seq := range td.bySeq {
+			if seq > floor && (best < 0 || seq < best) {
+				best = seq
+			}
+		}
+		return best
+	}
+
+	// tryStart dispatches the first sequence group once all subtasks are buffered.
+	tryStart := func(td *taskDispatch) {
+		if td.expected <= 0 || td.inFlight > 0 || td.currentSeq > 0 {
+			return
+		}
+		total := 0
+		for _, sts := range td.bySeq {
+			total += len(sts)
+		}
+		if total < td.expected {
+			return // still waiting for subtask messages
+		}
+		if first := minSeqAbove(td, 0); first >= 0 {
+			dispatchSeq(td, first)
+		}
+	}
 
 	for {
 		select {
@@ -163,11 +246,31 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 			if !ok {
 				return
 			}
-			if entry, found := taskCtxs[taskID]; found {
+			if td, found := dispatches[taskID]; found {
 				log.Printf("[DISPATCHER] aborting task=%s", taskID)
-				entry.cancel()
-				delete(taskCtxs, taskID)
+				td.cancel()
+				delete(dispatches, taskID)
 			}
+
+		case msg, ok := <-manifestCh:
+			if !ok {
+				return
+			}
+			raw, _ := json.Marshal(msg.Payload)
+			var manifest types.DispatchManifest
+			if err := json.Unmarshal(raw, &manifest); err != nil {
+				log.Printf("[DISPATCHER] ERROR: bad DispatchManifest payload: %v", err)
+				continue
+			}
+			td, exists := dispatches[manifest.TaskID]
+			if !exists {
+				tCtx, tCancel := context.WithCancel(ctx)
+				td = &taskDispatch{ctx: tCtx, cancel: tCancel, bySeq: make(map[int][]types.SubTask)}
+				dispatches[manifest.TaskID] = td
+			}
+			td.expected = len(manifest.SubTaskIDs)
+			log.Printf("[DISPATCHER] manifest task_id=%s expecting %d subtasks", manifest.TaskID, td.expected)
+			tryStart(td)
 
 		case msg, ok := <-subTaskCh:
 			if !ok {
@@ -178,38 +281,42 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 				log.Printf("[DISPATCHER] ERROR: bad SubTask payload: %v", err)
 				continue
 			}
-
-			// Get or create a cancellable context for this parent task.
-			entry, exists := taskCtxs[st.ParentTaskID]
+			td, exists := dispatches[st.ParentTaskID]
 			if !exists {
 				tCtx, tCancel := context.WithCancel(ctx)
-				entry = &taskCtxEntry{ctx: tCtx, cancel: tCancel}
-				taskCtxs[st.ParentTaskID] = entry
+				td = &taskDispatch{ctx: tCtx, cancel: tCancel, bySeq: make(map[int][]types.SubTask)}
+				dispatches[st.ParentTaskID] = td
 			}
-			taskCtx := entry.ctx
+			td.bySeq[st.Sequence] = append(td.bySeq[st.Sequence], st)
+			tryStart(td)
 
-			resultC := make(chan types.ExecutionResult, 8)
-			correctionC := make(chan types.CorrectionSignal, 8)
-
-			mu.Lock()
-			states[st.SubTaskID] = &subtaskState{
-				resultCh:     resultC,
-				correctionCh: correctionC,
+		case sig, ok := <-completionCh:
+			if !ok {
+				return
 			}
-			mu.Unlock()
-
-			log.Printf("[DISPATCHER] spawning executor+agentval for subtask=%s", st.SubTaskID)
-
-			// Capture for goroutine
-			subTask := st
-			go exec.RunSubTask(taskCtx, subTask, correctionC)
-			go func() {
-				av.Run(taskCtx, subTask, resultC, correctionC)
-				// Clean up state after AgentValidator completes
-				mu.Lock()
-				delete(states, subTask.SubTaskID)
-				mu.Unlock()
-			}()
+			td := dispatches[sig.parentTaskID]
+			if td == nil {
+				continue
+			}
+			// Collect output for context injection into next sequence.
+			if sig.output != nil {
+				var s string
+				if raw, err := json.Marshal(sig.output); err == nil {
+					if json.Unmarshal(raw, &s) == nil && s != "" {
+						td.prevOutputs = append(td.prevOutputs, s)
+					} else {
+						td.prevOutputs = append(td.prevOutputs, string(raw))
+					}
+				}
+			}
+			td.inFlight--
+			if td.inFlight == 0 {
+				if next := minSeqAbove(td, td.currentSeq); next >= 0 {
+					dispatchSeq(td, next)
+				} else {
+					delete(dispatches, sig.parentTaskID)
+				}
+			}
 
 		case msg, ok := <-execResultCh:
 			if !ok {
@@ -220,16 +327,13 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 				log.Printf("[DISPATCHER] ERROR: bad ExecutionResult payload: %v", err)
 				continue
 			}
-
 			mu.Lock()
 			state, found := states[result.SubTaskID]
 			mu.Unlock()
-
 			if !found {
 				log.Printf("[DISPATCHER] WARNING: no state for subtask=%s (already completed?)", result.SubTaskID)
 				continue
 			}
-
 			select {
 			case state.resultCh <- result:
 			default:
