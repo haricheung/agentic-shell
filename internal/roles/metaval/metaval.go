@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -182,6 +183,16 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 	case "accept":
 		log.Printf("[R4b] task=%s ACCEPTED", taskID)
 
+		// Build meaningful tags from task intent for cross-task retrieval
+		intentTags := []string{"success", taskID}
+		if tracker.spec.Intent != "" {
+			for _, word := range strings.Fields(tracker.spec.Intent) {
+				if len(word) >= 4 {
+					intentTags = append(intentTags, strings.ToLower(strings.Trim(word, ".,;:!?")))
+				}
+			}
+		}
+
 		// Write to memory
 		entry := types.MemoryEntry{
 			EntryID:   uuid.New().String(),
@@ -189,7 +200,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 			Type:      "episodic",
 			Content:   v.MergedOutput,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Tags:      []string{"task", taskID},
+			Tags:      intentTags,
 		}
 		for _, o := range tracker.outcomes {
 			if o.Status == "matched" {
@@ -233,6 +244,41 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		m.mu.Lock()
 		m.replanCounts[taskID]++
 		m.mu.Unlock()
+
+		// Write a procedural memory entry so the planner can avoid the same mistakes
+		type failureLesson struct {
+			Lesson      string   `json:"lesson"`
+			GapSummary  string   `json:"gap_summary"`
+			FailedTasks []string `json:"failed_subtasks"`
+		}
+		lesson := failureLesson{
+			Lesson:      "Task failed: " + v.GapSummary + ". Avoid repeating the same approach.",
+			GapSummary:  v.GapSummary,
+			FailedTasks: failedIDs,
+		}
+		// Build tags from gap summary keywords for retrieval
+		tags := []string{"failure", "replan", taskID}
+		for _, word := range strings.Fields(v.GapSummary) {
+			if len(word) >= 4 {
+				tags = append(tags, strings.ToLower(strings.Trim(word, ".,;:!?")))
+			}
+		}
+		failEntry := types.MemoryEntry{
+			EntryID:   uuid.New().String(),
+			TaskID:    taskID,
+			Type:      "procedural",
+			Content:   lesson,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Tags:      tags,
+		}
+		m.b.Publish(types.Message{
+			ID:        uuid.New().String(),
+			Timestamp: time.Now().UTC(),
+			From:      types.RoleMetaVal,
+			To:        types.RoleMemory,
+			Type:      types.MsgMemoryWrite,
+			Payload:   failEntry,
+		})
 
 		rr := types.ReplanRequest{
 			TaskID:          taskID,

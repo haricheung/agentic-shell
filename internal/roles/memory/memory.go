@@ -68,10 +68,20 @@ func (s *Store) Write(entry types.MemoryEntry) error {
 	return s.save()
 }
 
-// Query returns entries matching taskID and/or tags. Simple substring matching for MVP.
-func (s *Store) Query(taskID, tags string) ([]types.MemoryEntry, error) {
+// Query returns entries matching taskID, tags, and/or a natural-language keyword query.
+// All provided filters are ANDed; an empty filter is a wildcard.
+// The Query field is matched as keywords against entry tags, task_id, and serialised content.
+func (s *Store) Query(taskID, tags, query string) ([]types.MemoryEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	// Pre-tokenise natural-language query into lowercase words
+	var keywords []string
+	for _, w := range strings.Fields(strings.ToLower(query)) {
+		if len(w) >= 3 { // skip short noise words
+			keywords = append(keywords, w)
+		}
+	}
 
 	var results []types.MemoryEntry
 	for _, e := range s.data {
@@ -90,6 +100,21 @@ func (s *Store) Query(taskID, tags string) ([]types.MemoryEntry, error) {
 				continue
 			}
 		}
+		if len(keywords) > 0 {
+			// Serialise the entry into a single string for keyword scanning
+			raw, _ := json.Marshal(e)
+			haystack := strings.ToLower(string(raw))
+			anyMatch := false
+			for _, kw := range keywords {
+				if strings.Contains(haystack, kw) {
+					anyMatch = true
+					break
+				}
+			}
+			if !anyMatch {
+				continue
+			}
+		}
 		results = append(results, e)
 	}
 	return results, nil
@@ -103,7 +128,22 @@ func (s *Store) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			// Drain any pending writes before exiting so one-shot mode doesn't lose data
+			for {
+				select {
+				case msg := <-writeCh:
+					entry, err := toMemoryEntry(msg.Payload)
+					if err == nil {
+						if err := s.Write(entry); err != nil {
+							log.Printf("[R5] ERROR: shutdown write failed: %v", err)
+						} else {
+							log.Printf("[R5] stored entry %s for task %s (shutdown flush)", entry.EntryID, entry.TaskID)
+						}
+					}
+				default:
+					return
+				}
+			}
 
 		case msg, ok := <-writeCh:
 			if !ok {
@@ -129,7 +169,7 @@ func (s *Store) Run(ctx context.Context) {
 				log.Printf("[R5] ERROR: bad MemoryQuery payload: %v", err)
 				continue
 			}
-			entries, err := s.Query(query.TaskID, query.Tags)
+			entries, err := s.Query(query.TaskID, query.Tags, query.Query)
 			if err != nil {
 				log.Printf("[R5] ERROR: query failed: %v", err)
 				entries = nil

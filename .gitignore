@@ -4,7 +4,7 @@
 *.png
 
 # Binaries
-agsh
+/agsh
 /bin/
 
 # Build artifacts

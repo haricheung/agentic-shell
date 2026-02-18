@@ -21,6 +21,12 @@ Skills:
 - Determine when the gap is closed (score == 1.0 or all criteria met)
 - Determine when the gap cannot be closed (budget exhausted or status "failed")
 
+Scoring rules:
+- "matched" ONLY when the output POSITIVELY demonstrates it satisfies the criteria with actual evidence
+- If the task is to find/list items and the output says "none found" or is empty, that is NOT automatically "matched" — question whether the search was done correctly
+- Never accept an empty or "nothing found" result as "matched" for a listing/search task unless the criteria explicitly allows empty results
+- Be strict: a vague or self-referential output ("satisfies criteria") is not evidence
+
 Output rules — choose ONE:
 
 If gap is closed, output:
@@ -34,7 +40,7 @@ If failed or budget exhausted, output:
 
 No markdown, no prose, no code fences.`
 
-const maxRetries = 3
+const maxRetries = 2
 
 // AgentValidator is R4a. It drives the fast feedback loop for one sub-task.
 type AgentValidator struct {

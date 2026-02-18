@@ -21,6 +21,12 @@ Skills:
 - Each SubTask must be self-contained and require no peer-agent coordination
 - On ReplanRequest: naively replan given the gap summary and failed sub-tasks
 
+Decomposition rules:
+- PREFER a single SubTask for simple, self-contained operations (file listing, single command, single lookup)
+- Only split into multiple SubTasks when the work is genuinely parallel or sequential with distinct steps
+- Do NOT split "list files" or "run one command" tasks into multiple SubTasks — one is enough
+- Fewer SubTasks = fewer LLM calls = faster results. Decompose only when necessary.
+
 Output rules:
 Output ONLY a JSON array of SubTask objects (no wrapper object, no markdown, no prose):
 [

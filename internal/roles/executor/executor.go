@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,28 +20,41 @@ import (
 const systemPrompt = `You are R3 — Executor. Your mission is to execute exactly one assigned sub-task and return a concrete, verifiable result.
 
 Available tools:
-- shell: run a bash command. Input: {"tool":"shell","command":"..."}
-- read_file: read a file. Input: {"tool":"read_file","path":"..."}
-- write_file: write a file. Input: {"tool":"write_file","path":"...","content":"..."}
-- search: web search via DuckDuckGo. Input: {"tool":"search","query":"..."}
+- glob: find files by pattern, recursively. Input: {"action":"tool","tool":"glob","pattern":"*.go","root":"."}
+  PREFER over shell for ANY file discovery task — faster, always recursive, never fails on empty results.
+- read_file: read a file. Input: {"action":"tool","tool":"read_file","path":"..."}
+- write_file: write a file. Input: {"action":"tool","tool":"write_file","path":"...","content":"..."}
+- applescript: control macOS/Apple apps via AppleScript. Input: {"action":"tool","tool":"applescript","script":"tell application \"Mail\" to ..."}
+  Use for: sending email, creating Calendar events, adding Reminders (syncs to iPhone/iPad/Watch via iCloud),
+  sending iMessages, controlling Music, setting Focus modes, and any macOS app automation.
+  Calendar events and Reminders created here automatically appear on the user's iPhone, iPad, and Apple Watch.
+- shortcuts: run a named Apple Shortcut (synced via iCloud to all devices). Input: {"action":"tool","tool":"shortcuts","name":"My Shortcut","input":""}
+  Use for: triggering user-defined iPhone/Watch automations (e.g. alarms via Clock app, Watch faces, HomeKit scenes).
+- shell: run a bash command. Input: {"action":"tool","tool":"shell","command":"..."}
+  Use for system operations, NOT file discovery and NOT Apple app control.
+- search: web search. Input: {"action":"tool","tool":"search","query":"..."}
 
 Decision process:
 1. Read the SubTask intent and success_criteria carefully.
-2. Choose the minimal set of tool calls needed.
-3. Execute them in sequence (respond with one tool call at a time).
-4. When done, output the final ExecutionResult JSON.
+2. You are told the current working directory — use it to construct correct paths.
+3. For file discovery: use glob. For Apple device actions: use applescript or shortcuts. For other system ops: use shell.
+4. Execute tools in sequence (one tool call at a time, then wait for the result).
+5. When you have enough evidence to satisfy all success_criteria, output the final ExecutionResult JSON.
 
 Output rules:
-- For a tool call: {"action":"tool","tool":"shell","command":"..."}
+- For a tool call: {"action":"tool","tool":"<name>","<param>":"<value>",...}
 - For the final result: {"action":"result","subtask_id":"...","status":"completed|uncertain|failed","output":"...","uncertainty":null,"tool_calls":["..."]}
+- Use status "completed" when a tool ran and the output clearly answers the task.
+- Use status "uncertain" ONLY when the output is genuinely ambiguous and no further tool call would help.
 - No markdown, no prose, no code fences.`
 
 const correctionPrompt = `You are R3 — Executor. A correction has been received. Apply it and re-execute.
 
 Correction: %s
 What to do: %s
+Previous tool calls attempted: %s
 
-Re-execute the sub-task with this correction in mind. Output a tool call or the final ExecutionResult JSON.`
+You MUST try a DIFFERENT approach from the previous attempts above. Output a tool call or the final ExecutionResult JSON.`
 
 // Executor is R3. It executes sub-tasks using available tools.
 type Executor struct {
@@ -56,7 +71,10 @@ func New(b *bus.Bus, llmClient *llm.Client) *Executor {
 // In the architecture, per-subtask executors are spawned by the planner.
 // This Run method handles a single SubTask channel for a dedicated goroutine.
 func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correctionCh <-chan types.CorrectionSignal) {
-	result, err := e.execute(ctx, subTask, nil)
+	var allToolCalls []string // accumulated across all attempts for correction context
+
+	result, toolCalls, err := e.execute(ctx, subTask, nil, nil)
+	allToolCalls = append(allToolCalls, toolCalls...)
 	if err != nil {
 		log.Printf("[R3] ERROR executing subtask %s: %v", subTask.SubTaskID, err)
 		reason := err.Error()
@@ -88,7 +106,8 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 				return
 			}
 			log.Printf("[R3] received CorrectionSignal attempt=%d for subtask=%s", correction.AttemptNumber, correction.SubTaskID)
-			result, err = e.execute(ctx, subTask, &correction)
+			result, toolCalls, err = e.execute(ctx, subTask, &correction, allToolCalls)
+			allToolCalls = append(allToolCalls, toolCalls...)
 			if err != nil {
 				log.Printf("[R3] ERROR re-executing subtask %s: %v", subTask.SubTaskID, err)
 				reason := err.Error()
@@ -119,6 +138,11 @@ type toolCall struct {
 	Path    string `json:"path,omitempty"`
 	Content string `json:"content,omitempty"`
 	Query   string `json:"query,omitempty"`
+	Pattern string `json:"pattern,omitempty"`
+	Root    string `json:"root,omitempty"`
+	Script  string `json:"script,omitempty"`  // applescript
+	Name    string `json:"name,omitempty"`    // shortcuts
+	Input   string `json:"input,omitempty"`   // shortcuts
 }
 
 type finalResult struct {
@@ -130,13 +154,20 @@ type finalResult struct {
 	ToolCalls   []string `json:"tool_calls"`
 }
 
-func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *types.CorrectionSignal) (types.ExecutionResult, error) {
+func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *types.CorrectionSignal, priorToolCalls []string) (types.ExecutionResult, []string, error) {
+	wd, _ := os.Getwd()
+
 	var userPrompt string
 	if correction != nil {
-		userPrompt = fmt.Sprintf(correctionPrompt, correction.WhatWasWrong, correction.WhatToDo) +
-			"\n\nOriginal SubTask:\n" + subTaskToJSON(st)
+		prior := strings.Join(priorToolCalls, ", ")
+		if prior == "" {
+			prior = "none"
+		}
+		userPrompt = fmt.Sprintf(correctionPrompt, correction.WhatWasWrong, correction.WhatToDo, prior) +
+			"\n\nOriginal SubTask:\n" + subTaskToJSON(st) +
+			"\n\nCurrent working directory: " + wd
 	} else {
-		userPrompt = "Execute this SubTask:\n" + subTaskToJSON(st)
+		userPrompt = "Current working directory: " + wd + "\n\nExecute this SubTask:\n" + subTaskToJSON(st)
 	}
 
 	var toolCallHistory []string
@@ -146,14 +177,16 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 	for i := 0; i < maxToolCalls; i++ {
 		prompt := userPrompt
 		if toolResultsCtx.Len() > 0 {
-			prompt += "\n\nPrevious tool results:\n" + toolResultsCtx.String()
+			prompt += "\n\nTool results so far:\n" + toolResultsCtx.String()
+			prompt += "\nYou have the tool output above. Output the final ExecutionResult JSON now (status=completed). Only make another tool call if the output above is genuinely insufficient."
 		}
 
 		raw, err := e.llm.Chat(ctx, systemPrompt, prompt)
 		if err != nil {
-			return types.ExecutionResult{}, fmt.Errorf("llm: %w", err)
+			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("llm: %w", err)
 		}
 		raw = llm.StripFences(raw)
+		log.Printf("[R3] llm response (iter=%d): %s", i, firstN(raw, 200))
 
 		// Try to parse as final result first
 		var fr finalResult
@@ -164,22 +197,27 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 				Output:      fr.Output,
 				Uncertainty: fr.Uncertainty,
 				ToolCalls:   toolCallHistory,
-			}, nil
+			}, toolCallHistory, nil
 		}
 
 		// Parse as tool call
 		var tc toolCall
 		if err := json.Unmarshal([]byte(raw), &tc); err != nil {
-			return types.ExecutionResult{}, fmt.Errorf("parse LLM output: %w (raw: %s)", err, raw)
+			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("parse LLM output: %w (raw: %s)", err, raw)
 		}
 
-		toolCallHistory = append(toolCallHistory, tc.Tool+":"+firstN(tc.Command+tc.Path+tc.Query, 60))
+		detail := tc.Command + tc.Path + tc.Query + tc.Pattern + tc.Name + firstN(tc.Script, 40)
+		toolCallHistory = append(toolCallHistory, tc.Tool+":"+firstN(detail, 60))
+		log.Printf("[R3] running tool=%s cmd=%s path=%s query=%s script=%s name=%s",
+			tc.Tool, firstN(tc.Command, 80), tc.Path, tc.Query, firstN(tc.Script, 60), tc.Name)
 
 		result, err := e.runTool(ctx, tc)
 		if err != nil {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s ERROR: %v\n", tc.Tool, err))
+			log.Printf("[R3] tool %s error: %v", tc.Tool, err)
 		} else {
-			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result: %s\n", tc.Tool, firstN(result, 500)))
+			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, firstN(result, 2000)))
+			log.Printf("[R3] tool %s result: %s", tc.Tool, firstN(result, 200))
 		}
 	}
 
@@ -188,17 +226,57 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		Status:    "uncertain",
 		Output:    toolResultsCtx.String(),
 		ToolCalls: toolCallHistory,
-	}, nil
+	}, toolCallHistory, nil
+}
+
+// maxdepthRe strips -maxdepth N from find commands so the LLM never accidentally
+// limits searches to a single directory level in a project with subdirectories.
+var maxdepthRe = regexp.MustCompile(`-maxdepth\s+\d+\s*`)
+
+func normalizeFindCmd(cmd string) string {
+	if strings.HasPrefix(strings.TrimSpace(cmd), "find ") {
+		return maxdepthRe.ReplaceAllString(cmd, "")
+	}
+	return cmd
 }
 
 func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 	switch tc.Tool {
 	case "shell":
-		stdout, stderr, err := tools.RunShell(ctx, tc.Command)
+		cmd := normalizeFindCmd(tc.Command)
+		if cmd != tc.Command {
+			log.Printf("[R3] normalized find cmd: %q -> %q", tc.Command, cmd)
+		}
+		stdout, stderr, err := tools.RunShell(ctx, cmd)
 		if err != nil {
 			return fmt.Sprintf("stdout: %s\nstderr: %s\nerror: %v", stdout, stderr, err), nil
 		}
 		return fmt.Sprintf("stdout: %s\nstderr: %s", stdout, stderr), nil
+	case "glob":
+		root := tc.Root
+		if root == "" {
+			root = "."
+		}
+		matches, err := tools.GlobFiles(root, tc.Pattern)
+		if err != nil {
+			return "", err
+		}
+		if len(matches) == 0 {
+			return "(no files matched pattern " + tc.Pattern + " under " + root + ")", nil
+		}
+		return tools.GlobJoin(matches), nil
+	case "applescript":
+		result, err := tools.RunAppleScript(ctx, tc.Script)
+		if err != nil {
+			return fmt.Sprintf("applescript error: %v", err), nil
+		}
+		return result, nil
+	case "shortcuts":
+		result, err := tools.RunShortcut(ctx, tc.Name, tc.Input)
+		if err != nil {
+			return fmt.Sprintf("shortcuts error: %v", err), nil
+		}
+		return result, nil
 	case "read_file":
 		return tools.ReadFile(tc.Path)
 	case "write_file":
