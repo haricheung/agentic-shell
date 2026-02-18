@@ -457,3 +457,55 @@ func headTail(s string, maxLen int) string {
 **Verification**
 ffmpeg banner is ~2500 chars; with `headTail(4000)`: head=1333 shows version+partial config,
 tail=2667 shows the remaining config + actual encode output or error. The LLM now sees the result.
+
+**Note**: This fix was necessary but not sufficient — see Issue #19 for the R4a evidence gap
+that caused the full cascade despite the executor correctly reporting `completed`.
+
+---
+
+## Issue #19 — R4a rejects completed subtasks: ToolCalls carries no output evidence
+
+**Symptom**
+After Issue #18 fix, the executor LLM correctly reported `status: completed` with
+`output: "MP3 file successfully created at ..."`. But R4a still scored it as `retry` both
+attempts → `max retries reached → failed`. Task still abandoned.
+
+**Root cause**
+R4a's scoring rule: *"Trust tool output (stdout, file paths, command results) as primary evidence.
+The executor's prose claim alone is not evidence."*
+
+`ExecutionResult.ToolCalls` was populated only with tool names + command inputs:
+```
+["shell:ffmpeg -i '/Users/.../三个代表.mp4' -q:a 0 -map a '...mp3'"]
+```
+No output. R4a saw a prose claim ("MP3 file successfully created") with a tool call that had
+no observable result — exactly the pattern it's trained to distrust. Verdict: `retry`.
+
+The actual ffmpeg output (`size= 514kB time=00:00:28.23 bitrate= 149.5kbits/s speed=19.6x`) was
+only in the executor's internal `toolResultsCtx`, used to inform the LLM. It never flowed into
+`ExecutionResult`.
+
+**Fix**
+- **`executor.go`**: After each `runTool` call, append the last 120 chars of actual output (or
+  error string) to the corresponding `toolCallHistory` entry before it becomes `ExecutionResult.ToolCalls`:
+
+```go
+// success
+toolCallHistory[len(toolCallHistory)-1] += " → " + lastN(strings.TrimSpace(result), 120)
+// error
+toolCallHistory[len(toolCallHistory)-1] += " → ERROR: " + firstN(err.Error(), 80)
+```
+
+R4a now receives:
+```
+"shell:ffmpeg -i '/Downloads/三个代表.mp4' -q:a 0 -map a '...mp3' → ...
+  size= 514kB time=00:00:28.23 bitrate= 149.5kbits/s speed=19.6x"
+```
+That is concrete, verifiable evidence → verdict: `matched`.
+
+**Verification**
+End-to-end test: "find 三个代表.mp4 and extract its audio to mp3"
+- seq=1 locate: MATCHED attempt=1 ✓
+- seq=2 extract: MATCHED attempt=1 ✓ (no retries)
+- R4b verdict: accept ✓
+- Output file: `/Users/haricheung/Downloads/三个代表.mp3` — 514KB, valid MP3, 28s

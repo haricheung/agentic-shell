@@ -235,9 +235,13 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		if err != nil {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s ERROR: %v\n", tc.Tool, err))
 			log.Printf("[R3] tool %s error: %v", tc.Tool, err)
+			// Append error evidence to tool_calls so R4a can verify
+			toolCallHistory[len(toolCallHistory)-1] += " → ERROR: " + firstN(err.Error(), 80)
 		} else {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, headTail(result, 4000)))
 			log.Printf("[R3] tool %s result: %s", tc.Tool, firstN(result, 200))
+			// Append output tail to tool_calls so R4a sees concrete evidence, not just a prose claim
+			toolCallHistory[len(toolCallHistory)-1] += " → " + lastN(strings.TrimSpace(result), 120)
 		}
 	}
 
@@ -328,6 +332,13 @@ func firstN(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func lastN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "..." + s[len(s)-n:]
 }
 
 // headTail returns up to maxLen characters of s, preserving both the head and
