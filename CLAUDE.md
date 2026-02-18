@@ -71,13 +71,13 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/llm/client.go` | LLM client | Single `Chat(ctx, system, user)` method; `StripFences()` helper |
 | `internal/roles/perceiver/` | R1 | Translates input → TaskSpec (short snake_case task_id; binary success_criteria); session-history aware |
 | `internal/roles/planner/` | R2 | TaskSpec → SubTask[]; queries memory first; assigns sequence numbers for dependency ordering; handles ReplanRequest |
-| `internal/roles/executor/` | R3 | Executes one SubTask via numbered tool priority chain; correction-aware; `correctionPrompt` repeats format and tools |
-| `internal/roles/agentval/` | R4a | Scores ExecutionResult; drives retry loop; maxRetries=2; infrastructure errors → immediate fail |
+| `internal/roles/executor/` | R3 | Executes one SubTask via numbered tool priority chain; correction-aware; `correctionPrompt` repeats format and tools; `headTail(result, 4000)` for tool result context; each `ToolCalls` entry includes `→ <last 120 chars of output>` for R4a evidence |
+| `internal/roles/agentval/` | R4a | Scores ExecutionResult; drives retry loop; maxRetries=2; infrastructure errors → immediate fail; trusts `ToolCalls` output snippets as concrete evidence |
 | `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3 |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
 | `internal/roles/auditor/` | R6 | Bus tap; JSONL audit log; boundary + convergence checks |
 | `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; `Abort()` sets `suppressed=true` to block stale post-abort messages; `Resume()` lifts it before each new task |
-| `internal/tools/mdfind.go` | Tool | macOS Spotlight wrapper; `RunMdfind(ctx, query)` → `mdfind -name <query>` |
+| `internal/tools/mdfind.go` | Tool | macOS Spotlight wrapper; `RunMdfind(ctx, query)` → `mdfind -name <query>`; if no results and query has an extension, retries with stem only and post-filters by extension (Spotlight CJK+extension quirk) |
 
 ## Tools Available to Executor
 
@@ -104,8 +104,8 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 |---|---|---|---|
 | R1 | raw input + session history | `TaskSpec` JSON | task_id = short snake_case; success_criteria = verifiable from tool output |
 | R2 | `TaskSpec` + memory | `SubTask[]` JSON | same sequence = parallel; different sequence = dependency ordered; always populate `context` |
-| R3 | `SubTask` | `ExecutionResult` JSON | tool priority: mdfind→glob→read/write→applescript→shortcuts→shell→search; correction prompt repeats format |
-| R4a | `SubTask` + `ExecutionResult` | verdict JSON | trust tool stdout; infra errors → fail immediately; empty search result → matched |
+| R3 | `SubTask` | `ExecutionResult` JSON | tool priority: mdfind→glob→read/write→applescript→shortcuts→shell→search; correction prompt repeats format; `ToolCalls` entries carry `→ <output tail>` for evidence |
+| R4a | `SubTask` + `ExecutionResult` | verdict JSON | trust `ToolCalls` output snippets as primary evidence; prose claim alone → retry; infra errors → fail immediately; empty search result → matched |
 | R4b | `SubTask[]` outcomes + `TaskSpec` | verdict JSON | accept only when ALL success_criteria met; replan only (no partial_replan); merged_output = concrete data |
 
 ## Known Model Behaviour (Volcengine/DeepSeek)
@@ -113,6 +113,9 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 - Tends to return `status: "uncertain"` even with clear tool output → mitigated by "commit to completed" instruction appended after tool results
 - Follows JSON output format reliably when given concrete examples
 - May still use `find ~` via shell for personal file searches despite `mdfind` guidance → `normalizeFindCmd()` and repeated prompt reinforcement mitigate this
+- macOS Spotlight quirk: `mdfind -name 'file.mp4'` returns nothing for CJK filenames with extensions → `RunMdfind` retries with stem only and post-filters by extension
+- Long shell commands (e.g. ffmpeg) emit a large version/config banner before results; `headTail(result, 4000)` ensures the LLM sees both the beginning context and the end result even when total output exceeds 4000 chars
+- R4a will retry `status: completed` results if `ToolCalls` has no output evidence; the `→ <last 120 chars>` appended to each entry is the mechanism that prevents spurious retries
 
 ## Memory System
 
