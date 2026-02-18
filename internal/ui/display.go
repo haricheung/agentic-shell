@@ -67,25 +67,38 @@ var spinRunes = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 // Display renders a sci-fi inter-role flow visualization to stdout.
 // It reads from a bus tap channel and animates a live pipeline view.
 type Display struct {
-	tap     <-chan types.Message
-	abortCh chan struct{}
-	mu      sync.Mutex
-	status  string
-	started time.Time
-	inTask  bool
-	spinIdx int
+	tap        <-chan types.Message
+	abortCh    chan struct{}
+	resumeCh   chan struct{}
+	mu         sync.Mutex
+	status     string
+	started    time.Time
+	inTask     bool
+	spinIdx    int
+	suppressed bool // true after Abort(); blocks new pipeline boxes until Resume()
 }
 
 // New creates a Display reading from tap.
 func New(tap <-chan types.Message) *Display {
-	return &Display{tap: tap, abortCh: make(chan struct{}, 1)}
+	return &Display{tap: tap, abortCh: make(chan struct{}, 1), resumeCh: make(chan struct{}, 1)}
 }
 
-// Abort signals the display to immediately close the current pipeline box.
+// Abort signals the display to immediately close the current pipeline box
+// and suppress any subsequent stale messages until Resume() is called.
 // Safe to call from any goroutine.
 func (d *Display) Abort() {
 	select {
 	case d.abortCh <- struct{}{}:
+	default:
+	}
+}
+
+// Resume lifts the post-abort suppression so the next task can open a pipeline box.
+// Call this right before starting a new perceiver/task.
+// Safe to call from any goroutine.
+func (d *Display) Resume() {
+	select {
+	case d.resumeCh <- struct{}{}:
 	default:
 	}
 }
@@ -108,12 +121,27 @@ func (d *Display) Run(ctx context.Context) {
 				fmt.Print("\r\033[K")
 				d.endTask(false)
 			}
+			d.mu.Lock()
+			d.suppressed = true
+			d.mu.Unlock()
+
+		case <-d.resumeCh:
+			d.mu.Lock()
+			d.suppressed = false
+			d.mu.Unlock()
 
 		case msg, ok := <-d.tap:
 			if !ok {
 				return
 			}
 			if !d.inTask {
+				d.mu.Lock()
+				sup := d.suppressed
+				d.mu.Unlock()
+				if sup {
+					// Drain stale post-abort messages silently; don't open a new box.
+					continue
+				}
 				d.startTask()
 			}
 			// Clear spinner line before printing a new flow line.

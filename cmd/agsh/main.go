@@ -373,6 +373,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			return strings.TrimSpace(ans), nil
 		}
 
+		disp.Resume() // lift post-abort suppression before the new pipeline starts
 		p := perceiver.New(b, llmClient, clarifyFn)
 		taskID, err := p.Process(taskCtx, input, buildSessionContext(history))
 		if err != nil {

@@ -83,6 +83,10 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 	result, toolCalls, err := e.execute(ctx, subTask, nil, nil)
 	allToolCalls = append(allToolCalls, toolCalls...)
 	if err != nil {
+		if ctx.Err() != nil {
+			log.Printf("[R3] subtask=%s cancelled, skipping publish", subTask.SubTaskID)
+			return
+		}
 		log.Printf("[R3] ERROR executing subtask %s: %v", subTask.SubTaskID, err)
 		reason := err.Error()
 		result = types.ExecutionResult{
@@ -91,6 +95,10 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 			Output:      reason,
 			Uncertainty: &reason,
 		}
+	}
+	if ctx.Err() != nil {
+		log.Printf("[R3] subtask=%s context done after execute, skipping publish", subTask.SubTaskID)
+		return
 	}
 
 	e.b.Publish(types.Message{
@@ -116,6 +124,10 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 			result, toolCalls, err = e.execute(ctx, subTask, &correction, allToolCalls)
 			allToolCalls = append(allToolCalls, toolCalls...)
 			if err != nil {
+				if ctx.Err() != nil {
+					log.Printf("[R3] subtask=%s cancelled during correction, skipping publish", subTask.SubTaskID)
+					return
+				}
 				log.Printf("[R3] ERROR re-executing subtask %s: %v", subTask.SubTaskID, err)
 				reason := err.Error()
 				result = types.ExecutionResult{
@@ -124,6 +136,10 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 					Output:      reason,
 					Uncertainty: &reason,
 				}
+			}
+			if ctx.Err() != nil {
+				log.Printf("[R3] subtask=%s context done after correction, skipping publish", subTask.SubTaskID)
+				return
 			}
 			e.b.Publish(types.Message{
 				ID:        uuid.New().String(),
