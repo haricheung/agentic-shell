@@ -293,3 +293,76 @@ Searching for a file in the user's Downloads or home directory returned nothing.
   - `root: "~"` → user's home directory; use when searching for personal files (documents, downloads, music, photos, etc.).
   - `root: "~/Downloads"`, `root: "~/Documents"`, etc. → specific user directories.
   - **Never** use `root: "."` to search for user personal files — it will find nothing outside the project.
+
+---
+
+## Issue #13 — Stale ExecutionResult published after Ctrl+C reopens pipeline box
+
+**Symptom** (screenshot)
+After aborting a task (⚠️ task aborted / ❌ box closed), a new pipeline box immediately opened at the REPL prompt showing `R3 ──[ExecutionResult: failed]──► R4a`. The REPL was idle with no task running.
+
+**Root causes** (confirmed via debug log)
+1. When the task context is cancelled by Ctrl+C, the in-flight LLM call returns a `context canceled` error. `RunSubTask` caught the error and built a `failed` result — then **still published it to the bus** unconditionally.
+2. The display tap received the `ExecutionResult: failed` message, saw `inTask == false` (Abort had just fired), and called `startTask()`, opening a new pipeline box.
+3. There was no suppression mechanism to block stale post-abort messages from triggering a new box.
+
+**Fix**
+- **`executor.go` `RunSubTask`**: Check `ctx.Err() != nil` before every `Publish()` call — both the initial result and correction-round results. If the context is cancelled, return immediately without publishing. This stops the cascade at source.
+- **`display.go`**: Added `suppressed bool` field + `Resume()` method. `Abort()` now also sets `suppressed = true`. Incoming bus messages while suppressed and `!inTask` are drained silently (no `startTask()`). Acts as a safety net for any message that was already in-flight when the executor check fires.
+- **`main.go`**: `disp.Resume()` called at the top of each new REPL task (before `perceiver.Process()`), lifting the suppression exactly when the user submits a new query.
+
+---
+
+## Issue #14 — Personal file search takes 6 minutes (find ~ / glob root:"~" both scan entire home)
+
+**Symptom**
+```
+time find ~ -name '*三个代表*' -type f 2>/dev/null | head -20
+# → 0.46s user 7.75s system 2% cpu 5:51.35 total
+```
+Finding a single file by name in the home directory took nearly 6 minutes.
+
+**Root cause**
+Both `find ~` (shell) and `GlobFiles(root:"~")` enumerate every inode under `~` — including `~/Library`, cloud sync folders, and millions of cached files — because they have no OS index. The result is the same slow scan regardless of which tool is used.
+
+**Fix**
+Added `mdfind` as a first-class executor tool backed by macOS Spotlight:
+- **`internal/tools/mdfind.go`**: `RunMdfind(ctx, query)` calls `mdfind -name <query> 2>/dev/null`. Spotlight's persistent index returns results in < 100 ms regardless of file location.
+- **`executor.go` `runTool`**: new `"mdfind"` case.
+- **Executor system prompt**: `mdfind` listed first with explicit ALWAYS-use guidance for personal file searches. `glob` demoted to project-only (source code, configs). Decision step updated accordingly.
+
+**Benchmark**: `mdfind -name '三个代表'` → **77 ms** vs `find ~` → **351 s** (4500× faster).
+
+---
+
+## Issue #15 — `glob` silently returns 0 results for globstar patterns (`**/*.go`)
+
+**Symptom**
+LLMs routinely emit patterns like `**/*.go` or `*/*.json` (shell globstar style). These returned 0 results with no error.
+
+**Root cause**
+`GlobFiles` matched the pattern against `d.Name()` (filename only, no path separators). Any `/` in the pattern causes `filepath.Match` to return `false` for every file. Also, the example `"pattern":"*.go"` in the executor system prompt biased the LLM toward Go-specific patterns.
+
+**Fix**
+- **`glob.go` `GlobFiles`**: strip everything up to and including the last `/` from the pattern before matching. `"**/*.go"` → `"*.go"`, `"*/*.json"` → `"*.json"`. Verified: `GlobFiles(".", "**/*.go")` now returns the same 8 files as `GlobFiles(".", "*.go")`.
+- **Executor system prompt**: example changed from `"pattern":"*.go"` to `"pattern":"*.json"`; added note *"Pattern matches the FILENAME ONLY — do NOT include '/'"*.
+
+---
+
+## Issue #16 — Result output shows literal `\n` instead of rendered newlines
+
+**Symptom**
+```
+"Available free disk space:\n- / (root): 191 GiB\n- /System/Volumes/VM: 191 GiB\n..."
+```
+Newlines in the output string were displayed as the two-character sequence `\n` instead of actual line breaks.
+
+**Root cause**
+`printResult` passed all output through `json.MarshalIndent`, which wraps strings in double-quotes and escapes real newlines to `\n`. The JSON-encoded string was then printed verbatim.
+
+**Fix**
+`printResult` now:
+1. Marshals output to JSON, then attempts `json.Unmarshal` into a `string`.
+2. If successful (plain string output): prints directly with `fmt.Println` — real newlines render correctly.
+3. If not (structured object/array): falls back to `json.MarshalIndent` for pretty JSON.
+4. Suppresses the output block when it duplicates the summary.
