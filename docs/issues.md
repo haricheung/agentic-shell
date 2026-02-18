@@ -509,3 +509,74 @@ End-to-end test: "find 三个代表.mp4 and extract its audio to mp3"
 - seq=2 extract: MATCHED attempt=1 ✓ (no retries)
 - R4b verdict: accept ✓
 - Output file: `/Users/haricheung/Downloads/三个代表.mp3` — 514KB, valid MP3, 28s
+
+---
+
+## Issue #20 — Spinner line-wrap floods the terminal with identical retry lines
+
+**Symptom**
+During a correction/retry, the terminal filled with dozens of identical lines:
+```
+⠸ ⚙️  retry 1 — Use a macOS-compatible command like 'ps aux | sort -
+⠼ ⚙️  retry 1 — Use a macOS-compatible command like 'ps aux | sort -
+⠴ ⚙️  retry 1 — Use a macOS-compatible command like 'ps aux | sort -
+...
+```
+Each line was a new spinner animation frame, not an in-place overwrite.
+
+**Root cause**
+The spinner used `\r` (carriage return) to overwrite the current line. When the status
+string was long (~70 visible chars), the terminal wrapped it to a second line. `\r` then
+returned the cursor to the start of the *second* (wrapped) line, not line 1. Each 80ms tick
+wrote a new visible line instead of overwriting — producing a continuous scroll of identical
+frames.
+
+The status text for corrections was built as:
+`"⚙️  retry N — " + clip(WhatToDo, 55)` ≈ 70 visible chars, which wraps in an 80-col terminal.
+
+**Fix**
+- **`display.go` ticker**: changed `\r` to `\r\033[K` — erase-to-EOL after carriage return
+  clears leftover chars from longer previous statuses on the same line.
+- **`display.go` `dynamicStatus`**: reduced `WhatToDo` clip from 55 → 38 runes. Full spinner
+  line is now ≤ 54 visible cols, safely within any terminal ≥ 60 cols — no wrapping possible.
+
+---
+
+## Issue #21 — Model repeatedly uses `find /Users/...` instead of `mdfind`
+
+**Symptom**
+Despite the executor system prompt listing `mdfind` as tool #1 for personal file searches,
+the model (Volcengine/DeepSeek) repeatedly emitted slow `find /Users/haricheung` shell
+commands — taking 6+ minutes instead of <1 second.
+
+Example from debug log:
+```
+[R3] running tool=shell cmd=find /Users/haricheung -name "三个代表.mp3" -o -name "三个代表*.mp3" ...
+```
+
+**Root cause**
+Model non-compliance with prompt priority. The `shell` tool description also contained
+"Always append 2>/dev/null to find commands" which implicitly validated using `find` at all.
+Prompt reinforcement alone proved insufficient across multiple sessions.
+
+**Fix**
+Two-layer enforcement:
+1. **Prompt**: `shell` description changed to "NEVER use 'find' to locate personal files —
+   use mdfind instead", removing the implicit `find` validation.
+2. **Code**: `redirectPersonalFind()` in `executor.go:runTool` — detects `shell find` commands
+   targeting personal paths (`/Users/`, ` ~`, `~/`, `/home/`, `/Volumes/`) and transparently
+   redirects them to `RunMdfind()` with the extracted `-name` pattern. The model receives fast
+   Spotlight results without knowing the redirect happened.
+
+```go
+if query, ok := redirectPersonalFind(tc.Command); ok {
+    log.Printf("[R3] redirecting personal find to mdfind: query=%q", query)
+    return tools.RunMdfind(ctx, query)
+}
+```
+
+Routing rules:
+- `find /Users/haricheung -name "三个代表.mp3"` → `mdfind -name '三个代表'` (redirected)
+- `find ~ -name "*.pdf"` → `mdfind -name '*.pdf'` (redirected)
+- `find . -name "*.go"` → unchanged (project search)
+- `find /tmp -name "*.log"` → unchanged (system path)
