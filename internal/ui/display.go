@@ -53,13 +53,39 @@ var msgStatus = map[types.MessageType]string{
 	types.MsgTaskSpec:         "🧠 perceiving...",
 	types.MsgSubTask:          "📐 scheduling subtasks...",
 	types.MsgDispatchManifest: "📐 dispatching...",
-	types.MsgExecutionResult:  "⚙️  running tools...",
-	types.MsgCorrectionSignal: "🔍 correcting...",
+	types.MsgExecutionResult:  "🔍 evaluating result...",
+	types.MsgCorrectionSignal: "⚙️  retrying...",
 	types.MsgSubTaskOutcome:   "🔮 evaluating outcomes...",
 	types.MsgReplanRequest:    "🔮 replanning...",
 	types.MsgMemoryWrite:      "💾 saving memory...",
 	types.MsgMemoryRead:       "💾 recalling...",
 	types.MsgMemoryResponse:   "📐 planning...",
+}
+
+// dynamicStatus returns a spinner label for msg, enriched with payload detail
+// for message types where the static label alone is not informative enough.
+func dynamicStatus(msg types.Message) string {
+	switch msg.Type {
+	case types.MsgCorrectionSignal:
+		var c types.CorrectionSignal
+		if remarshal(msg.Payload, &c) == nil && c.WhatToDo != "" {
+			return fmt.Sprintf("⚙️  retry %d — %s", c.AttemptNumber, clip(c.WhatToDo, 55))
+		}
+	case types.MsgSubTaskOutcome:
+		var o types.SubTaskOutcome
+		if remarshal(msg.Payload, &o) == nil {
+			switch o.Status {
+			case "matched":
+				return "🔮 subtask matched — merging..."
+			case "failed":
+				return "🔮 subtask failed — assessing..."
+			}
+		}
+	}
+	if s := msgStatus[msg.Type]; s != "" {
+		return s
+	}
+	return ""
 }
 
 var spinRunes = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -147,9 +173,7 @@ func (d *Display) Run(ctx context.Context) {
 			// Clear spinner line before printing a new flow line.
 			fmt.Print("\r\033[K")
 			d.printFlow(msg)
-			if s := msgStatus[msg.Type]; s != "" {
-				d.setStatus(s)
-			}
+			d.setStatus(dynamicStatus(msg))
 			if msg.Type == types.MsgFinalResult {
 				d.endTask(true)
 			}
