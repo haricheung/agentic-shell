@@ -236,7 +236,7 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s ERROR: %v\n", tc.Tool, err))
 			log.Printf("[R3] tool %s error: %v", tc.Tool, err)
 		} else {
-			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, firstN(result, 2000)))
+			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, headTail(result, 4000)))
 			log.Printf("[R3] tool %s result: %s", tc.Tool, firstN(result, 200))
 		}
 	}
@@ -328,4 +328,17 @@ func firstN(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// headTail returns up to maxLen characters of s, preserving both the head and
+// tail of the output. For long outputs like ffmpeg (banner + result at the end),
+// this ensures the LLM sees both the command context and the actual result/error,
+// rather than truncating before the result appears.
+func headTail(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	head := maxLen / 3
+	tail := maxLen - head
+	return s[:head] + "\n...[middle truncated]...\n" + s[len(s)-tail:]
 }

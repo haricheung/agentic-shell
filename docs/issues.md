@@ -404,3 +404,56 @@ sequence=1: locate file → mdfind → /Users/haricheung/Downloads/三个代表.
 sequence=2: extract audio (context includes "prior step output: /Users/.../三个代表.mp4")
             → uses the injected path directly, no re-discovery needed
 ```
+
+---
+
+## Issue #18 — LLM hallucinates ffmpeg failure; task abandoned despite success
+
+**Symptom**
+Task "extract audio from 三个代表.mp4" was abandoned after 3 replan rounds with:
+> "Task abandoned after 3 failed attempts. No new audio file was created because ffmpeg failed
+> to overwrite existing file, and verification subtask could not confirm file existence or
+> playability due to missing file."
+
+The file `/Users/haricheung/Downloads/三个代表.mp3` actually existed (526 KB, valid MP3, 28s).
+The ffmpeg command with `-y` flag had succeeded in replan round 2.
+
+**Root cause**
+`firstN(result, 2000)` in `executor.go` truncated shell tool output to 2000 characters before
+passing it to the LLM. ffmpeg's version banner + build configuration alone is ~2500 characters,
+so the LLM context window for that tool call ended mid-config-dump — **the actual encoding
+result or error line was never visible to the LLM**.
+
+The cascade:
+1. Replan 1: `ffmpeg ... 三个代表.mp3` (no `-y`) → file already exists → real error, correctly
+   reported as failed.
+2. Replan 2: `ffmpeg ... -y ... 三个代表.mp3` → **actually succeeded** (overwrites), but LLM
+   saw only the truncated banner → hallucinated "file already exists" → reported `status: failed`.
+3. Verification subtask: `ls -la` showed the file (526249 bytes), `afplay` played it, `ffprobe`
+   confirmed 28s duration — all proving success. But R4a kept retrying because its success
+   criteria included "confirm ffmpeg extraction succeeded in this run" and the extraction subtask
+   was (incorrectly) marked failed. Both subtasks exhausted maxRetries=2 → reported failed.
+4. R4b saw 2/3 subtasks failed → replanned again → repeat ×3 → abandoned.
+
+**Compounding factor**
+The LLM was anchored to the previous failure ("already exists") and hallucinated the same error
+even when the command succeeded, since it couldn't observe the actual result.
+
+**Fix**
+- **`executor.go`**: Replaced `firstN(result, 2000)` with `headTail(result, 4000)` for tool
+  results passed to the LLM context. `headTail` preserves the first ~1333 chars AND the last
+  ~2667 chars, with `...[middle truncated]...` in between. Long-banner tools like ffmpeg now
+  show their actual result at the end even when the total output is large.
+
+```go
+func headTail(s string, maxLen int) string {
+    if len(s) <= maxLen { return s }
+    head := maxLen / 3
+    tail := maxLen - head
+    return s[:head] + "\n...[middle truncated]...\n" + s[len(s)-tail:]
+}
+```
+
+**Verification**
+ffmpeg banner is ~2500 chars; with `headTail(4000)`: head=1333 shows version+partial config,
+tail=2667 shows the remaining config + actual encode output or error. The LLM now sees the result.
