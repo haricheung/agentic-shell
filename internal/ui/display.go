@@ -69,7 +69,9 @@ func dynamicStatus(msg types.Message) string {
 	case types.MsgCorrectionSignal:
 		var c types.CorrectionSignal
 		if remarshal(msg.Payload, &c) == nil && c.WhatToDo != "" {
-			return fmt.Sprintf("⚙️  retry %d — %s", c.AttemptNumber, clip(c.WhatToDo, 55))
+			// Clip to 38 chars: "⚙️  retry N — " prefix is ~14 cols, total ≤ 54 visible
+			// cols — safely fits without wrapping even in narrow terminals.
+			return fmt.Sprintf("⚙️  retry %d — %s", c.AttemptNumber, clip(c.WhatToDo, 38))
 		}
 	case types.MsgSubTaskOutcome:
 		var o types.SubTaskOutcome
@@ -187,7 +189,9 @@ func (d *Display) Run(ctx context.Context) {
 			d.mu.Lock()
 			status := d.status
 			d.mu.Unlock()
-			fmt.Printf("\r%s%s%s %s", ansiCyan, string(frame), ansiReset, status)
+			// \r\033[K: return to line start then erase to EOL — prevents leftover
+			// chars from longer previous statuses and keeps overwrite in-place.
+			fmt.Printf("\r\033[K%s%s%s %s", ansiCyan, string(frame), ansiReset, status)
 		}
 	}
 }
