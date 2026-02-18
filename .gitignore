@@ -2,3 +2,16 @@
 .env.*
 .DS_Store
 *.png
+
+# Binaries
+agsh
+/bin/
+
+# Build artifacts
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
