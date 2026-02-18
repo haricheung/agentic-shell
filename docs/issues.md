@@ -366,3 +366,41 @@ Newlines in the output string were displayed as the two-character sequence `\n` 
 2. If successful (plain string output): prints directly with `fmt.Println` — real newlines render correctly.
 3. If not (structured object/array): falls back to `json.MarshalIndent` for pretty JSON.
 4. Suppresses the output block when it duplicates the summary.
+
+---
+
+## Issue #17 — Subtask B fails because it ran in parallel with subtask A that locates its input
+
+**Symptom** (debug log)
+```
+[R4a] subtask=b2c3d4e5... FAILED: Prerequisite not met: source file '三个代表.mp4' was not
+      found via mdfind. The subtask cannot proceed as it depends on the successful location
+      of the source file, which failed.
+```
+Meanwhile subtask A (locate file) succeeded and was matched. The file was present all along.
+
+**Root cause**
+The dispatcher launched ALL subtasks simultaneously, ignoring the `sequence` field. Subtask A
+(sequence=1, locate file) and subtask B (sequence=2, extract audio) ran in parallel. Subtask B
+had to re-discover the file itself; mdfind returned nothing for that query, so it failed.
+
+Two compounding factors:
+1. `sequence` was correctly set by the planner, but the dispatcher never read it.
+2. The planner prompt only said "same sequence = parallel" — it never said "different sequence = dependency ordering", so future plans might still assign same-sequence to dependent tasks.
+
+**Fix**
+- **`cmd/agsh/main.go` `runSubtaskDispatcher`**: Rewrote the dispatcher to implement sequential dispatch:
+  - Subscribes to `MsgDispatchManifest` to learn expected subtask count.
+  - Buffers incoming subtasks in `bySeq map[int][]SubTask`.
+  - Once all expected subtasks arrive, dispatches the lowest sequence group.
+  - Each agentval goroutine signals completion via `completionCh`; when inFlight reaches 0, the next sequence group is dispatched.
+  - Outputs from completed sequences are collected and injected into every next-sequence subtask's `Context` field as "Outputs from prior steps (use these directly — do not re-run discovery)".
+- **Planner system prompt**: Added explicit sequence rules — different sequence numbers for dependent subtasks, same sequence number for truly independent parallel subtasks. Explained that the dispatcher injects prior-step outputs automatically.
+
+**Behaviour after fix**
+```
+sequence=1: locate file → mdfind → /Users/haricheung/Downloads/三个代表.mp4
+            [wait for completion]
+sequence=2: extract audio (context includes "prior step output: /Users/.../三个代表.mp4")
+            → uses the injected path directly, no re-discovery needed
+```
