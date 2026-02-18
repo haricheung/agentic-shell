@@ -34,7 +34,8 @@ Tool selection — use the FIRST tool that fits; do not skip down the list:
    Input: {"action":"tool","tool":"shortcuts","name":"My Shortcut","input":""}
 7. shell — bash command for everything else (counting, aggregation, system info, file ops).
    Input: {"action":"tool","tool":"shell","command":"..."}
-   Always append 2>/dev/null to find commands. Never include ~/Music/Music or ~/Library in find paths.
+   NEVER use "find" to locate personal files — use mdfind (tool #1) instead.
+   Never include ~/Music/Music or ~/Library in shell paths.
 8. search — DuckDuckGo web search. Input: {"action":"tool","tool":"search","query":"..."}
 
 Execution rules:
@@ -257,6 +258,41 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 // limits searches to a single directory level in a project with subdirectories.
 var maxdepthRe = regexp.MustCompile(`-maxdepth\s+\d+\s*`)
 
+// findNameRe extracts the first -name pattern from a find command.
+var findNameRe = regexp.MustCompile(`-name\s+["']?([^"'\s]+)["']?`)
+
+// personalPathPrefixes are path prefixes that indicate a personal-file search.
+// The model should use mdfind for these, not shell find.
+// " ~" catches both "find ~" and "find ~/..." forms.
+var personalPathPrefixes = []string{
+	"/Users/", " ~/", " ~ ", "/home/", "/Volumes/",
+}
+
+// redirectPersonalFind detects `find <personal-path> ... -name <pattern>` commands
+// and returns the equivalent mdfind query string. Returns ("", false) if the
+// command is not a personal-file find.
+func redirectPersonalFind(cmd string) (query string, ok bool) {
+	trimmed := strings.TrimSpace(cmd)
+	if !strings.HasPrefix(trimmed, "find ") {
+		return "", false
+	}
+	isPersonal := false
+	for _, pfx := range personalPathPrefixes {
+		if strings.Contains(trimmed, pfx) {
+			isPersonal = true
+			break
+		}
+	}
+	if !isPersonal {
+		return "", false
+	}
+	m := findNameRe.FindStringSubmatch(trimmed)
+	if len(m) < 2 {
+		return "", false
+	}
+	return m[1], true
+}
+
 func normalizeFindCmd(cmd string) string {
 	trimmed := strings.TrimSpace(cmd)
 	if !strings.HasPrefix(trimmed, "find ") {
@@ -277,6 +313,13 @@ func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 	case "mdfind":
 		return tools.RunMdfind(ctx, tc.Query)
 	case "shell":
+		// Intercept personal-file find commands and redirect to mdfind.
+		// The model occasionally ignores the prompt priority and emits
+		// `find /Users/... -name <pattern>` which is extremely slow (~6 min).
+		if query, ok := redirectPersonalFind(tc.Command); ok {
+			log.Printf("[R3] redirecting personal find to mdfind: query=%q (original: %s)", query, firstN(tc.Command, 80))
+			return tools.RunMdfind(ctx, query)
+		}
 		cmd := normalizeFindCmd(tc.Command)
 		if cmd != tc.Command {
 			log.Printf("[R3] normalized find cmd: %q -> %q", tc.Command, cmd)
