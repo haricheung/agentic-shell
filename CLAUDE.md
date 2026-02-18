@@ -76,7 +76,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3 |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
 | `internal/roles/auditor/` | R6 | Bus tap; JSONL audit log; boundary + convergence checks |
-| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; `Abort()` sets `suppressed=true` to block stale post-abort messages; `Resume()` lifts it before each new task |
+| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; `Abort()` sets `suppressed=true` to block stale post-abort messages; `Resume()` lifts it before each new task; spinner uses `\r\033[K` to prevent line-wrap flood |
 | `internal/tools/mdfind.go` | Tool | macOS Spotlight wrapper; `RunMdfind(ctx, query)` → `mdfind -name <query>`; if no results and query has an extension, retries with stem only and post-filters by extension (Spotlight CJK+extension quirk) |
 
 ## Tools Available to Executor
@@ -96,6 +96,8 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 
 `normalizeFindCmd()` in `executor.go:runTool` strips `-maxdepth N` and appends `2>/dev/null` to any `shell find` command as a safety net for model non-compliance.
 
+`redirectPersonalFind()` in `executor.go:runTool` intercepts `shell find` commands targeting personal paths (`/Users/`, `~`, `~/...`, `/home/`, `/Volumes/`) and transparently redirects them to `RunMdfind()` with the extracted `-name` pattern. Project searches (`find .`) and system paths (`find /tmp`) pass through unchanged.
+
 **`glob` pattern notes**: pattern is matched against the filename only (`filepath.Match(pattern, d.Name())`). Globstar prefixes like `**/*.go` are automatically stripped to `*.go` before matching. Do not include `/` in patterns.
 
 ## Role Prompt Contracts (brief)
@@ -112,7 +114,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 
 - Tends to return `status: "uncertain"` even with clear tool output → mitigated by "commit to completed" instruction appended after tool results
 - Follows JSON output format reliably when given concrete examples
-- May still use `find ~` via shell for personal file searches despite `mdfind` guidance → `normalizeFindCmd()` and repeated prompt reinforcement mitigate this
+- May still use `find ~` via shell for personal file searches despite `mdfind` guidance → `redirectPersonalFind()` in `runTool` transparently rewrites these to `mdfind` calls at the code level; no prompt reinforcement needed
 - macOS Spotlight quirk: `mdfind -name 'file.mp4'` returns nothing for CJK filenames with extensions → `RunMdfind` retries with stem only and post-filters by extension
 - Long shell commands (e.g. ffmpeg) emit a large version/config banner before results; `headTail(result, 4000)` ensures the LLM sees both the beginning context and the end result even when total output exceeds 4000 chars
 - R4a will retry `status: completed` results if `ToolCalls` has no output evidence; the `→ <last 120 chars>` appended to each entry is the mechanism that prevents spurious retries
