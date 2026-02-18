@@ -2,17 +2,26 @@ package tools
 
 import (
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 )
 
 // GlobFiles walks root recursively and returns paths whose base name matches
 // pattern (standard filepath.Match syntax: *.go, *.json, etc.).
+// root supports ~ / ~/ prefix (expanded to the user's home directory).
 // If root is empty, it defaults to ".".
 // Inaccessible directories are silently skipped.
 func GlobFiles(root, pattern string) ([]string, error) {
 	if root == "" {
 		root = "."
+	}
+	// Expand leading ~ so callers can pass "~", "~/Downloads", etc.
+	if root == "~" || strings.HasPrefix(root, "~/") || strings.HasPrefix(root, "~\\") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			root = home + root[1:]
+		}
 	}
 
 	var matches []string

@@ -265,3 +265,31 @@ Replaced `bufio.Scanner` in `runREPL` with `github.com/chzyer/readline`:
 - **Dispatcher now uses per-task contexts**: `runSubtaskDispatcher` maintains `taskCtxs map[parentTaskID → {ctx, cancel}]`. Each executor/agentval goroutine receives the task-specific context. When Ctrl+C fires, the signal handler sends the `taskID` to `abortTaskCh`; the dispatcher calls `entry.cancel()` to stop all goroutines for that task (cancels in-flight LLM calls and shell commands immediately).
 - **`Display.Abort()`**: new method sends to `abortCh`; the `Run()` goroutine calls `endTask(false)` — prints the `❌` footer, sets `inTask = false`, stops spinner and flow lines.
 - **Signal handler no longer exits on second Ctrl+C**: when `taskCancel == nil` (idle), the handler does nothing. Exiting is exclusively via readline's `ErrInterrupt` → two-press confirmation, or typing `exit`/`Ctrl+D`. This eliminates the accidental-exit race.
+
+---
+
+## Issue #12 — `glob` with `root:"."` finds no user personal files
+
+**Symptom**
+```
+[R3] tool glob result: (no files matched pattern *三个代表* under .)
+```
+Searching for a file in the user's Downloads or home directory returned nothing.
+
+**Root causes**
+1. **`root: "."` is the project working directory**, not the user's home. `GlobFiles(".", pattern)` walks `/Users/haricheung/code/agentic-shell` — a code repository — which contains no personal documents.
+2. **`GlobFiles` did not expand `~`**: passing `root: "~"` or `root: "~/Downloads"` would walk a literal directory named `~` on disk (which doesn't exist), silently returning no results.
+
+**Fix**
+- **`internal/tools/glob.go`**: Added `~` prefix expansion at the top of `GlobFiles`:
+  ```go
+  if root == "~" || strings.HasPrefix(root, "~/") || strings.HasPrefix(root, "~\\") {
+      home, err := os.UserHomeDir()
+      if err == nil { root = home + root[1:] }
+  }
+  ```
+- **`internal/roles/executor/executor.go` system prompt**: Added explicit `root` guidance under the `glob` tool description:
+  - `root: "."` → current project directory (code/configs in repo); use for project-scoped searches.
+  - `root: "~"` → user's home directory; use when searching for personal files (documents, downloads, music, photos, etc.).
+  - `root: "~/Downloads"`, `root: "~/Documents"`, etc. → specific user directories.
+  - **Never** use `root: "."` to search for user personal files — it will find nothing outside the project.
