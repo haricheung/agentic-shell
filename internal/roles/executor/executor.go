@@ -20,13 +20,13 @@ import (
 const systemPrompt = `You are R3 — Executor. Your mission is to execute exactly one assigned sub-task and return a concrete, verifiable result.
 
 Available tools:
-- glob: find files by pattern, recursively. Input: {"action":"tool","tool":"glob","pattern":"*.go","root":"."}
-  PREFER over shell for ANY file discovery task — faster, always recursive, never fails on empty results.
-  root MUST reflect where the files actually live:
-    • "."  → current project directory (code, configs in the repo). Use for project-scoped searches.
-    • "~"  → user's home directory. Use when searching for the user's personal files (documents, downloads, music, photos, etc.).
-    • "~/Downloads", "~/Documents", etc. → specific user directories.
-  NEVER use root:"." to search for user personal files — it will find nothing outside the project.
+- mdfind: macOS Spotlight search — FASTEST way to find personal files by name. Input: {"action":"tool","tool":"mdfind","query":"三个代表"}
+  Uses the OS Spotlight index; finds results in <1 second regardless of file location.
+  ALWAYS use mdfind (not glob, not shell find) when the user asks to find personal files by name
+  (documents, downloads, music, videos, photos, or any file outside the current project).
+- glob: find project files by pattern. Input: {"action":"tool","tool":"glob","pattern":"*.go","root":"."}
+  Use ONLY for project-scoped file searches (source code, configs in the repo).
+  root:"." = current project directory. Do NOT use glob to search for personal files; use mdfind instead.
 - read_file: read a file. Input: {"action":"tool","tool":"read_file","path":"..."}
 - write_file: write a file. Input: {"action":"tool","tool":"write_file","path":"...","content":"..."}
 - applescript: control macOS/Apple apps via AppleScript. Input: {"action":"tool","tool":"applescript","script":"tell application \"Mail\" to ..."}
@@ -44,7 +44,7 @@ Available tools:
 Decision process:
 1. Read the SubTask intent and success_criteria carefully.
 2. You are told the current working directory — use it to construct correct paths.
-3. For file discovery: use glob. For Apple device actions: use applescript or shortcuts. For other system ops: use shell.
+3. For personal file searches: use mdfind (instant). For project file searches: use glob. For Apple device actions: use applescript or shortcuts. For other system ops: use shell.
 4. Execute tools in sequence (one tool call at a time, then wait for the result).
 5. When you have enough evidence to satisfy all success_criteria, output the final ExecutionResult JSON.
 
@@ -273,6 +273,8 @@ func normalizeFindCmd(cmd string) string {
 
 func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 	switch tc.Tool {
+	case "mdfind":
+		return tools.RunMdfind(ctx, tc.Query)
 	case "shell":
 		cmd := normalizeFindCmd(tc.Command)
 		if cmd != tc.Command {
