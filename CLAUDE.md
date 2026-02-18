@@ -71,29 +71,33 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/roles/metaval/` | R4b | Fan-in; merges outcomes; accept or replan |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
 | `internal/roles/auditor/` | R6 | Bus tap; JSONL audit log; boundary + convergence checks |
-| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; no external deps |
+| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; `Abort()` sets `suppressed=true` to block stale post-abort messages; `Resume()` lifts it before each new task |
+| `internal/tools/mdfind.go` | Tool | macOS Spotlight wrapper; `RunMdfind(ctx, query)` → `mdfind -name <query>` |
 
 ## Tools Available to Executor
 
 | Tool | Input fields | When to use |
 |---|---|---|
-| `glob` | `pattern`, `root` | **Preferred** for file discovery — always recursive, no subprocess |
+| `mdfind` | `query` | **Personal file search** — macOS Spotlight index, < 100 ms. Always use for user files (Downloads, Documents, Music, etc.) |
+| `glob` | `pattern`, `root` | **Project file search** — `root:"."` only; pattern matches filename, not full path; `**/` prefix stripped automatically |
 | `read_file` | `path` | Read a single file |
 | `write_file` | `path`, `content` | Write a file |
 | `applescript` | `script` | Control macOS apps (Mail, Calendar, Reminders, Messages, Music…); Calendar/Reminders sync to iPhone/iPad/Watch via iCloud |
 | `shortcuts` | `name`, `input` | Run a named Apple Shortcut (iCloud-synced; can trigger iPhone/Watch automations) |
-| `shell` | `command` | General bash; use for counting/aggregation (`wc -l`), not file discovery |
+| `shell` | `command` | General bash; counting/aggregation (`wc -l`), not file discovery |
 | `search` | `query` | DuckDuckGo instant answer (no API key) |
 
-**Do not use `shell` for file discovery** — the LLM model reliably adds `-maxdepth 1` to `find`
-commands, missing subdirectory files. `normalizeFindCmd()` strips it as a safety net, but `glob`
-is the right tool and avoids the problem entirely.
+**File search hierarchy**: `mdfind` for anything outside the project (user personal files) → `glob` for project files → `shell` only for operations neither handles.
+
+`normalizeFindCmd()` in `executor.go:runTool` strips `-maxdepth N` and appends `2>/dev/null` to any `shell find` command as a safety net for model non-compliance.
+
+**`glob` pattern notes**: pattern is matched against the filename only (`filepath.Match(pattern, d.Name())`). Globstar prefixes like `**/*.go` are automatically stripped to `*.go` before matching. Do not include `/` in patterns.
 
 ## Known Model Behaviour (Volcengine/DeepSeek)
 
-- Ignores system-prompt instructions to avoid `-maxdepth 1` in `find` → mitigated by `normalizeFindCmd()` in `executor.go:runTool`
-- Tends to return `status: "uncertain"` even with clear tool output → mitigated by prompt and "commit to completed" instruction after tool results
+- Tends to return `status: "uncertain"` even with clear tool output → mitigated by "commit to completed" instruction appended after tool results
 - Follows JSON output format reliably when given concrete examples
+- May still use `find ~` via shell for personal file searches despite `mdfind` guidance → `normalizeFindCmd()` and repeated prompt reinforcement mitigate this
 
 ## Memory System
 
@@ -107,6 +111,19 @@ is the right tool and avoids the problem entirely.
 Each REPL turn records `{input, result.Summary}` in a rolling 5-entry history.
 `buildSessionContext()` formats it and passes it to the Perceiver so follow-up inputs
 ("wrong", "bullshit", "do it again", pronouns) resolve against prior context.
+
+`printResult` detects string output (via marshal+unmarshal roundtrip) and prints it with
+`fmt.Println` so `\n` renders as real newlines. Structured output (object/array) falls back
+to `json.MarshalIndent`. Output is suppressed when it duplicates the summary.
+
+## Abort Handling
+
+Ctrl+C in REPL aborts only the current task, never the process:
+1. Signal handler calls `taskCancel()` (per-task context) + sends `taskID` to `abortTaskCh`.
+2. Dispatcher calls `entry.cancel()` for that task's executor/agentval goroutines.
+3. Executor checks `ctx.Err()` before every `bus.Publish()` — cancelled contexts skip publish entirely, preventing stale `ExecutionResult` messages from reaching the bus.
+4. `disp.Abort()` closes the pipeline box and sets `suppressed=true`; stale in-flight messages are drained silently.
+5. `disp.Resume()` is called at the top of the next user task to re-enable the pipeline box.
 
 ## Design Documents
 
