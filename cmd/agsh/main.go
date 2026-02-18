@@ -456,12 +456,32 @@ func printResult(result types.FinalResult) {
 	)
 	fmt.Printf("\n%s%s📋 Result%s\n", bold, green, reset)
 	fmt.Println(result.Summary)
-	if result.Output != nil {
-		if b, err := json.MarshalIndent(result.Output, "", "  "); err == nil {
-			fmt.Println(string(b))
-		} else {
-			fmt.Println(result.Output)
+	if result.Output == nil {
+		return
+	}
+	// If output is a plain string, print it directly so \n renders as newlines
+	// rather than being JSON-encoded to visible "\n" escape sequences.
+	// After bus/JSON round-trips, string values surface as either Go string
+	// or interface{} containing string — handle both.
+	b, err := json.Marshal(result.Output)
+	if err != nil {
+		fmt.Println(result.Output)
+		return
+	}
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		// It's a string — print with real newlines, not JSON escapes.
+		if s != result.Summary {
+			fmt.Println(s)
 		}
+		return
+	}
+	// Structured output (object/array) — pretty-print as indented JSON.
+	var pretty []byte
+	if pretty, err = json.MarshalIndent(result.Output, "", "  "); err == nil {
+		fmt.Println(string(pretty))
+	} else {
+		fmt.Println(result.Output)
 	}
 }
 
