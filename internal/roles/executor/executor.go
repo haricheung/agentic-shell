@@ -24,9 +24,10 @@ Available tools:
   Uses the OS Spotlight index; finds results in <1 second regardless of file location.
   ALWAYS use mdfind (not glob, not shell find) when the user asks to find personal files by name
   (documents, downloads, music, videos, photos, or any file outside the current project).
-- glob: find project files by pattern. Input: {"action":"tool","tool":"glob","pattern":"*.go","root":"."}
-  Use ONLY for project-scoped file searches (source code, configs in the repo).
-  root:"." = current project directory. Do NOT use glob to search for personal files; use mdfind instead.
+- glob: find project files by filename pattern. Input: {"action":"tool","tool":"glob","pattern":"*.json","root":"."}
+  Pattern matches the FILENAME ONLY — do NOT include "/" (e.g. use "*.json" not "**/*.json").
+  Use ONLY for project-scoped searches (source code, configs). root:"." = current project directory.
+  Do NOT use glob for personal files — use mdfind instead.
 - read_file: read a file. Input: {"action":"tool","tool":"read_file","path":"..."}
 - write_file: write a file. Input: {"action":"tool","tool":"write_file","path":"...","content":"..."}
 - applescript: control macOS/Apple apps via AppleScript. Input: {"action":"tool","tool":"applescript","script":"tell application \"Mail\" to ..."}
