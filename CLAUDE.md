@@ -49,9 +49,14 @@ R6 Auditor  auditor/   (read-only bus tap, JSONL log)
 can register independent tap channels via `bus.NewTap()` (Auditor and UI each hold one). Publish
 is non-blocking — slow subscribers drop messages with a log warning.
 
-**Subtask dispatcher** (`cmd/agsh/main.go:runSubtaskDispatcher`): bridges the bus to per-subtask
-goroutines. Each SubTask spawns a paired `Executor + AgentValidator`; `ExecutionResult` bus
-messages are routed by subtask ID to the correct AgentValidator channel.
+**Subtask dispatcher** (`cmd/agsh/main.go:runSubtaskDispatcher`): sequence-aware; subscribes to
+`MsgDispatchManifest` to learn expected subtask count, buffers incoming `SubTask` messages by
+`sequence` number, then dispatches in order:
+- Same sequence number → all subtasks in that group launch in parallel.
+- Different sequence numbers → strictly ordered; the next group only starts when the current group
+  completes. Outputs from each completed group are injected into every next-group subtask's
+  `Context` field as "Outputs from prior steps" so later subtasks (e.g. "extract audio") can use
+  paths discovered by earlier subtasks (e.g. "locate file") without re-running discovery.
 
 **Correction dual-publish**: `CorrectionSignal` is published to the bus (for Auditor observability)
 AND sent via a direct channel (for routing to the paired Executor). Both are required.
@@ -64,11 +69,11 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/types/types.go` | Shared schemas | All message and data types |
 | `internal/bus/bus.go` | Message bus | Foundation; all roles depend on this |
 | `internal/llm/client.go` | LLM client | Single `Chat(ctx, system, user)` method; `StripFences()` helper |
-| `internal/roles/perceiver/` | R1 | Translates input → TaskSpec; uses session history for follow-up context |
-| `internal/roles/planner/` | R2 | TaskSpec → SubTask[]; queries memory first; handles ReplanRequest |
-| `internal/roles/executor/` | R3 | Executes one SubTask via tool loop; correction-aware |
-| `internal/roles/agentval/` | R4a | Scores ExecutionResult; drives retry loop; maxRetries=2 |
-| `internal/roles/metaval/` | R4b | Fan-in; merges outcomes; accept or replan |
+| `internal/roles/perceiver/` | R1 | Translates input → TaskSpec (short snake_case task_id; binary success_criteria); session-history aware |
+| `internal/roles/planner/` | R2 | TaskSpec → SubTask[]; queries memory first; assigns sequence numbers for dependency ordering; handles ReplanRequest |
+| `internal/roles/executor/` | R3 | Executes one SubTask via numbered tool priority chain; correction-aware; `correctionPrompt` repeats format and tools |
+| `internal/roles/agentval/` | R4a | Scores ExecutionResult; drives retry loop; maxRetries=2; infrastructure errors → immediate fail |
+| `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3 |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
 | `internal/roles/auditor/` | R6 | Bus tap; JSONL audit log; boundary + convergence checks |
 | `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; `Abort()` sets `suppressed=true` to block stale post-abort messages; `Resume()` lifts it before each new task |
@@ -92,6 +97,16 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 `normalizeFindCmd()` in `executor.go:runTool` strips `-maxdepth N` and appends `2>/dev/null` to any `shell find` command as a safety net for model non-compliance.
 
 **`glob` pattern notes**: pattern is matched against the filename only (`filepath.Match(pattern, d.Name())`). Globstar prefixes like `**/*.go` are automatically stripped to `*.go` before matching. Do not include `/` in patterns.
+
+## Role Prompt Contracts (brief)
+
+| Role | Input | Output | Key constraints |
+|---|---|---|---|
+| R1 | raw input + session history | `TaskSpec` JSON | task_id = short snake_case; success_criteria = verifiable from tool output |
+| R2 | `TaskSpec` + memory | `SubTask[]` JSON | same sequence = parallel; different sequence = dependency ordered; always populate `context` |
+| R3 | `SubTask` | `ExecutionResult` JSON | tool priority: mdfind→glob→read/write→applescript→shortcuts→shell→search; correction prompt repeats format |
+| R4a | `SubTask` + `ExecutionResult` | verdict JSON | trust tool stdout; infra errors → fail immediately; empty search result → matched |
+| R4b | `SubTask[]` outcomes + `TaskSpec` | verdict JSON | accept only when ALL success_criteria met; replan only (no partial_replan); merged_output = concrete data |
 
 ## Known Model Behaviour (Volcengine/DeepSeek)
 
