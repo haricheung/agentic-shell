@@ -241,9 +241,36 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		m.mu.Unlock()
 
 	case "replan":
+		const maxReplans = 3
+
 		m.mu.Lock()
 		m.replanCounts[taskID]++
+		replanCount := m.replanCounts[taskID]
 		m.mu.Unlock()
+
+		// Abandon after too many failed replan rounds to prevent infinite loops.
+		if replanCount >= maxReplans {
+			log.Printf("[R4b] task=%s ABANDONED after %d replan rounds", taskID, replanCount)
+			summary := fmt.Sprintf("❌ Task abandoned after %d failed attempts. %s", replanCount, v.GapSummary)
+			finalResult := types.FinalResult{TaskID: taskID, Summary: summary}
+			m.b.Publish(types.Message{
+				ID:        uuid.New().String(),
+				Timestamp: time.Now().UTC(),
+				From:      types.RoleMetaVal,
+				To:        types.RoleUser,
+				Type:      types.MsgFinalResult,
+				Payload:   finalResult,
+			})
+			if m.outputFn != nil {
+				m.outputFn(taskID, summary, nil)
+			}
+			m.mu.Lock()
+			delete(m.trackers, taskID)
+			delete(m.replanCounts, taskID)
+			delete(m.prevFailedCounts, taskID)
+			m.mu.Unlock()
+			return
+		}
 
 		// Write a procedural memory entry so the planner can avoid the same mistakes
 		type failureLesson struct {

@@ -182,3 +182,86 @@ agsh> bullshit, use wc -l to count properly
 --- Result ---
 Total line count: 2581          ← correct; reused prior context
 ```
+
+---
+
+## Issue #8 — REPL UX: raw log spam, no visual pipeline feedback
+
+**Symptom**
+All `[R1]`, `[R3]` debug log lines printed to the same terminal as user output, making results hard to read. No visual indication of what the system was doing while processing a query.
+
+**Root cause**
+`log.Printf` defaulted to `os.Stderr` (visible in terminal). No progress indicator. No inter-role flow visualization.
+
+**Fix**
+1. Redirect `log` output to `~/.cache/agsh/debug.log` at startup — terminal stays clean.
+2. Added `internal/ui/display.go` — a sci-fi terminal overlay driven by a bus tap:
+   - Braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) with live status label, updated every 80 ms
+   - Flow line per bus message: `  🧠 R1 ──[TaskSpec]──► 📐 R2`
+   - Pipeline box borders: `┌─── ⚡ agsh pipeline ────` / `└─── ✅  18ms ────`
+   - Infrastructure messages (memory read/write) rendered dim; correction signals in red
+   - No external dependencies — pure ANSI escape codes
+3. Modified `bus.go`: single `tapCh` replaced by `taps []chan Message`; `NewTap()` lets auditor and UI each register an independent fan-out channel.
+4. REPL prompt updated to `⚡ agsh` header + cyan `❯` prompt char.
+
+---
+
+## Issue #9 — Infinite replan loop on macOS file-search tasks
+
+**Symptom** (screenshot)
+Searching for movie/music files looped: R4b kept sending ReplanRequest despite the executor finding the correct answer on the first try.
+
+**Root causes** (from debug log analysis)
+1. **macOS TCC/SIP protection**: `~/Music/Music` is system-protected. `find ~/Music` exits with status 1 (`Operation not permitted`), even though files in other directories are returned in stdout. The executor's result was correct and complete, but stderr showed a permission error.
+2. **R4a "empty = incomplete" rule was too broad**: The rule "never accept empty result for a listing task" caused R4a to reject the music subtask even when the shell actually ran and found nothing — because there genuinely are no music files in accessible directories.
+3. **R4a penalised inaccessible OS directories**: It required the search to cover `~/Music` fully, which is impossible. This sent a CorrectionSignal to an executor that had already done everything it could.
+
+**Fix**
+- **`agentval.go` system prompt**: Added two explicit rules:
+  - *Empty-result rule*: if `tool_calls` shows a real search was run and stdout is empty, output `matched` — empty is a valid answer.
+  - *OS permission rule*: `"Operation not permitted"` / `"Permission denied"` in stderr is an OS constraint, not an executor gap; accept the result if all accessible directories were searched.
+- **`executor.go` system prompt**: Added macOS guidance — always append `2>/dev/null` to find; never include `~/Music/Music` or `~/Library`.
+- **`executor.go` `normalizeFindCmd()`**: Code-level guardrail — automatically appends `2>/dev/null` to any `find` command that doesn't already have it, so permission errors never cause exit status 1 or hide stdout results.
+
+---
+
+## Issue #10 — REPL input: backspace broken, arrow keys show codes, Chinese unsupported
+
+**Symptom**
+In the REPL:
+- Backspace printed `^?` instead of deleting the previous character
+- Arrow keys printed raw escape sequences (`^[[A`, `^[[B`, `^[[C`, `^[[D`)
+- Up/down did not navigate command history
+- Chinese (and other multi-byte Unicode) input was garbled or split across reads
+
+**Root cause**
+`bufio.Scanner` reads raw bytes from stdin with no terminal awareness.
+It has no concept of terminal line editing, control sequences, or multi-byte character boundaries.
+
+**Fix**
+Replaced `bufio.Scanner` in `runREPL` with `github.com/chzyer/readline`:
+- Terminal set to raw mode; readline handles backspace, `←→`, `↑↓` natively
+- `↑↓` arrows navigate persistent session history (stored in `~/.cache/agsh/history`)
+- Unicode-aware: correctly handles multi-byte UTF-8 including CJK wide characters
+- `Ctrl+A/E` (line start/end), `Ctrl+W` (delete word) all work
+- Clarify prompt uses `rl.SetPrompt()` so clarification answers also get proper editing
+- `Ctrl+D` exits cleanly (EOF)
+- `bufio.Scanner` retained only in `runTask` (one-shot mode, non-interactive)
+
+---
+
+## Issue #11 — Ctrl+C abort: second press exits program; executor keeps running after abort
+
+**Symptom** (screenshot)
+1. First Ctrl+C: "⚠️ task aborted" shown correctly — but executor/agentval goroutines kept running, display kept printing flow lines and spinning
+2. Second Ctrl+C: "agsh: shutting down" — program exited instead of returning to REPL prompt
+
+**Root causes**
+1. **Executors used main `ctx`**: `runSubtaskDispatcher` called `exec.RunSubTask(ctx, ...)` using the process-wide context. Ctrl+C cancelled only `taskCtx` (the REPL wait loop), not the goroutines doing LLM calls and tool execution.
+2. **Display never saw abort**: `d.inTask` stayed `true` (no FinalResult was received), so the spinner and flow lines kept appearing after abort, flooding the terminal.
+3. **Signal handler called `cancel()` when idle**: when `taskCancel == nil` (after the first abort set it to nil), the SIGINT goroutine called `cancel()` → "agsh: shutting down". This happened in the brief window before readline re-entered raw mode (which would have intercepted Ctrl+C as `ErrInterrupt` instead of SIGINT).
+
+**Fix**
+- **Dispatcher now uses per-task contexts**: `runSubtaskDispatcher` maintains `taskCtxs map[parentTaskID → {ctx, cancel}]`. Each executor/agentval goroutine receives the task-specific context. When Ctrl+C fires, the signal handler sends the `taskID` to `abortTaskCh`; the dispatcher calls `entry.cancel()` to stop all goroutines for that task (cancels in-flight LLM calls and shell commands immediately).
+- **`Display.Abort()`**: new method sends to `abortCh`; the `Run()` goroutine calls `endTask(false)` — prints the `❌` footer, sets `inTask = false`, stops spinner and flow lines.
+- **Signal handler no longer exits on second Ctrl+C**: when `taskCancel == nil` (idle), the handler does nothing. Exiting is exclusively via readline's `ErrInterrupt` → two-press confirmation, or typing `exit`/`Ctrl+D`. This eliminates the accidental-exit race.

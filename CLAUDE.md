@@ -10,7 +10,15 @@ go run ./cmd/agsh                                   # REPL mode
 go run ./cmd/agsh "list all go files"               # one-shot mode
 ```
 
-Cache files (memory, audit log) are written to `~/.cache/agsh/`.
+Cache / log files written to `~/.cache/agsh/`:
+
+| File | Contents |
+|---|---|
+| `memory.json` | Persistent episodic + procedural memory |
+| `audit.jsonl` | Structured audit events |
+| `debug.log` | Internal role debug logs (redirected from stderr at startup) |
+
+To watch debug output live: `tail -f ~/.cache/agsh/debug.log`
 
 ## Environment Configuration
 
@@ -37,8 +45,9 @@ User input
 R6 Auditor  auditor/   (read-only bus tap, JSONL log)
 ```
 
-**Message bus** (`internal/bus/`): every inter-role message passes through it. Auditor gets a
-read-only tap. Publish is non-blocking — slow subscribers drop messages with a log warning.
+**Message bus** (`internal/bus/`): every inter-role message passes through it. Multiple consumers
+can register independent tap channels via `bus.NewTap()` (Auditor and UI each hold one). Publish
+is non-blocking — slow subscribers drop messages with a log warning.
 
 **Subtask dispatcher** (`cmd/agsh/main.go:runSubtaskDispatcher`): bridges the bus to per-subtask
 goroutines. Each SubTask spawns a paired `Executor + AgentValidator`; `ExecutionResult` bus
@@ -62,6 +71,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/roles/metaval/` | R4b | Fan-in; merges outcomes; accept or replan |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
 | `internal/roles/auditor/` | R6 | Bus tap; JSONL audit log; boundary + convergence checks |
+| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; no external deps |
 
 ## Tools Available to Executor
 

@@ -49,13 +49,14 @@ func New(b *bus.Bus, llmClient *llm.Client, clarifyFn func(string) (string, erro
 }
 
 // Process takes raw user input, possibly asks a clarifying question, and publishes a TaskSpec.
+// It returns the task ID so the caller can correlate the eventual FinalResult.
 // sessionContext is a summary of recent REPL history; pass "" for one-shot mode.
-func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string) error {
+func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string) (string, error) {
 	input := rawInput
 	for {
 		spec, needsClarification, question, err := p.perceive(ctx, input, sessionContext)
 		if err != nil {
-			return fmt.Errorf("perceiver: %w", err)
+			return "", fmt.Errorf("perceiver: %w", err)
 		}
 
 		if !needsClarification {
@@ -68,13 +69,13 @@ func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string
 				Payload:   spec,
 			})
 			log.Printf("[R1] published TaskSpec task_id=%s", spec.TaskID)
-			return nil
+			return spec.TaskID, nil
 		}
 
 		// Ask user for clarification
 		answer, err := p.clarify(question)
 		if err != nil {
-			return fmt.Errorf("perceiver: clarification: %w", err)
+			return "", fmt.Errorf("perceiver: clarification: %w", err)
 		}
 		// Append the Q&A to the input for next round; keep session context unchanged
 		input = fmt.Sprintf("%s\n\nClarification: Q: %s A: %s", rawInput, question, answer)

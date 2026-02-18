@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chzyer/readline"
 	"github.com/joho/godotenv"
 
 	"github.com/haricheung/agentic-shell/internal/bus"
@@ -26,6 +27,7 @@ import (
 	"github.com/haricheung/agentic-shell/internal/roles/perceiver"
 	"github.com/haricheung/agentic-shell/internal/roles/planner"
 	"github.com/haricheung/agentic-shell/internal/types"
+	"github.com/haricheung/agentic-shell/internal/ui"
 )
 
 func main() {
@@ -36,6 +38,17 @@ func main() {
 	homeDir, _ := os.UserHomeDir()
 	cacheDir := filepath.Join(homeDir, ".cache", "agsh")
 
+	// Ensure cache directory exists before opening any files.
+	_ = os.MkdirAll(cacheDir, 0755)
+
+	// Redirect debug logs to file so they don't interfere with the terminal UI.
+	// Tail ~/.cache/agsh/debug.log to observe internal role activity.
+	if f, err := os.OpenFile(filepath.Join(cacheDir, "debug.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+		log.SetOutput(f)
+		defer f.Close()
+	}
+
 	// Build the bus — foundational, everything depends on it
 	b := bus.New()
 
@@ -45,6 +58,9 @@ func main() {
 	// Infrastructure roles
 	mem := memory.New(b, filepath.Join(cacheDir, "memory.json"))
 	aud := auditor.New(b.Tap(), filepath.Join(cacheDir, "audit.jsonl"))
+
+	// Sci-fi terminal UI — reads its own independent tap of every bus message
+	disp := ui.New(b.NewTap())
 
 	// Final result channel — delivers output to the REPL/one-shot handler
 	resultCh := make(chan types.FinalResult, 4)
@@ -59,14 +75,16 @@ func main() {
 	exec := executor.New(b, llmClient)
 	av := agentval.New(b, llmClient)
 
-	// Context with signal handling
+	// Context — cancelled on SIGTERM or when the current mode finishes.
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGTERM) // Ctrl+C (SIGINT) handled per-mode below
 	go func() {
-		<-sigCh
-		fmt.Println("\nagsh: shutting down")
-		cancel()
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	// Start persistent goroutines
@@ -74,13 +92,28 @@ func main() {
 	go aud.Run(ctx)
 	go plan.Run(ctx)
 	go mv.Run(ctx)
+	go disp.Run(ctx)
+
+	// Task abort channel: REPL sends a taskID here when Ctrl+C is pressed mid-task.
+	// The dispatcher cancels all executor/agentval goroutines for that task.
+	abortTaskCh := make(chan string, 4)
 
 	// Subtask dispatcher: subscribes to SubTask messages and spawns paired executor/agentval goroutines
-	go runSubtaskDispatcher(ctx, b, exec, av)
+	go runSubtaskDispatcher(ctx, b, exec, av, abortTaskCh)
 
 	// REPL or one-shot
 	if len(os.Args) > 1 && os.Args[1] != "" {
-		// One-shot mode
+		// One-shot mode: Ctrl+C cancels the whole task and exits.
+		intrCh := make(chan os.Signal, 1)
+		signal.Notify(intrCh, os.Interrupt)
+		go func() {
+			select {
+			case <-intrCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
 		input := strings.Join(os.Args[1:], " ")
 		if err := runTask(ctx, b, llmClient, input, resultCh); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -94,14 +127,15 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	} else {
 		// REPL mode
-		runREPL(ctx, b, llmClient, resultCh, cancel)
+		runREPL(ctx, b, llmClient, resultCh, cancel, cacheDir, disp, abortTaskCh)
 	}
 }
 
 // runSubtaskDispatcher subscribes to SubTask and ExecutionResult messages on the bus.
 // For each SubTask it spawns a paired Executor+AgentValidator goroutine set.
-// It bridges ExecutionResult bus messages back to the AgentValidator's direct result channel.
-func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Executor, av *agentval.AgentValidator) {
+// abortTaskCh receives task IDs to cancel; the matching executor/agentval goroutines are
+// stopped immediately when a task abort is requested.
+func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Executor, av *agentval.AgentValidator, abortTaskCh <-chan string) {
 	subTaskCh := b.Subscribe(types.MsgSubTask)
 	execResultCh := b.Subscribe(types.MsgExecutionResult)
 
@@ -110,6 +144,13 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 		correctionCh chan types.CorrectionSignal
 	}
 
+	// Per-task cancellable contexts so we can abort all goroutines for a given task.
+	type taskCtxEntry struct {
+		ctx    context.Context
+		cancel context.CancelFunc
+	}
+	taskCtxs := make(map[string]*taskCtxEntry) // parentTaskID -> entry
+
 	var mu sync.Mutex
 	states := make(map[string]*subtaskState) // subtask_id -> state
 
@@ -117,6 +158,16 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 		select {
 		case <-ctx.Done():
 			return
+
+		case taskID, ok := <-abortTaskCh:
+			if !ok {
+				return
+			}
+			if entry, found := taskCtxs[taskID]; found {
+				log.Printf("[DISPATCHER] aborting task=%s", taskID)
+				entry.cancel()
+				delete(taskCtxs, taskID)
+			}
 
 		case msg, ok := <-subTaskCh:
 			if !ok {
@@ -127,6 +178,15 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 				log.Printf("[DISPATCHER] ERROR: bad SubTask payload: %v", err)
 				continue
 			}
+
+			// Get or create a cancellable context for this parent task.
+			entry, exists := taskCtxs[st.ParentTaskID]
+			if !exists {
+				tCtx, tCancel := context.WithCancel(ctx)
+				entry = &taskCtxEntry{ctx: tCtx, cancel: tCancel}
+				taskCtxs[st.ParentTaskID] = entry
+			}
+			taskCtx := entry.ctx
 
 			resultC := make(chan types.ExecutionResult, 8)
 			correctionC := make(chan types.CorrectionSignal, 8)
@@ -142,9 +202,9 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 
 			// Capture for goroutine
 			subTask := st
-			go exec.RunSubTask(ctx, subTask, correctionC)
+			go exec.RunSubTask(taskCtx, subTask, correctionC)
 			go func() {
-				av.Run(ctx, subTask, resultC, correctionC)
+				av.Run(taskCtx, subTask, resultC, correctionC)
 				// Clean up state after AgentValidator completes
 				mu.Lock()
 				delete(states, subTask.SubTaskID)
@@ -190,7 +250,7 @@ func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input strin
 	}
 
 	p := perceiver.New(b, llmClient, clarifyFn)
-	if err := p.Process(ctx, input, ""); err != nil {
+	if _, err := p.Process(ctx, input, ""); err != nil {
 		return fmt.Errorf("perceiver: %w", err)
 	}
 
@@ -210,20 +270,84 @@ type sessionEntry struct {
 	Summary string
 }
 
-func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, cancel context.CancelFunc) {
-	scanner := bufio.NewScanner(os.Stdin)
+func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string) {
+	fmt.Println("\033[1m\033[36m⚡ agsh\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.cache/agsh/debug.log)\033[0m")
 
-	fmt.Println("agsh — agentic shell (type 'exit' to quit)")
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:            "\033[36m❯\033[0m ",
+		HistoryFile:       filepath.Join(cacheDir, "history"),
+		HistorySearchFold: true,
+		InterruptPrompt:   "^C",
+		EOFPrompt:         "exit",
+	})
+	if err != nil {
+		// readline unavailable (e.g. not a TTY) — not expected in normal usage
+		fmt.Fprintf(os.Stderr, "readline init error: %v\n", err)
+		cancel()
+		return
+	}
+	defer rl.Close()
 
 	const maxHistory = 5
 	var history []sessionEntry
 
+	// Per-task state — protected by taskMu.
+	var taskMu sync.Mutex
+	var taskCancel context.CancelFunc
+	var currentTaskID string
+
+	// Ctrl+C during task execution (readline NOT active): abort the task only.
+	// Ctrl+C during readline input arrives as readline.ErrInterrupt (handled below).
+	// We never call cancel() from here — readline's ErrInterrupt handles "really quit".
+	intrCh := make(chan os.Signal, 1)
+	signal.Notify(intrCh, os.Interrupt)
+	defer signal.Stop(intrCh)
+	go func() {
+		for {
+			select {
+			case <-intrCh:
+				taskMu.Lock()
+				tc := taskCancel
+				tid := currentTaskID
+				taskMu.Unlock()
+				if tc != nil {
+					tc() // cancel per-task context (unblocks waitResult)
+					// Tell dispatcher to cancel the executor/agentval goroutines.
+					select {
+					case abortTaskCh <- tid:
+					default:
+					}
+					disp.Abort() // close the pipeline box immediately
+					fmt.Print("\r\033[K\n\033[33m⚠️  task aborted\033[0m  (type 'exit' or Ctrl+D to quit)\n")
+				}
+				// When idle (tc == nil), do nothing — readline's ErrInterrupt handles exit.
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	for {
-		fmt.Print("\nagsh> ")
-		if !scanner.Scan() {
+		// readline handles: backspace, arrow keys, Ctrl+A/E, history (↑↓), Unicode/CJK.
+		line, err := rl.Readline()
+		if err == readline.ErrInterrupt {
+			// Ctrl+C while idle (no task running) — first press warns, close loop exits.
+			fmt.Println("\n\033[2m(Ctrl+C again or type 'exit' to quit)\033[0m")
+			line2, err2 := rl.Readline()
+			if err2 == readline.ErrInterrupt || strings.TrimSpace(line2) == "exit" || strings.TrimSpace(line2) == "quit" {
+				cancel()
+				return
+			}
+			line = line2
+			err = err2
+		}
+		if err != nil {
+			// io.EOF (Ctrl+D) or other error → exit cleanly
+			cancel()
 			break
 		}
-		input := strings.TrimSpace(scanner.Text())
+
+		input := strings.TrimSpace(line)
 		if input == "" {
 			continue
 		}
@@ -232,31 +356,73 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			break
 		}
 
+		// Per-task context: cancelling it aborts only this task, not the whole process.
+		taskCtx, tCancel := context.WithCancel(ctx)
+		taskMu.Lock()
+		taskCancel = tCancel
+		currentTaskID = "" // will be set after Process() returns the ID
+		taskMu.Unlock()
+
 		clarifyFn := func(question string) (string, error) {
-			fmt.Printf("? %s\n> ", question)
-			if scanner.Scan() {
-				return scanner.Text(), nil
+			rl.SetPrompt(fmt.Sprintf("\033[33m?\033[0m %s\n\033[36m❯\033[0m ", question))
+			ans, err := rl.Readline()
+			rl.SetPrompt("\033[36m❯\033[0m ")
+			if err != nil {
+				return "", fmt.Errorf("no input")
 			}
-			return "", fmt.Errorf("no input")
+			return strings.TrimSpace(ans), nil
 		}
 
 		p := perceiver.New(b, llmClient, clarifyFn)
-		if err := p.Process(ctx, input, buildSessionContext(history)); err != nil {
+		taskID, err := p.Process(taskCtx, input, buildSessionContext(history))
+		if err != nil {
+			taskMu.Lock()
+			taskCancel = nil
+			currentTaskID = ""
+			taskMu.Unlock()
+			tCancel()
+			if taskCtx.Err() != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				continue
+			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			continue
 		}
+		// Register task ID so the signal handler can send it to the dispatcher on abort.
+		taskMu.Lock()
+		currentTaskID = taskID
+		taskMu.Unlock()
 
-		// Wait for result (non-blocking with context)
-		select {
-		case <-ctx.Done():
-			return
-		case result := <-resultCh:
-			printResult(result)
-			// Record this turn in session history
-			history = append(history, sessionEntry{Input: input, Summary: result.Summary})
-			if len(history) > maxHistory {
-				history = history[len(history)-maxHistory:]
+		// Wait for the result matching this task ID.
+		// Discard stale FinalResults from previously aborted tasks.
+	waitResult:
+		for {
+			select {
+			case <-taskCtx.Done():
+				break waitResult
+			case result := <-resultCh:
+				if result.TaskID != taskID {
+					continue // stale result from a previously aborted task
+				}
+				printResult(result)
+				history = append(history, sessionEntry{Input: input, Summary: result.Summary})
+				if len(history) > maxHistory {
+					history = history[len(history)-maxHistory:]
+				}
+				break waitResult
 			}
+		}
+
+		taskMu.Lock()
+		taskCancel = nil
+		currentTaskID = ""
+		taskMu.Unlock()
+		tCancel()
+
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }
@@ -282,10 +448,14 @@ func firstN(s string, n int) string {
 }
 
 func printResult(result types.FinalResult) {
-	fmt.Println("\n--- Result ---")
+	const (
+		bold  = "\033[1m"
+		green = "\033[32m"
+		reset = "\033[0m"
+	)
+	fmt.Printf("\n%s%s📋 Result%s\n", bold, green, reset)
 	fmt.Println(result.Summary)
 	if result.Output != nil {
-		// Pretty-print if structured
 		if b, err := json.MarshalIndent(result.Output, "", "  "); err == nil {
 			fmt.Println(string(b))
 		} else {

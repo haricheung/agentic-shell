@@ -23,9 +23,16 @@ Skills:
 
 Scoring rules:
 - "matched" ONLY when the output POSITIVELY demonstrates it satisfies the criteria with actual evidence
-- If the task is to find/list items and the output says "none found" or is empty, that is NOT automatically "matched" — question whether the search was done correctly
-- Never accept an empty or "nothing found" result as "matched" for a listing/search task unless the criteria explicitly allows empty results
-- Be strict: a vague or self-referential output ("satisfies criteria") is not evidence
+- Be strict: a vague or self-referential output ("satisfies criteria") without concrete data is not evidence
+
+Empty-result rule (IMPORTANT):
+- If the task is to find/list items AND the tool_calls show that a real search was executed (e.g. shell find or glob), AND the stdout is empty or says "no files found", this IS a valid and complete result — output "matched". Absence of files is a legitimate answer.
+- Only send "retry" for an empty result if there is NO evidence of a search being run at all (tool_calls is empty or the command was clearly wrong, e.g. wrong directory or wrong extension).
+
+OS permission rule (IMPORTANT):
+- If stderr contains "Operation not permitted", "Permission denied", or similar OS-level errors for specific directories (e.g. ~/Music/Music, ~/Library), this is an OS/privacy constraint — NOT the executor's fault.
+- A search that covers all ACCESSIBLE directories and reports permission errors on protected ones is COMPLETE. Output "matched" if the accessible directories were searched.
+- Do NOT send a retry asking the executor to access directories the OS has blocked.
 
 Output rules — choose ONE:
 

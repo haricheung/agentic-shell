@@ -13,18 +13,17 @@ const (
 )
 
 // Bus is the observable message bus. All inter-role communication passes through it.
-// The Auditor receives a read-only tap channel for every message published.
+// Multiple consumers (Auditor, UI) can each register their own tap channel via NewTap.
 type Bus struct {
 	mu          sync.RWMutex
 	subscribers map[types.MessageType][]chan types.Message
-	tapCh       chan types.Message
+	taps        []chan types.Message
 }
 
 // New creates a new Bus.
 func New() *Bus {
 	return &Bus{
 		subscribers: make(map[types.MessageType][]chan types.Message),
-		tapCh:       make(chan types.Message, tapBufSize),
 	}
 }
 
@@ -43,11 +42,16 @@ func (b *Bus) Publish(msg types.Message) {
 		}
 	}
 
-	// Send to tap (auditor). Non-blocking to avoid auditor backpressure stalling the bus.
-	select {
-	case b.tapCh <- msg:
-	default:
-		log.Printf("[BUS] WARNING: tap channel full — audit message dropped type=%s", msg.Type)
+	// Fan out to all tap channels (auditor, UI, etc.). Non-blocking.
+	b.mu.RLock()
+	taps := b.taps
+	b.mu.RUnlock()
+	for _, tap := range taps {
+		select {
+		case tap <- msg:
+		default:
+			log.Printf("[BUS] WARNING: tap channel full — message dropped type=%s", msg.Type)
+		}
 	}
 }
 
@@ -61,8 +65,17 @@ func (b *Bus) Subscribe(t types.MessageType) <-chan types.Message {
 	return ch
 }
 
-// Tap returns the read-only tap channel for the Auditor.
-// Only one consumer should call this; calling it multiple times returns the same channel.
+// NewTap registers and returns a new read-only tap channel.
+// Each caller gets an independent channel that receives every published message.
+func (b *Bus) NewTap() <-chan types.Message {
+	ch := make(chan types.Message, tapBufSize)
+	b.mu.Lock()
+	b.taps = append(b.taps, ch)
+	b.mu.Unlock()
+	return ch
+}
+
+// Tap is an alias for NewTap, kept for backward compatibility.
 func (b *Bus) Tap() <-chan types.Message {
-	return b.tapCh
+	return b.NewTap()
 }

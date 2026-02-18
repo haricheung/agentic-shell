@@ -32,6 +32,8 @@ Available tools:
   Use for: triggering user-defined iPhone/Watch automations (e.g. alarms via Clock app, Watch faces, HomeKit scenes).
 - shell: run a bash command. Input: {"action":"tool","tool":"shell","command":"..."}
   Use for system operations, NOT file discovery and NOT Apple app control.
+  For find commands: ALWAYS append 2>/dev/null so that "Operation not permitted" errors on macOS-protected directories do not cause exit status 1 or hide results from other directories.
+  On macOS, never include ~/Music/Music or ~/Library in find paths — they are system-protected and always fail.
 - search: web search. Input: {"action":"tool","tool":"search","query":"..."}
 
 Decision process:
@@ -234,8 +236,16 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 var maxdepthRe = regexp.MustCompile(`-maxdepth\s+\d+\s*`)
 
 func normalizeFindCmd(cmd string) string {
-	if strings.HasPrefix(strings.TrimSpace(cmd), "find ") {
-		return maxdepthRe.ReplaceAllString(cmd, "")
+	trimmed := strings.TrimSpace(cmd)
+	if !strings.HasPrefix(trimmed, "find ") {
+		return cmd
+	}
+	// Strip -maxdepth N
+	cmd = maxdepthRe.ReplaceAllString(cmd, "")
+	// Always suppress permission errors so they don't hide results or cause exit status 1.
+	// This matters on macOS where ~/Music/Music, ~/Library etc. are TCC-protected.
+	if !strings.Contains(cmd, "2>/dev/null") && !strings.Contains(cmd, "2> /dev/null") {
+		cmd = strings.TrimRight(cmd, " \t") + " 2>/dev/null"
 	}
 	return cmd
 }
