@@ -1,4 +1,5 @@
 # Bug Log & Fix History
+[toc]
 
 Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
