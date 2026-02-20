@@ -1078,28 +1078,33 @@ base = strings.TrimSuffix(base, "/chat/completions")
 
 ---
 
-## Issue #36 — Left-arrow cursor movement broken in REPL input
+## Issue #36 — Left-arrow / Home cursor movement broken with CJK input
 
 **Symptom**
-Pressing the left arrow key while editing a REPL input line moved the terminal
-cursor to the wrong column. The cursor appeared stuck or jumped incorrectly,
-especially noticeable when editing CJK text.
+- Pressing left-arrow while typing CJK text left the cursor in the wrong
+  column (did not move back by a full character width).
+- Pressing Home (go-to-start) placed the cursor mid-line, not at column 0.
+- Backspace correctly deleted one CJK character per press.
+- Entering ASCII text after CJK caused it to appear at the leftmost column
+  instead of at the cursor position.
 
-**Root cause**
-`chzyer/readline` measures prompt width by counting raw bytes, not visual
-characters. The prompt `"\033[36m❯\033[0m "` contains ANSI escape sequences
-that are invisible (zero visual width) but 5–7 bytes long. readline counted
-those bytes as columns, so its cursor offset was wrong by ~12 columns and
-left-arrow movement landed in the wrong position.
+**Root cause (series of investigations)**
+
+| Attempt | Hypothesis | Result |
+|---|---|---|
+| 1 | Prompt ANSI bytes counted as columns → wrong offset | Wrong: `ColorFilter` already strips ANSI before measuring |
+| 2 | `❯` (U+276F) ambiguous width: Ghostty renders 2 cols but `runewidth` says 1 → promptLen mismatch | Partially right: replaced `❯` with ASCII `>` but cursor still broken |
+| Final | `getBackspaceSequence()` in `runebuf.go` emits exactly **1 `\b` per rune** regardless of character width; CJK chars are 2 columns wide, so backing up by 1 column leaves cursor one column short per character; also, the `sep` (line-wrap boundary) map indexed by visual column was used as if it were a rune index — harmless for ASCII but wrong for CJK | ✅ Root cause confirmed |
 
 **Fix**
-Wrap every ANSI escape sequence in the prompt with `\x01` (start of
-non-printing region) and `\x02` (end), which is readline's standard marker
-for zero-width spans (equivalent to `\[`/`\]` in bash PS1):
-```
-before: "\033[36m❯\033[0m "
-after:  "\x01\033[36m\x02❯\x01\033[0m\x02 "
-```
+Created a patched local copy of `chzyer/readline` at
+`internal/readline_compat/` and wired it via a `go.mod` `replace` directive.
+
+Changed `getBackspaceSequence()` in `runebuf.go`:
+1. **Backspace count**: emit `runes.Width(r.buf[i-1])` backspaces per rune
+   instead of always 1 — so CJK chars back up 2 columns.
+2. **`sep` map**: rebuilt indexed by rune position (not visual column), using
+   `col/r.width < (col+w)/r.width` to detect line-wrap boundary crossings.
 
 ---
 
