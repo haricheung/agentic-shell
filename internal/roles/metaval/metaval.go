@@ -17,10 +17,13 @@ import (
 
 const systemPrompt = `You are R4b — Meta-Validator. Merge SubTaskOutcome results and decide whether the task is complete or needs replanning.
 
+Each SubTaskOutcome carries the subtask's intent and success_criteria that R4a was checking.
+Your job: verify that every criterion across all subtasks is satisfied by the combined outputs.
+
 Assessment rules:
-- "accept" if the combined outputs of all subtasks satisfy every success criterion in the TaskSpec. Failed subtasks are acceptable if the overall goal is met by the remaining outputs.
-- "replan" if one or more success criteria remain unmet and the gap is addressable by replanning. Summarise exactly what is missing and why.
-- Do NOT accept if a critical subtask failed and its output is required to satisfy the TaskSpec.
+- "accept" ONLY when the combined outputs POSITIVELY demonstrate every success_criterion listed in every SubTaskOutcome.
+- "replan" if any criterion is unmet or a subtask failed and its output is needed. State exactly which criterion failed and why.
+- Do NOT accept on vague grounds. Absence of failure is not the same as presence of evidence.
 
 merged_output rules:
 - Combine all subtask outputs into a single user-facing result string or object.
@@ -33,7 +36,7 @@ All criteria met:
 {"verdict":"accept","summary":"<one sentence for the user>","merged_output":"<combined result>"}
 
 Criteria unmet, replanning possible:
-{"verdict":"replan","gap_summary":"<what is missing and why>","failed_subtasks":["<subtask_id>"],"recommendation":"replan"}
+{"verdict":"replan","gap_summary":"<which criterion failed and why>","failed_subtasks":["<subtask_id>"],"recommendation":"replan"}
 
 No markdown, no prose, no code fences.`
 
@@ -157,10 +160,21 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 
 	gapTrend := computeGapTrend(len(failedIDs), prevFailed, replanCount)
 
-	// Ask LLM to merge and assess
+	// Log the full criteria set R4b is evaluating against so it's auditable.
+	log.Printf("[R4b] task=%s evaluating %d outcomes (failed=%d gap_trend=%s)",
+		taskID, len(tracker.outcomes), len(failedIDs), gapTrend)
+	for _, o := range tracker.outcomes {
+		criteriaJSON, _ := json.Marshal(o.SuccessCriteria)
+		log.Printf("[R4b]   subtask=%s status=%s criteria=%s", o.SubTaskID, o.Status, criteriaJSON)
+	}
+
+	// Ask LLM to merge and assess.
+	// SubTaskOutcomes now carry intent + success_criteria so the LLM has the
+	// full criteria set to check against — not just the intent from TaskSpec.
 	outcomesJSON, _ := json.MarshalIndent(tracker.outcomes, "", "  ")
 	specJSON, _ := json.MarshalIndent(tracker.spec, "", "  ")
-	userPrompt := fmt.Sprintf("TaskSpec:\n%s\n\nSubTaskOutcomes:\n%s\n\nFailed subtasks: %v\nGap trend: %s",
+	userPrompt := fmt.Sprintf(
+		"TaskSpec (intent and constraints):\n%s\n\nSubTaskOutcomes (each carries its own success_criteria):\n%s\n\nFailed subtasks: %v\nGap trend: %s",
 		specJSON, outcomesJSON, failedIDs, gapTrend)
 
 	raw, err := m.llm.Chat(ctx, systemPrompt, userPrompt)

@@ -75,6 +75,32 @@ type verdict struct {
 	FailureReason   string            `json:"failure_reason,omitempty"`
 }
 
+// outcome builds a SubTaskOutcome carrying the original criteria so R4b can check them.
+func (a *AgentValidator) outcome(st types.SubTask, status string, output any, reason *string, traj []types.GapTrajectoryPoint) types.SubTaskOutcome {
+	return types.SubTaskOutcome{
+		SubTaskID:       st.SubTaskID,
+		ParentTaskID:    st.ParentTaskID,
+		Intent:          st.Intent,
+		SuccessCriteria: st.SuccessCriteria,
+		Status:          status,
+		Output:          output,
+		FailureReason:   reason,
+		GapTrajectory:   traj,
+	}
+}
+
+// publish sends a SubTaskOutcome to the bus.
+func (a *AgentValidator) publish(o types.SubTaskOutcome) {
+	a.b.Publish(types.Message{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now().UTC(),
+		From:      types.RoleAgentVal,
+		To:        types.RoleMetaVal,
+		Type:      types.MsgSubTaskOutcome,
+		Payload:   o,
+	})
+}
+
 // Run drives the fast loop for one sub-task.
 // resultCh receives ExecutionResult messages from the Executor.
 // correctionCh is for sending CorrectionSignals back to the Executor.
@@ -102,23 +128,11 @@ func (a *AgentValidator) Run(
 		select {
 		case <-ctx.Done():
 			reason := "context cancelled"
-			return types.SubTaskOutcome{
-				SubTaskID:    subTask.SubTaskID,
-				ParentTaskID: subTask.ParentTaskID,
-				Status:       "failed",
-				FailureReason: &reason,
-				GapTrajectory: trajectory,
-			}
+			return a.outcome(subTask, "failed", nil, &reason, trajectory)
 		case r, ok := <-resultCh:
 			if !ok {
 				reason := "result channel closed"
-				return types.SubTaskOutcome{
-					SubTaskID:    subTask.SubTaskID,
-					ParentTaskID: subTask.ParentTaskID,
-					Status:       "failed",
-					FailureReason: &reason,
-					GapTrajectory: trajectory,
-				}
+				return a.outcome(subTask, "failed", nil, &reason, trajectory)
 			}
 			result = r
 		}
@@ -174,52 +188,25 @@ func (a *AgentValidator) Run(
 		}
 
 		trajectory = append(trajectory, types.GapTrajectoryPoint{
-			Attempt:      attempt,
-			Score:        v.Score,
+			Attempt:       attempt,
+			Score:         v.Score,
 			UnmetCriteria: v.UnmetCriteria,
 		})
 
 		switch v.Verdict {
 		case "matched":
 			log.Printf("[R4a] subtask=%s MATCHED on attempt=%d", subTask.SubTaskID, attempt)
-			outcome := types.SubTaskOutcome{
-				SubTaskID:     subTask.SubTaskID,
-				ParentTaskID:  subTask.ParentTaskID,
-				Status:        "matched",
-				Output:        result.Output,
-				GapTrajectory: trajectory,
-			}
-			a.b.Publish(types.Message{
-				ID:        uuid.New().String(),
-				Timestamp: time.Now().UTC(),
-				From:      types.RoleAgentVal,
-				To:        types.RoleMetaVal,
-				Type:      types.MsgSubTaskOutcome,
-				Payload:   outcome,
-			})
-			return outcome
+			o := a.outcome(subTask, "matched", result.Output, nil, trajectory)
+			a.publish(o)
+			return o
 
 		case "retry":
 			if attempt >= maxRetries {
 				log.Printf("[R4a] subtask=%s max retries reached, reporting failed", subTask.SubTaskID)
 				reason := fmt.Sprintf("max retries (%d) reached; last issue: %s", maxRetries, v.WhatWasWrong)
-				outcome := types.SubTaskOutcome{
-					SubTaskID:     subTask.SubTaskID,
-					ParentTaskID:  subTask.ParentTaskID,
-					Status:        "failed",
-					Output:        result.Output,
-					FailureReason: &reason,
-					GapTrajectory: trajectory,
-				}
-				a.b.Publish(types.Message{
-					ID:        uuid.New().String(),
-					Timestamp: time.Now().UTC(),
-					From:      types.RoleAgentVal,
-					To:        types.RoleMetaVal,
-					Type:      types.MsgSubTaskOutcome,
-					Payload:   outcome,
-				})
-				return outcome
+				o := a.outcome(subTask, "failed", result.Output, &reason, trajectory)
+				a.publish(o)
+				return o
 			}
 
 			correction := types.CorrectionSignal{
@@ -240,13 +227,7 @@ func (a *AgentValidator) Run(
 			case correctionCh <- correction:
 			case <-ctx.Done():
 				reason := "context cancelled during correction"
-				return types.SubTaskOutcome{
-					SubTaskID:    subTask.SubTaskID,
-					ParentTaskID: subTask.ParentTaskID,
-					Status:       "failed",
-					FailureReason: &reason,
-					GapTrajectory: trajectory,
-				}
+				return a.outcome(subTask, "failed", nil, &reason, trajectory)
 			}
 
 		default: // "failed"
@@ -255,23 +236,9 @@ func (a *AgentValidator) Run(
 				reason = "validation failed"
 			}
 			log.Printf("[R4a] subtask=%s FAILED: %s", subTask.SubTaskID, reason)
-			outcome := types.SubTaskOutcome{
-				SubTaskID:     subTask.SubTaskID,
-				ParentTaskID:  subTask.ParentTaskID,
-				Status:        "failed",
-				Output:        result.Output,
-				FailureReason: &reason,
-				GapTrajectory: trajectory,
-			}
-			a.b.Publish(types.Message{
-				ID:        uuid.New().String(),
-				Timestamp: time.Now().UTC(),
-				From:      types.RoleAgentVal,
-				To:        types.RoleMetaVal,
-				Type:      types.MsgSubTaskOutcome,
-				Payload:   outcome,
-			})
-			return outcome
+			o := a.outcome(subTask, "failed", result.Output, &reason, trajectory)
+			a.publish(o)
+			return o
 		}
 	}
 }

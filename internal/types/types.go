@@ -104,12 +104,14 @@ type GapTrajectoryPoint struct {
 
 // SubTaskOutcome is produced by R4a and consumed by R4b
 type SubTaskOutcome struct {
-	SubTaskID     string               `json:"subtask_id"`
-	ParentTaskID  string               `json:"parent_task_id"`
-	Status        string               `json:"status"` // "matched" | "failed"
-	Output        any                  `json:"output"`
-	FailureReason *string              `json:"failure_reason"`
-	GapTrajectory []GapTrajectoryPoint `json:"gap_trajectory"`
+	SubTaskID       string               `json:"subtask_id"`
+	ParentTaskID    string               `json:"parent_task_id"`
+	Intent          string               `json:"intent"`
+	SuccessCriteria []string             `json:"success_criteria"` // copied from SubTask so R4b can check them
+	Status          string               `json:"status"`           // "matched" | "failed"
+	Output          any                  `json:"output"`
+	FailureReason   *string              `json:"failure_reason"`
+	GapTrajectory   []GapTrajectoryPoint `json:"gap_trajectory"`
 }
 
 // ReplanRequest is produced by R4b and consumed by R2 Planner
