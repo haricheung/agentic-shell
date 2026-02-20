@@ -584,6 +584,42 @@ Routing rules:
 
 ---
 
+## Issue #24 — `❯` prompt not shown after task completes
+
+**Symptom**
+After a task finishes, the REPL sometimes returned with no visible prompt — the `❯` readline
+cursor was missing. The pipeline footer (`└─── ✅ ...`) appeared but the prompt did not.
+
+**Root cause**
+Race condition between the display goroutine and the REPL goroutine:
+
+1. MetaValidator calls `bus.Publish(MsgFinalResult)` — puts tap message in display goroutine's
+   channel buffer, but the goroutine may not have run yet.
+2. MetaValidator calls `outputFn()` — fills `resultCh`, unblocking the REPL goroutine.
+3. REPL goroutine: `printResult()` → breaks out of `waitResult` → calls `rl.Readline()`,
+   which draws `❯ ` on the current terminal line.
+4. Display goroutine: finally gets scheduled, receives `MsgFinalResult` tap → `endTask()` →
+   prints `\r\033[K└─── ✅ ...`. The `\r\033[K` erases the `❯` that readline drew.
+
+The REPL goroutine and display goroutine race to the terminal. The `❯` is erased whenever
+the display goroutine loses the race and fires after readline.
+
+**Fix**
+Added `WaitTaskClose(timeout time.Duration)` to `Display` — a synchronisation point that
+blocks until the pipeline box is fully closed:
+
+- **`taskDone chan struct{}`** field added to `Display`; created in `startTask()` under
+  the mutex, closed (and nilled) by `endTask()` under the mutex.
+- **`WaitTaskClose(300ms)`** called in the REPL's `waitResult` loop immediately after
+  receiving the final result, **before** `printResult()` and before readline resumes.
+  The 300 ms timeout prevents deadlock if the display goroutine is stuck.
+
+Order after fix (deterministic):
+1. Display: `endTask()` prints footer → closes `taskDone`
+2. REPL: `WaitTaskClose` returns → `printResult()` → `rl.Readline()` draws `❯`
+
+---
+
 ## Issue #23 — Clarification question printed dozens of times before user types anything
 
 **Symptom**

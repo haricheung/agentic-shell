@@ -103,7 +103,8 @@ type Display struct {
 	started    time.Time
 	inTask     bool
 	spinIdx    int
-	suppressed bool // true after Abort(); blocks new pipeline boxes until Resume()
+	suppressed bool          // true after Abort(); blocks new pipeline boxes until Resume()
+	taskDone   chan struct{}  // closed by endTask; nil between tasks
 }
 
 // New creates a Display reading from tap.
@@ -201,7 +202,26 @@ func (d *Display) Run(ctx context.Context) {
 	}
 }
 
+// WaitTaskClose blocks until the current pipeline box is closed by endTask, or until
+// timeout elapses. Call this after receiving the final result but before printing output
+// or returning control to readline, to ensure the pipeline footer is printed first.
+func (d *Display) WaitTaskClose(timeout time.Duration) {
+	d.mu.Lock()
+	ch := d.taskDone
+	d.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+	}
+}
+
 func (d *Display) startTask() {
+	d.mu.Lock()
+	d.taskDone = make(chan struct{})
+	d.mu.Unlock()
 	d.started = time.Now()
 	d.inTask = true
 	d.setStatus("initializing...")
@@ -216,6 +236,14 @@ func (d *Display) endTask(success bool) {
 		icon = "❌"
 	}
 	fmt.Printf("\r\033[K%s└─── %s  %v %s%s\n", ansiDim, icon, elapsed, strings.Repeat("─", 35), ansiReset)
+	// Signal any waiter (REPL goroutine) that the pipeline box is closed.
+	d.mu.Lock()
+	ch := d.taskDone
+	d.taskDone = nil
+	d.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
 }
 
 func (d *Display) setStatus(s string) {

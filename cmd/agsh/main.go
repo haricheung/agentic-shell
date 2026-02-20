@@ -551,6 +551,11 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 				if result.TaskID != taskID {
 					continue // stale result from a previously aborted task
 				}
+				// Wait for the display to close the pipeline box before printing
+				// the result and returning to readline. Without this, the REPL
+				// goroutine can reach rl.Readline() (which draws ❯) before the
+				// display goroutine calls endTask(), whose \r\033[K then erases it.
+				disp.WaitTaskClose(300 * time.Millisecond)
 				printResult(result)
 				history = append(history, sessionEntry{Input: input, Summary: result.Summary})
 				if len(history) > maxHistory {
