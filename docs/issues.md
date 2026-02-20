@@ -774,3 +774,189 @@ if msg.Type == types.MsgAuditQuery || msg.Type == types.MsgAuditReport {
     continue
 }
 ```
+
+---
+
+## Issue #27 — Planner generates fake, repeated subtask UUIDs
+
+**Symptom**
+The same subtask ID `a1b2c3d4-e5f6-7890-abcd-ef1234567890` appears 270 times across
+completely different tasks in the debug log. The top repeated IDs share an obvious
+sequential template pattern:
+```
+a1b2c3d4-e5f6-7890-abcd-ef1234567890  → 270 uses
+a1b2c3d4-e5f6-7890-abcd-ef1234567891  →  33 uses   ← last digit incremented
+a1b2c3d4-e5f6-7890-abcd-ef1234567892  →  33 uses
+e3b0c442-98fc-1c14-9afc-39c7c5d6f0b1  → 166 uses
+b2c3d4e5-f6a7-8901-bcde-f01234567890  → 112 uses
+```
+The top 10 repeated IDs account for ~26% of all subtask dispatches.
+
+**Root cause**
+The planner LLM is fabricating UUIDs in its JSON output rather than delegating ID
+generation to the Go runtime. The planner system prompt tells R2 to assign a `subtask_id`
+to each subtask — the LLM invents plausible-looking but deterministic UUIDs from its
+training distribution. It is never called `uuid.NewString()`; it just writes hex that
+looks like a UUID.
+
+**Impact**
+The entire dispatcher routing guarantee depends on subtask ID uniqueness. Results from
+task A's executor targeting subtask_id X are delivered to task B's agentval goroutine if
+task B reuses ID X. This is confirmed by:
+```
+[DISPATCHER] WARNING: no state for subtask=a1b2c3d4... (already completed?)
+```
+The dispatcher receives an `ExecutionResult` for an ID whose state was already cleaned
+up by a different task. The result is silently dropped; the intended recipient never
+receives it.
+
+**Fix needed**
+Subtask IDs must be assigned by the Go runtime after the LLM responds, not by the LLM
+itself. The planner prompt should not ask for `subtask_id` in the JSON output; Go code
+should call `uuid.NewString()` and inject IDs before publishing.
+
+---
+
+## Issue #28 — R4b accepts tasks with failed subtasks (1 matched + 1 failed = accept)
+
+**Symptom** (debug log)
+```
+[R4b] outcome for subtask=d9e0f1... status=matched (1/2)
+[R4b] outcome for subtask=c8f9a0... status=failed  (2/2)
+[R4b] task=linus_torvalds_recent_activity ACCEPTED
+```
+R4b accepted a task where one of two subtasks explicitly failed.
+
+**Root cause**
+R4b validation is LLM-based and holistic. The LLM receives all outcomes together and
+reasons about whether "the overall goal" is met — it does not mechanically check whether
+every subtask passed. When a failed subtask's counterpart produced plausible-sounding
+output, the LLM concluded the combined result was "good enough" and emitted `accept`.
+The prompt instruction "accept only when ALL success_criteria met" is advisory to the
+LLM, not an enforced code constraint.
+
+**Impact**
+The user receives a partial or wrong result and is told the task succeeded. Incorrect
+answers are delivered silently with no signal that part of the execution failed.
+
+**Fix needed**
+R4b must reject (or replan) if any subtask status is `failed`, enforced in Go code
+before the LLM is called. The LLM should only be invoked to merge outputs from subtasks
+that all passed.
+
+---
+
+## Issue #29 — Memory system is structurally bypassed; effectively write-only
+
+**Symptom**
+The same user question about monitor size was answered incorrectly three times in a row.
+R5 stored failure lessons after each attempt. The agents made identical mistakes on every
+retry with no evidence that prior lessons influenced any plan.
+
+**Root cause — two structural failures:**
+
+1. **R1 (Perceiver) is completely memory-blind.** Misunderstandings are locked in at
+   R1 before R2 ever queries memory. R1 produces a `TaskSpec` with the wrong `intent`
+   and `success_criteria`, and R2 plans against that wrong spec. Any memory R2 retrieves
+   is irrelevant because the task is already mis-characterised. R1 has no integration
+   with R5 at all.
+
+2. **R2 memory results are advisory, not enforced.** R2 sends `MsgMemoryRead`, receives
+   entries, but its prompt gives memory the same weight as any other context — the LLM
+   may or may not act on it. The log confirms R2 dispatches identical subtask structures
+   with identical fake UUIDs regardless of stored lessons. There is no code-level check
+   that memory results must materially change the plan when relevant entries exist.
+
+**Impact**
+The memory system correctly stores episodic and procedural entries. Nothing reads them
+in a way that changes agent behaviour. It is real infrastructure connected to nothing
+that matters. The system cannot learn across sessions.
+
+**Fix needed**
+R1 must query memory before characterising ambiguous tasks. R2 must have a code-enforced
+contract: if relevant procedural entries exist, the plan must demonstrate it has avoided
+the previously recorded failure approach.
+
+---
+
+## Issue #30 — Validators evaluate holistically; per-criterion enforcement is absent
+
+**Symptom**
+R4a accepts `status=completed, output="27 inches"` even when the tool stdout is empty —
+the claim is plausible so the LLM scores it as `matched`. R4b accepts 1-matched + 1-failed
+outcomes (see Issue #28). Validators behave as lenient reviewers rather than strict
+checkers.
+
+**Root cause**
+Both R4a and R4b are LLM-based validators scoring LLM-produced output. LLMs reason by
+plausibility and analogy — they are constitutionally unsuited to strict boolean
+per-criterion checking. The design requires each `success_criteria` entry to be
+independently verified (pass/fail), but the LLM receives all criteria together with all
+output and forms a holistic impression. One plausible-sounding criterion can carry the
+whole result even when others are clearly unmet.
+
+This is the same failure as writing expectations without tests: the expectations exist in
+the prompt, but without mechanical per-criterion checking they are decoration.
+
+**Impact**
+- R4a: spurious `matched` verdicts on empty or hallucinated tool output
+- R4b: partial task acceptance (failed subtasks ignored if others look good)
+- Correction loops that should fire do not; the system over-reports success
+
+**Fix needed**
+Validation must be restructured so that each `success_criterion` is evaluated
+independently and produces an explicit boolean verdict before any holistic merge. A
+single `false` must hard-fail the validation in code, regardless of what the LLM
+concludes about the overall result.
+
+---
+
+## Issue #31 — LLM output parser fails on trailing prose after JSON
+
+**Symptom**
+```
+[R3] ERROR re-executing subtask ...: parse LLM output: invalid character 'I' after
+top-level value (raw: {"action":"result",...}
+I have the required output from the previous tool call...)
+```
+Correct executions are thrown away and republished as `status=failed`.
+
+**Root cause**
+The LLM occasionally appends explanatory prose after the closing `}` of its JSON
+response. `StripFences()` strips markdown code fences but does not strip trailing
+non-JSON text. `json.Unmarshal` fails on the first non-whitespace character after the
+top-level value. R3 catches the parse error, and because it cannot interpret the result,
+publishes a `failed` ExecutionResult. R4a then immediately fails the subtask as an
+infrastructure error.
+
+**Fix needed**
+After `StripFences()`, truncate the string at the first `}` that closes the top-level
+JSON object before attempting `json.Unmarshal`.
+
+---
+
+## Issue #32 — `redirectPersonalFind` discards `-path` filter; mdfind rejects glob patterns
+
+**Symptom**
+```
+find /Users/haricheung -type f -name "*.json" -path "*memory*"
+→ redirecting to mdfind: query="*.json"
+→ (no files found with name matching "*.json")
+```
+Both the path filter and the result are lost.
+
+**Root cause — two compounding failures:**
+
+1. `redirectPersonalFind` extracts only the `-name` value and silently discards all
+   other `find` flags including `-path`, `-type`, and `-maxdepth`. The memory file path
+   constraint is lost.
+
+2. `mdfind -name '*.json'` performs exact name matching — Spotlight does not expand
+   glob wildcards in `-name` queries. A pattern containing `*` will never match any
+   file. The redirect produces guaranteed empty results for any pattern with a wildcard.
+
+**Fix needed**
+For redirected queries, extract the stem from the `-name` pattern (strip `*` and
+leading path separators) and pass only that to `mdfind`. Post-filter results by
+extension in Go code if needed. Alternatively, when `-path` is present, consider
+using `shell find` within the specific subdirectory rather than redirecting to mdfind.
