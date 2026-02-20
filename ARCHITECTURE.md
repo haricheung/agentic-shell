@@ -36,6 +36,16 @@ Three principles are borrowed directly:
 
 The biological analogy is scaffolding. The algorithm is the building. For any component described in biological terms, the implementation must specify: *what exactly runs, when, and how its output is evaluated.*
 
+**Where this system deliberately diverges from the biological model — and why it is better:**
+
+In a human organization, the forth-and-back of goal achievement (plan → execute → correct → replan) involves *negotiation*. Negotiation is necessary because information is distributed: each team member sees only their own work, managers receive filtered reports, and alignment requires communication between peers with partial views. The back-and-forth is the mechanism for resolving information asymmetry.
+
+This system eliminates that asymmetry entirely. The Metaagent is omniscient within its operational scope: it composed every sub-task, holds the complete `TaskSpec`, observes every `CorrectionSignal` accumulating in the fast loop, receives every `SubTaskOutcome` with its full `gap_trajectory`, and has access to all prior memory. There is no information to negotiate — the Metaagent already has it all.
+
+The consequence: the forth-and-back in this system is not about aligning team members' partial views. It is about **iterative discovery of what reality allows**. The plan is a hypothesis. Execution tests it against the real world. The gap signal is the reality check. The GGS computes a correction from complete trajectory data — more precisely than any human manager could, because no human manager has full real-time visibility into every sub-task's evidence at every retry attempt.
+
+The bio-inspiration is borrowed for the **loop structure** (decision → execution → correction), not for the communication patterns within the loop. The implementation is superior to the biological model for exactly this reason: omniscience replaces negotiation, and a precise gradient replaces approximate consensus.
+
 ### Nested Feedback Loops
 
 The framework's control structure is a single pattern — **decision → execution → correction → execution** — instantiated at three nested scales simultaneously:
@@ -88,7 +98,14 @@ The system has an operational hierarchy of two tiers, plus one lateral observer 
 
 ### Metaagent
 
-The central brain. Owns the user's goal from receipt to delivery. Contains:
+The central brain. Owns the user's goal from receipt to delivery. **It is the omniscient
+coordinator of the system**: it holds the complete `TaskSpec`, dispatched every sub-task,
+observes all in-flight correction signals, receives every outcome with its full evidence
+trail, and queries all prior memory. No effector agent has this view — each sees only its
+own sub-task. This god-view is not a convenience; it is the structural property that makes
+precise gradient computation possible and eliminates the need for peer-to-peer negotiation.
+The GGS can compute a directed, evidence-complete correction because the Metaagent has
+perfect information — something no human manager ever has. Contains:
 
 **Planner** — decomposes the user's goal into atomic sub-tasks and dispatches them. Each sub-task must be self-contained: no peer-agent coordination required. If a sub-task requires output from a sibling, that dependency must be resolved at decomposition time, not at execution time. Frequent mid-execution dependency discoveries are a signal that decomposition quality is insufficient.
 
