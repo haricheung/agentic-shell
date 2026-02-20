@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 
 	"github.com/haricheung/agentic-shell/internal/bus"
@@ -57,7 +58,7 @@ func main() {
 
 	// Infrastructure roles
 	mem := memory.New(b, filepath.Join(cacheDir, "memory.json"))
-	aud := auditor.New(b.Tap(), filepath.Join(cacheDir, "audit.jsonl"))
+	aud := auditor.New(b, b.NewTap(), filepath.Join(cacheDir, "audit.jsonl"), 5*time.Minute)
 
 	// Sci-fi terminal UI — reads its own independent tap of every bus message
 	disp := ui.New(b.NewTap())
@@ -84,6 +85,22 @@ func main() {
 		case <-sigCh:
 			cancel()
 		case <-ctx.Done():
+		}
+	}()
+
+	// Audit report channel — delivers R6 reports to the REPL printer.
+	auditReportCh := make(chan types.AuditReport, 4)
+	auditReportSub := b.Subscribe(types.MsgAuditReport)
+	go func() {
+		for msg := range auditReportSub {
+			raw, _ := json.Marshal(msg.Payload)
+			var rep types.AuditReport
+			if json.Unmarshal(raw, &rep) == nil {
+				select {
+				case auditReportCh <- rep:
+				default:
+				}
+			}
 		}
 	}()
 
@@ -127,7 +144,7 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	} else {
 		// REPL mode
-		runREPL(ctx, b, llmClient, resultCh, cancel, cacheDir, disp, abortTaskCh)
+		runREPL(ctx, b, llmClient, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh)
 	}
 }
 
@@ -374,7 +391,7 @@ type sessionEntry struct {
 	Summary string
 }
 
-func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string) {
+func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string) {
 	fmt.Println("\033[1m\033[36m⚡ agsh\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.cache/agsh/debug.log)\033[0m")
 
 	rl, err := readline.NewEx(&readline.Config{
@@ -460,6 +477,26 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			break
 		}
 
+		// /audit — request an on-demand audit report directly from R6, bypassing the pipeline.
+		if input == "/audit" {
+			b.Publish(types.Message{
+				ID:        uuid.New().String(),
+				Timestamp: time.Now().UTC(),
+				From:      types.RoleUser,
+				To:        types.RoleAuditor,
+				Type:      types.MsgAuditQuery,
+			})
+			select {
+			case rep := <-auditReportCh:
+				printAuditReport(rep)
+			case <-time.After(3 * time.Second):
+				fmt.Println("(audit report timed out)")
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+
 		// Per-task context: cancelling it aborts only this task, not the whole process.
 		taskCtx, tCancel := context.WithCancel(ctx)
 		taskMu.Lock()
@@ -517,6 +554,9 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 					history = history[len(history)-maxHistory:]
 				}
 				break waitResult
+			case rep := <-auditReportCh:
+				// Periodic audit report arrived mid-task — print it then keep waiting.
+				printAuditReport(rep)
 			}
 		}
 
@@ -587,6 +627,40 @@ func printResult(result types.FinalResult) {
 	} else {
 		fmt.Println(result.Output)
 	}
+}
+
+func printAuditReport(rep types.AuditReport) {
+	const (
+		bold   = "\033[1m"
+		cyan   = "\033[36m"
+		yellow = "\033[33m"
+		red    = "\033[31m"
+		dim    = "\033[2m"
+		reset  = "\033[0m"
+	)
+	fmt.Printf("\n%s%s📡 Audit Report%s  %s%s → %s%s\n",
+		bold, cyan, reset, dim, rep.Period.From, rep.Period.To, reset)
+	fmt.Printf("  Tasks observed:      %d\n", rep.TasksObserved)
+	fmt.Printf("  Avg corrections:     %.2f\n", rep.ConvergenceHealth.AvgCorrectionCount)
+	gt := rep.ConvergenceHealth.GapTrendDistribution
+	fmt.Printf("  Gap trends:          ↑improving=%d  →stable=%d  ↓worsening=%d\n",
+		gt.Improving, gt.Stable, gt.Worsening)
+	if len(rep.BoundaryViolations) > 0 {
+		fmt.Printf("  %sBoundary violations:%s\n", yellow, reset)
+		for _, v := range rep.BoundaryViolations {
+			fmt.Printf("    • %s\n", v)
+		}
+	}
+	if len(rep.DriftAlerts) > 0 {
+		fmt.Printf("  %sDrift alerts:%s\n", red, reset)
+		for _, d := range rep.DriftAlerts {
+			fmt.Printf("    • %s\n", d)
+		}
+	}
+	if len(rep.BoundaryViolations) == 0 && len(rep.DriftAlerts) == 0 {
+		fmt.Printf("  %sNo anomalies detected.%s\n", dim, reset)
+	}
+	fmt.Println()
 }
 
 func toSubTask(payload any) (types.SubTask, error) {

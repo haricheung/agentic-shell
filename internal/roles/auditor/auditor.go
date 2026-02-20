@@ -11,29 +11,47 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
-// Auditor taps the message bus read-only and writes structured AuditEvents to a JSONL file.
-// It detects boundary violations, convergence failures, and thrashing.
+// Auditor (R6) taps the message bus read-only for passive observation, and also
+// subscribes to MsgAuditQuery to respond to on-demand report requests.
+// It detects boundary violations, convergence failures, and thrashing, accumulates
+// window statistics, and publishes AuditReport messages either on-demand or periodically.
 type Auditor struct {
-	tap     <-chan types.Message
-	logPath string
-	mu      sync.Mutex
-	logFile *os.File
+	b        *bus.Bus
+	tap      <-chan types.Message
+	logPath  string
+	mu       sync.Mutex
+	logFile  *os.File
+	interval time.Duration // 0 = periodic reports disabled
 
-	// convergence tracking
-	correctionCounts map[string]int // taskID -> correction_count
-	replanCounts     map[string]int // taskID -> replan count
+	// convergence tracking (per task, reset on MsgFinalResult)
+	correctionCounts map[string]int
+	replanCounts     map[string]int
+
+	// window stats — reset after each report
+	windowStart        time.Time
+	tasksObserved      int
+	totalCorrections   int
+	gapTrends          types.GapTrendDist
+	boundaryViolations []string
+	driftAlerts        []string
+	anomalies          []string
 }
 
-// New creates an Auditor.
-func New(tap <-chan types.Message, logPath string) *Auditor {
+// New creates an Auditor. tap must be a dedicated bus tap (NewTap()).
+// interval sets the periodic report cadence; pass 0 to disable periodic reports.
+func New(b *bus.Bus, tap <-chan types.Message, logPath string, interval time.Duration) *Auditor {
 	return &Auditor{
+		b:                b,
 		tap:              tap,
 		logPath:          logPath,
+		interval:         interval,
 		correctionCounts: make(map[string]int),
 		replanCounts:     make(map[string]int),
+		windowStart:      time.Now().UTC(),
 	}
 }
 
@@ -54,10 +72,31 @@ func (a *Auditor) Run(ctx context.Context) {
 
 	log.Printf("[AUDIT] started; writing to %s", a.logPath)
 
+	queryCh := a.b.Subscribe(types.MsgAuditQuery)
+
+	var ticker *time.Ticker
+	var tickC <-chan time.Time
+	if a.interval > 0 {
+		ticker = time.NewTicker(a.interval)
+		tickC = ticker.C
+		defer ticker.Stop()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+
+		case <-tickC:
+			a.publishReport("periodic")
+
+		case msg, ok := <-queryCh:
+			if !ok {
+				return
+			}
+			log.Printf("[AUDIT] received AuditQuery from %s", msg.From)
+			a.publishReport("on-demand")
+
 		case msg, ok := <-a.tap:
 			if !ok {
 				return
@@ -97,15 +136,38 @@ func (a *Auditor) process(msg types.Message) {
 				allowed.from, allowed.to, msg.Type, msg.From, msg.To)
 			detail = &d
 			log.Printf("[AUDIT] BOUNDARY VIOLATION: %s", d)
+			a.mu.Lock()
+			a.boundaryViolations = append(a.boundaryViolations, d)
+			a.anomalies = append(a.anomalies, "boundary_violation: "+d)
+			a.mu.Unlock()
 		}
 	}
 
-	// 2. Convergence failure checks on ReplanRequest
+	// 2. Track tasks dispatched
+	if msg.Type == types.MsgDispatchManifest {
+		a.mu.Lock()
+		a.tasksObserved++
+		a.mu.Unlock()
+	}
+
+	// 3. Convergence failure checks on ReplanRequest
 	if msg.Type == types.MsgReplanRequest {
 		rr, err := toReplanRequest(msg.Payload)
 		if err == nil {
+			a.mu.Lock()
 			a.replanCounts[rr.TaskID]++
 			a.correctionCounts[rr.TaskID] += rr.CorrectionCount
+			a.totalCorrections += rr.CorrectionCount
+
+			switch rr.GapTrend {
+			case "improving":
+				a.gapTrends.Improving++
+			case "worsening":
+				a.gapTrends.Worsening++
+			default:
+				a.gapTrends.Stable++
+			}
+			a.mu.Unlock()
 
 			if rr.GapTrend == "worsening" {
 				anomaly = "convergence_failure"
@@ -113,6 +175,9 @@ func (a *Auditor) process(msg types.Message) {
 					rr.TaskID, rr.CorrectionCount, a.replanCounts[rr.TaskID])
 				detail = &d
 				log.Printf("[AUDIT] CONVERGENCE FAILURE: %s", d)
+				a.mu.Lock()
+				a.anomalies = append(a.anomalies, "convergence_failure: "+d)
+				a.mu.Unlock()
 			}
 
 			const thrashThreshold = 5
@@ -122,6 +187,10 @@ func (a *Auditor) process(msg types.Message) {
 					rr.TaskID, rr.CorrectionCount, thrashThreshold)
 				detail = &d
 				log.Printf("[AUDIT] THRASHING DETECTED: %s", d)
+				a.mu.Lock()
+				a.driftAlerts = append(a.driftAlerts, d)
+				a.anomalies = append(a.anomalies, "drift: "+d)
+				a.mu.Unlock()
 			}
 		}
 	}
@@ -137,6 +206,61 @@ func (a *Auditor) process(msg types.Message) {
 	}
 
 	a.writeEvent(event)
+}
+
+func (a *Auditor) publishReport(trigger string) {
+	a.mu.Lock()
+	now := time.Now().UTC()
+	tasks := a.tasksObserved
+	corrections := a.totalCorrections
+	trends := a.gapTrends
+	violations := append([]string(nil), a.boundaryViolations...)
+	drifts := append([]string(nil), a.driftAlerts...)
+	anomalies := append([]string(nil), a.anomalies...)
+	windowFrom := a.windowStart.Format(time.RFC3339)
+
+	// Reset window
+	a.windowStart = now
+	a.tasksObserved = 0
+	a.totalCorrections = 0
+	a.gapTrends = types.GapTrendDist{}
+	a.boundaryViolations = nil
+	a.driftAlerts = nil
+	a.anomalies = nil
+	a.mu.Unlock()
+
+	avgCorrections := 0.0
+	if tasks > 0 {
+		avgCorrections = float64(corrections) / float64(tasks)
+	}
+
+	report := types.AuditReport{
+		ReportID: uuid.New().String(),
+		Period: types.AuditPeriod{
+			From: windowFrom,
+			To:   now.Format(time.RFC3339),
+		},
+		TasksObserved:      tasks,
+		BoundaryViolations: violations,
+		ConvergenceHealth: types.ConvergenceHealth{
+			AvgCorrectionCount:   avgCorrections,
+			GapTrendDistribution: trends,
+		},
+		DriftAlerts: drifts,
+		Anomalies:   anomalies,
+	}
+
+	log.Printf("[AUDIT] publishing %s report: tasks=%d corrections=%.1f violations=%d drifts=%d",
+		trigger, tasks, avgCorrections, len(violations), len(drifts))
+
+	a.b.Publish(types.Message{
+		ID:        uuid.New().String(),
+		Timestamp: now,
+		From:      types.RoleAuditor,
+		To:        types.RoleUser,
+		Type:      types.MsgAuditReport,
+		Payload:   report,
+	})
 }
 
 func (a *Auditor) writeEvent(e types.AuditEvent) {

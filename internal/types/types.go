@@ -31,6 +31,8 @@ const (
 	MsgMemoryRead       MessageType = "MemoryRead"
 	MsgMemoryResponse   MessageType = "MemoryResponse"
 	MsgFinalResult      MessageType = "FinalResult"
+	MsgAuditQuery       MessageType = "AuditQuery"  // User → R6: request an on-demand report
+	MsgAuditReport      MessageType = "AuditReport" // R6 → User: generated report
 )
 
 // Message is the envelope for all inter-role communication on the bus
