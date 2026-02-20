@@ -42,7 +42,7 @@ User input
             └─ R4a AgentValidator (paired with each Executor)
                  └─ R4b MetaValidator   metaval/   (fan-in; replan or accept)
                       └─ R5 Memory      memory/    (file-backed JSON)
-R6 Auditor  auditor/   (read-only bus tap, JSONL log)
+R6 Auditor  auditor/   (bus tap + subscriber; JSONL log; periodic + on-demand reports)
 ```
 
 **Message bus** (`internal/bus/`): every inter-role message passes through it. Multiple consumers
@@ -75,7 +75,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/roles/agentval/` | R4a | Scores ExecutionResult; drives retry loop; maxRetries=2; infrastructure errors → immediate fail; trusts `ToolCalls` output snippets as concrete evidence |
 | `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3 |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
-| `internal/roles/auditor/` | R6 | Bus tap; JSONL audit log; boundary + convergence checks |
+| `internal/roles/auditor/` | R6 | Active entity: taps bus read-only (passive observation) + subscribes to `MsgAuditQuery` (on-demand) + publishes `MsgAuditReport`; 5-min periodic ticker; accumulates window stats (tasks, corrections, gap trends, violations, drift alerts); resets window after each report |
 | `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; `Abort()` sets `suppressed=true` to block stale post-abort messages; `Resume()` lifts it before each new task; spinner uses `\r\033[K` to prevent line-wrap flood |
 | `internal/tools/mdfind.go` | Tool | macOS Spotlight wrapper; `RunMdfind(ctx, query)` → `mdfind -name <query>`; if no results and query has an extension, retries with stem only and post-filters by extension (Spotlight CJK+extension quirk) |
 
@@ -135,6 +135,19 @@ Each REPL turn records `{input, result.Summary}` in a rolling 5-entry history.
 `printResult` detects string output (via marshal+unmarshal roundtrip) and prints it with
 `fmt.Println` so `\n` renders as real newlines. Structured output (object/array) falls back
 to `json.MarshalIndent`. Output is suppressed when it duplicates the summary.
+
+## Auditor (R6)
+
+R6 is a fully active entity — it both observes and reports:
+
+- **Passive tap**: reads every bus message via `bus.NewTap()` to detect boundary violations, convergence failures, and thrashing. Writes one `AuditEvent` JSONL line per message to `~/.cache/agsh/audit.jsonl`.
+- **Active subscription**: subscribes to `MsgAuditQuery`. When a query arrives, calls `publishReport("on-demand")`.
+- **Periodic ticker**: fires every 5 minutes (configurable via `auditor.New(... interval)`). Calls `publishReport("periodic")`.
+- **Window stats**: each report window accumulates `tasksObserved`, `totalCorrections`, `gapTrends`, `boundaryViolations`, `driftAlerts`, `anomalies`. Stats reset after each report.
+- **`/audit` REPL command**: publishes `MsgAuditQuery` (From=User, To=R6) and waits up to 3 s for the `MsgAuditReport` response, then pretty-prints it. Bypasses the Perceiver — it is a meta-system command, not a task.
+- **`auditor.New()` signature**: `New(b *bus.Bus, tap <-chan types.Message, logPath string, interval time.Duration)` — pass `b.NewTap()` for the tap and `0` to disable periodic reports.
+
+Periodic reports that arrive mid-task are drained from `auditReportCh` in the `waitResult` loop and printed inline.
 
 ## Abort Handling
 
