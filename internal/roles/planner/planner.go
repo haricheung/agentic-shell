@@ -35,6 +35,16 @@ Context field rules:
 - Always populate context with everything the executor needs beyond the intent: known file paths, format requirements, constraints, relevant memory.
 - For sequence N+1 subtasks, you do NOT need to repeat how to find a file already located in sequence N — the dispatcher will inject prior outputs.
 
+Success criteria rules (critical):
+- Each criterion MUST be a concrete, checkable assertion about tool output — NOT a restatement of the intent.
+- Bad (intent echo):  "get today's day of the week"
+- Good (assertion):   "output explicitly states which day of the week today is (e.g. Monday / 星期一)"
+- Bad (intent echo):  "find the audio file"
+- Good (assertion):   "output contains a valid absolute file path ending in .mp3 or .m4a"
+- Bad (intent echo):  "check PM2.5"
+- Good (assertion):   "output contains a numeric PM2.5 value"
+- Criteria must be falsifiable: a validator reading only the tool output must be able to say pass or fail.
+
 Memory constraint rules (when a MEMORY CONSTRAINTS block is present):
 - Every "MUST NOT" line records an approach that failed before for a similar task. You MUST NOT use that approach regardless of how promising it seems.
 - Every "SHOULD PREFER" line records an approach that worked before. Prefer it over untested alternatives.
@@ -45,7 +55,7 @@ Output ONLY a JSON array (no wrapper, no markdown, no prose):
     "subtask_id": "<uuid>",
     "parent_task_id": "...",
     "intent": "<one-sentence action>",
-    "success_criteria": ["<verifiable from tool output>"],
+    "success_criteria": ["<assertion checkable against tool output>"],
     "context": "<relevant background, constraints, known paths>",
     "deadline": null,
     "sequence": 1
