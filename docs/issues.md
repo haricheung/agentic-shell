@@ -584,6 +584,99 @@ Routing rules:
 
 ---
 
+## Issue #22 — `/audit` always shows zeros on process restart
+
+**Symptom**
+After exiting and restarting agsh, `/audit` immediately showed:
+```
+Tasks observed:  0
+Avg corrections: 0.00
+Gap trends:      ↑improving=0  →stable=0  ↓worsening=0
+No anomalies detected.
+```
+even though several tasks had been run in the previous session.
+
+**Root cause**
+The auditor's window stats (`tasksObserved`, `totalCorrections`, `gapTrends`,
+`boundaryViolations`, `driftAlerts`, `anomalies`, `windowStart`) were held only in
+memory. On process restart they were initialised to zero values in `New()`, discarding
+all accumulated data from prior runs.
+
+**Fix**
+Persist window stats to `~/.cache/agsh/audit_stats.json` and reload on startup:
+
+- **`persistedStats` struct**: mirrors the seven window fields with JSON tags.
+- **`loadStats()`**: called synchronously inside `New()` before returning. Reads
+  `audit_stats.json`; silently no-ops if absent (first run). Restores all seven fields
+  so the window is correct from message #1 of the new session.
+- **`saveStats()`**: acquires the mutex to snapshot current window fields, then writes
+  JSON to `audit_stats.json` with `os.WriteFile`. Called from the auditor goroutine only
+  (no extra lock needed for the write itself).
+- **`process()` call site**: `saveStats()` is called only after `MsgDispatchManifest`,
+  `MsgReplanRequest`, or any anomaly — the three event types that actually mutate stats.
+  Not called on every tap message (20+ per task).
+- **`publishReport()` call site**: `saveStats()` is called immediately after the window
+  reset so a crash right after `/audit` doesn't replay old stats on next start.
+- **`auditor.New()` signature updated**: `statsPath string` added as fourth parameter
+  (before `interval`).
+- **`main.go`**: passes `filepath.Join(cacheDir, "audit_stats.json")` as `statsPath`.
+
+**Behaviour after fix**
+```
+Session 1:
+  agsh> list all go files      ← tasks=1 recorded
+  agsh> exit
+
+Session 2:
+  agsh> /audit
+  Tasks observed:  1            ← restored from audit_stats.json
+  window_start: 2026-02-19...
+```
+After `/audit` triggers a report the window resets and the zeroed stats are immediately
+persisted, so restarting again shows tasks=0 with the new `window_start`.
+
+---
+
+## Issue #23 — Clarification question printed dozens of times before user types anything
+
+**Symptom**
+```
+❯ 算算目前我用的外接显示器是什么尺寸的
+? 您需要我通过什么方式来确定外接显示器的尺寸？...
+? 您需要我通过什么方式来确定外接显示器的尺寸？...
+... (×12)
+❯ up to you
+```
+The same clarification question appeared ~12 times before the user had typed any answer.
+
+**Root causes**
+1. **No cap on clarification rounds**: `perceiver.Process()` looped unconditionally — if the
+   model returned `needs_clarification: true` more than once, the loop continued forever.
+2. **IME-buffered empty keystrokes**: Typing Chinese input via an IME can leave residual
+   keystrokes in the terminal buffer. When `rl.Readline()` was called inside `clarifyFn`,
+   it consumed those buffered empty strokes and returned `""` immediately — without blocking
+   for real user input. Each empty answer caused the model to be called again with a blank
+   clarification, which returned `needs_clarification: true` again, calling `clarifyFn`
+   again, and so on until the buffer was drained.
+
+**Fix** (`perceiver/perceiver.go`):
+- **`maxClarificationRounds = 2`**: `Process()` now loops at most twice before giving up.
+- **Empty answer → break**: if the user provides an empty answer (Enter with no text),
+  treat it as "proceed with your best interpretation" and exit the loop immediately.
+- **Final commit call**: after the loop exits (max rounds or empty answer), `perceive()` is
+  called one final time with an appended instruction
+  `"[Instruction: proceed with the best interpretation; do not request further clarification.]"`
+  to force the model to emit a `TaskSpec` instead of another `needs_clarification`.
+- **`publish()` helper**: extracted from the loop body to avoid duplicating the bus publish +
+  log line.
+
+**Behaviour after fix**
+- First clarification round: model asks → user sees question → user types answer → loop
+- Second clarification round (if model still unclear): model asks once more → user answers
+- After two rounds, or on empty answer: model is forced to commit; task proceeds.
+
+---
+
 ## Issue #24 — `❯` prompt not shown after task completes
 
 **Symptom**
@@ -653,96 +746,3 @@ fmt.Printf("\033[33m?\033[0m %s\n", question)
 ans, err := rl.Readline()
 ```
 The question is now printed exactly once; readline only manages its own `❯ ` line.
-
----
-
-## Issue #23 — Clarification question printed dozens of times before user types anything
-
-**Symptom**
-```
-❯ 算算目前我用的外接显示器是什么尺寸的
-? 您需要我通过什么方式来确定外接显示器的尺寸？...
-? 您需要我通过什么方式来确定外接显示器的尺寸？...
-... (×12)
-❯ up to you
-```
-The same clarification question appeared ~12 times before the user had typed any answer.
-
-**Root causes**
-1. **No cap on clarification rounds**: `perceiver.Process()` looped unconditionally — if the
-   model returned `needs_clarification: true` more than once, the loop continued forever.
-2. **IME-buffered empty keystrokes**: Typing Chinese input via an IME can leave residual
-   keystrokes in the terminal buffer. When `rl.Readline()` was called inside `clarifyFn`,
-   it consumed those buffered empty strokes and returned `""` immediately — without blocking
-   for real user input. Each empty answer caused the model to be called again with a blank
-   clarification, which returned `needs_clarification: true` again, calling `clarifyFn`
-   again, and so on until the buffer was drained.
-
-**Fix** (`perceiver/perceiver.go`):
-- **`maxClarificationRounds = 2`**: `Process()` now loops at most twice before giving up.
-- **Empty answer → break**: if the user provides an empty answer (Enter with no text),
-  treat it as "proceed with your best interpretation" and exit the loop immediately.
-- **Final commit call**: after the loop exits (max rounds or empty answer), `perceive()` is
-  called one final time with an appended instruction
-  `"[Instruction: proceed with the best interpretation; do not request further clarification.]"`
-  to force the model to emit a `TaskSpec` instead of another `needs_clarification`.
-- **`publish()` helper**: extracted from the loop body to avoid duplicating the bus publish +
-  log line.
-
-**Behaviour after fix**
-- First clarification round: model asks → user sees question → user types answer → loop
-- Second clarification round (if model still unclear): model asks once more → user answers
-- After two rounds, or on empty answer: model is forced to commit; task proceeds.
-
----
-
-## Issue #22 — `/audit` always shows zeros on process restart
-
-**Symptom**
-After exiting and restarting agsh, `/audit` immediately showed:
-```
-Tasks observed:  0
-Avg corrections: 0.00
-Gap trends:      ↑improving=0  →stable=0  ↓worsening=0
-No anomalies detected.
-```
-even though several tasks had been run in the previous session.
-
-**Root cause**
-The auditor's window stats (`tasksObserved`, `totalCorrections`, `gapTrends`,
-`boundaryViolations`, `driftAlerts`, `anomalies`, `windowStart`) were held only in
-memory. On process restart they were initialised to zero values in `New()`, discarding
-all accumulated data from prior runs.
-
-**Fix**
-Persist window stats to `~/.cache/agsh/audit_stats.json` and reload on startup:
-
-- **`persistedStats` struct**: mirrors the seven window fields with JSON tags.
-- **`loadStats()`**: called synchronously inside `New()` before returning. Reads
-  `audit_stats.json`; silently no-ops if absent (first run). Restores all seven fields
-  so the window is correct from message #1 of the new session.
-- **`saveStats()`**: acquires the mutex to snapshot current window fields, then writes
-  JSON to `audit_stats.json` with `os.WriteFile`. Called from the auditor goroutine only
-  (no extra lock needed for the write itself).
-- **`process()` call site**: `saveStats()` is called only after `MsgDispatchManifest`,
-  `MsgReplanRequest`, or any anomaly — the three event types that actually mutate stats.
-  Not called on every tap message (20+ per task).
-- **`publishReport()` call site**: `saveStats()` is called immediately after the window
-  reset so a crash right after `/audit` doesn't replay old stats on next start.
-- **`auditor.New()` signature updated**: `statsPath string` added as fourth parameter
-  (before `interval`).
-- **`main.go`**: passes `filepath.Join(cacheDir, "audit_stats.json")` as `statsPath`.
-
-**Behaviour after fix**
-```
-Session 1:
-  agsh> list all go files      ← tasks=1 recorded
-  agsh> exit
-
-Session 2:
-  agsh> /audit
-  Tasks observed:  1            ← restored from audit_stats.json
-  window_start: 2026-02-19...
-```
-After `/audit` triggers a report the window resets and the zeroed stats are immediately
-persisted, so restarting again shows tasks=0 with the new `window_start`.
