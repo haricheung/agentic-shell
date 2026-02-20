@@ -293,6 +293,15 @@ func roleLabel(r types.Role) string {
 	return emoji + " " + string(r)
 }
 
+// msgDetail returns a short inline detail string for a pipeline flow line.
+//
+// Expectations:
+//   - MsgSubTask: returns "#N intent | first_criterion" when criteria present; "+N" suffix when multiple
+//   - MsgSubTask: returns "#N intent" with no suffix when SuccessCriteria is empty
+//   - MsgSubTaskOutcome failed with trajectory: returns "failed | unmet: <first unmet criterion>"
+//   - MsgSubTaskOutcome matched or failed with no trajectory: returns status string only
+//   - MsgCorrectionSignal: returns "attempt N — what_was_wrong" clipped to 40 chars
+//   - Returns "" for unknown or unparseable message types
 func msgDetail(msg types.Message) string {
 	switch msg.Type {
 	case types.MsgTaskSpec:

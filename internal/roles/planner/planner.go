@@ -206,6 +206,15 @@ func (p *Planner) replan(ctx context.Context, spec types.TaskSpec, rr types.Repl
 //
 // Step 3 — Constrain: derive MUST NOT (procedural) and SHOULD PREFER (episodic) lines.
 // Returns an empty string when no relevant entries exist.
+//
+// Expectations:
+//   - Returns "" when entries is empty
+//   - Sorts entries newest-first before applying cap (most recent lessons take priority)
+//   - Caps to maxMemoryEntries; entries beyond the cap are silently dropped
+//   - Drops entries with zero keyword overlap against intent (>= 3-char words)
+//   - Returns "" when all entries are filtered by keyword or have unknown type
+//   - Procedural entries appear under "MUST NOT" heading
+//   - Episodic entries appear under "SHOULD PREFER" heading
 func calibrate(entries []types.MemoryEntry, intent string) string {
 	if len(entries) == 0 {
 		return ""
@@ -270,6 +279,11 @@ func calibrate(entries []types.MemoryEntry, intent string) string {
 }
 
 // entrySummary produces a short readable description of a memory entry for constraint text.
+//
+// Expectations:
+//   - Truncates content JSON at 180 chars, appending "…" when trimmed
+//   - Prepends "[tags: t1, t2] " when tags are present
+//   - Returns raw content JSON with no prefix when tags are empty
 func entrySummary(e types.MemoryEntry) string {
 	raw, _ := json.Marshal(e.Content)
 	s := string(raw)
@@ -283,6 +297,11 @@ func entrySummary(e types.MemoryEntry) string {
 }
 
 // memTokenize splits s into lowercase keywords of length >= 3.
+//
+// Expectations:
+//   - Returns only words with len >= 3 (short noise words are discarded)
+//   - All returned words are lowercase
+//   - Returns nil for empty or whitespace-only input
 func memTokenize(s string) []string {
 	var words []string
 	for _, w := range strings.Fields(strings.ToLower(s)) {

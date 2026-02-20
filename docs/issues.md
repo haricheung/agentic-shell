@@ -960,3 +960,82 @@ For redirected queries, extract the stem from the `-name` pattern (strip `*` and
 leading path separators) and pass only that to `mdfind`. Post-filter results by
 extension in Go code if needed. Alternatively, when `-path` is present, consider
 using `shell find` within the specific subdirectory rather than redirecting to mdfind.
+
+---
+
+## Issue #33 — Memory entries treated as advisory; calibration not code-enforced
+
+**Symptom**
+R2 queried R5 before planning and received relevant memory entries, but the LLM
+planner consistently ignored them. The same failing approaches (e.g. `shell find`)
+were repeated even when procedural entries explicitly documented them as failures.
+Memory was effectively write-only: read path worked, but entries had no behavioral
+effect on planner output.
+
+**Root cause**
+`plan()` serialised the raw `MemoryResponse` as a JSON block and appended it to the
+user prompt as advisory text:
+```
+Prior memory entries (learn from these):
+[{"type":"procedural","timestamp":"...","content":"..."}]
+```
+LLMs treat advisory context as optional. The model had no strong structural cue to
+treat the entries as hard constraints vs. background information, so it ignored them.
+The problem is Issue #29 / T5 — memory was bypassed at the calibration step.
+
+**Fix**
+Implemented `calibrate()` in Go code (Steps 1–3 of the Memory Calibration Protocol):
+- **Step 1**: Retrieve entries from R5 (already done via bus before this fix).
+- **Step 2**: Sort by recency (newest first), cap at `maxMemoryEntries=10`, keyword-
+  filter against intent (discard zero-overlap entries).
+- **Step 3**: Derive structured constraint text: `MUST NOT` for procedural entries
+  (failed approaches) and `SHOULD PREFER` for episodic entries (successful approaches).
+
+The constraint block is injected with explicit headings:
+```
+--- MEMORY CONSTRAINTS (code-derived) ---
+MUST NOT (prior failures — do not repeat these approaches):
+  - [tags: file, search] "used shell find -name *.go"
+--- END CONSTRAINTS ---
+```
+`MUST NOT` framing gives the LLM a hard structural signal that the model respects.
+No extra LLM call is needed for calibration; all logic is deterministic Go code.
+
+**Added**
+- `calibrate(entries []types.MemoryEntry, intent string) string` — Steps 1–3
+- `entrySummary(e types.MemoryEntry) string` — human-readable entry line
+- `memTokenize(s string) []string` — keyword tokeniser (len≥3, lowercase)
+- `maxMemoryEntries = 10` constant
+- Tests: `internal/roles/planner/planner_test.go` — one test per documented expectation
+- Expectation comments on all three functions
+
+---
+
+## Issue #34 — Validator criteria invisible in pipeline display
+
+**Symptom**
+The pipeline visualiser showed `MsgSubTask: #1 locate the audio file` with no hint
+of what the subtask was being validated against. `MsgSubTaskOutcome` showed only
+`matched` or `failed` with no detail about which criterion caused a failure.
+Debugging validator behaviour required reading raw debug logs.
+
+**Root cause**
+`msgDetail()` in `display.go` rendered `MsgSubTask` as `#N intent` only (no
+criteria). `MsgSubTaskOutcome` returned the bare `Status` string, discarding the
+`GapTrajectory` and `UnmetCriteria` fields that are populated on failure.
+
+**Fix**
+Updated `msgDetail()`:
+
+- **MsgSubTask**: appends `| <first criterion>` when `SuccessCriteria` is non-empty;
+  appends `(+N)` suffix when there are multiple criteria. Example:
+  `#1 locate audio | output contains a valid file path (+1)`
+
+- **MsgSubTaskOutcome**: when `status="failed"` and `GapTrajectory` is non-empty,
+  extracts the last trajectory point and shows the first unmet criterion:
+  `failed | unmet: output contains a valid file path`
+  When status is `matched` or no trajectory exists, returns the status string only.
+
+**Added**
+- Tests: `internal/ui/display_test.go` — one test per documented expectation
+- Expectation comments on `msgDetail()`
