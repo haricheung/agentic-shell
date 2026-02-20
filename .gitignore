@@ -5,7 +5,11 @@
 
 # Binaries
 /agsh
+/main
 /bin/
+
+# Recordings
+*.cast
 
 # Build artifacts
 *.test
