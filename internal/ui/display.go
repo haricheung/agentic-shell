@@ -162,6 +162,11 @@ func (d *Display) Run(ctx context.Context) {
 			if !ok {
 				return
 			}
+			// Meta-system messages (audit query/report) are not task pipeline events;
+			// skip them so they don't open a pipeline box or stall the spinner.
+			if msg.Type == types.MsgAuditQuery || msg.Type == types.MsgAuditReport {
+				continue
+			}
 			if !d.inTask {
 				d.mu.Lock()
 				sup := d.suppressed
