@@ -10,10 +10,12 @@
 | Change | Reason |
 |---|---|
 | R2 — memory integration replaced with active calibration protocol | v0.5 injected raw memory entries as advisory text; LLM ignored them. Memory must produce explicit, code-enforced planning constraints, not suggestions |
+| R2 — calibration step is code-side only (keyword match + recency); no LLM call | Separate LLM call for calibration would add 1-2 s latency per task. The Dreamer (v0.7) pre-organizes semantic memory so calibration degrades to a near-zero read; in v0.6 calibration is bounded by capping entries at 10 and doing filtering in Go code, not in the LLM |
 | R4a — holistic scoring replaced with per-criterion independent evaluation | v0.5 asked LLM to "score the result overall"; LLM accepted plausible-sounding outputs even when specific criteria were unmet. Each criterion must produce a binary verdict independently |
+| R4a — criterion verdicts now include failure_class (logical \| environmental) | Hard per-criterion evaluation is correct but the error signal was too coarse. Environmental failures (network, permissions, not found) need a different controller response than logical failures (wrong answer). Enriching the signal enables targeted replanning without weakening the gate |
 | R4b — LLM gate: hard-fail on any failed subtask enforced in code before LLM | v0.5 let the LLM merge all outcomes together and reason holistically; it accepted 1-matched + 1-failed as success. LLM is now only invoked when all subtasks passed |
 | SubTask IDs removed from planner LLM output; assigned by runtime | Planner LLM fabricated fake sequential UUIDs (top ID reused 270 times), breaking all dispatcher routing guarantees. IDs are now assigned by Go after parsing |
-| R1 success_criteria quality constraint strengthened | Criteria must be independently falsifiable from tool output alone; vague criteria disable all downstream validation |
+| R1 success_criteria quality constraint strengthened | Criteria must be independently falsifiable from tool output alone; vague criteria disable all downstream validation. Most validator "rigidity" problems are upstream criteria quality failures, not validator failures |
 | R1 confirmed memory-blind (explicit) | R1 is a transducer (reference signal), not a decision-maker. Memory belongs to R2 (brain). Made explicit rather than implicit |
 
 ---
@@ -165,27 +167,33 @@ correction.
 R2 must execute this protocol before generating any `SubTask` list. It is not optional
 and is not advisory.
 
+**Latency budget**: the calibration step must not add perceivable latency. Steps 1–3
+are executed in Go code (no LLM call). Only Step 4 (plan generation) invokes the LLM.
+
 **Step 1 — Retrieve**: Query R5 with the current `TaskSpec.intent` and key terms.
-Receive `MemoryEntry[]`.
+Receive up to **10** most recent `MemoryEntry[]` (capped in Go before passing to planner).
 
-**Step 2 — Calibrate**: For each retrieved entry, assess independently:
-- Is this entry relevant to the current task intent?
-- Is the lesson still valid (not superseded by a newer contradicting entry)?
-- If two entries contradict each other, flag the conflict and prefer the newer one.
-Discard irrelevant or superseded entries. Calibration output: a filtered, ranked list.
+**Step 2 — Calibrate**: In Go code, filter entries by:
+- Keyword overlap with `TaskSpec.intent` (discard zero-overlap entries)
+- Recency (prefer newer entries; if two entries contradict, keep the newer)
+Calibration output: a filtered, ranked list. **No LLM call for this step.**
 
-**Step 3 — Constrain**: Derive explicit planning constraints from the calibrated entries.
-Each constraint takes one of two forms:
+**Step 3 — Constrain**: In Go code, derive explicit planning constraints from calibrated
+entries and format them as injected text for the planner prompt:
 - `MUST NOT`: "must not use approach X for intent Y because lesson Z" (from procedural entries)
 - `SHOULD PREFER`: "should use approach A for intent B because episodic evidence C" (from episodic entries)
 
-**Step 4 — Plan**: Generate the `SubTask` list. The plan must demonstrably satisfy all
-`MUST NOT` constraints — if a procedural entry records that approach X failed for a
-similar task, the plan must use a different approach. Issuing an identical plan to a
-previous failed plan is a planning error regardless of LLM output.
+**Step 4 — Plan**: LLM generates the `SubTask` list given the prompt with pre-formatted
+constraints injected. The plan must demonstrably satisfy all `MUST NOT` constraints.
+Issuing an identical plan to a previous failed plan is a planning error regardless of LLM output.
 
 **Step 4 is code-enforced**: if the generated plan reuses a tool or approach flagged in
 a `MUST NOT` constraint, the plan is rejected and re-generated before dispatch.
+
+**v0.6 known limitation**: R5 stores raw episodic/procedural entries (no Dreamer yet).
+The calibrate step does more filtering work than it will in v0.7, when the Dreamer
+pre-organizes episodic → semantic memory between tasks. In v0.7, R2's calibration reads
+pre-curated semantic entries; the calibrate step degrades to a near-zero-cost pass-through.
 
 **Contract**:
 
@@ -290,15 +298,27 @@ reasoning about the overall result is not permitted during the evaluation phase.
 For each criterion:
 1. Examine `tool_calls` evidence and `output` for that specific criterion only
 2. Produce an explicit verdict: `pass` or `fail`
-3. If `fail`: record which criterion failed and why in one sentence
+3. If `fail`: record which criterion failed, why, and the **failure class**:
+   - `logical` — the approach ran but produced the wrong result (e.g. wrong file, wrong value)
+   - `environmental` — infrastructure prevented execution (network timeout, permission denied,
+     path not found, tool unavailable)
+4. The failure class does NOT change the pass/fail verdict — it enriches the error signal
+   so the controller (R2) can respond differently (wrong logic → new approach; bad environment
+   → same logic, different path/tool)
 
 **Aggregation rule (code-enforced)**:
 - ALL criteria `pass` → `SubTaskOutcome { status: matched }`
 - ANY criterion `fail` → `SubTaskOutcome { status: failed }` — no exceptions, no holistic override
 
 The only LLM judgment permitted after the per-criterion phase is writing the
-`CorrectionSignal.what_to_do` — which criterion failed, and what specific change would
-satisfy it.
+`CorrectionSignal.what_to_do` — which criterion failed, its class, and what specific
+change would satisfy it.
+
+**On plausible reasoning**: the `gap_trajectory` in `SubTaskOutcome` accumulates evidence
+across retry attempts — this is the Pólya mechanism. A criterion that failed on attempt 1
+and passed on attempt 2 is evidence the approach works; a criterion that fails consistently
+across all attempts is strong evidence of a logical failure requiring replanning. R4b and
+GGS use this trajectory; R4a's job is only to supply accurate per-attempt binary evidence.
 
 **Skills**:
 - Evaluate each success criterion independently against tool evidence
@@ -321,7 +341,8 @@ satisfy it.
 CorrectionSignal {
   "subtask_id":        "string",
   "attempt_number":    "integer",
-  "failed_criterion":  "string",   // the exact criterion string that failed
+  "failed_criterion":  "string",              // the exact criterion string that failed
+  "failure_class":     "logical | environmental",
   "what_was_wrong":    "string",
   "what_to_do":        "string"
 }
@@ -333,10 +354,20 @@ SubTaskOutcome {
   "output":           "any",
   "failure_reason":   "string | null",
   "criteria_verdicts": [
-    { "criterion": "string", "verdict": "pass | fail", "evidence": "string" }
+    {
+      "criterion":     "string",
+      "verdict":       "pass | fail",
+      "failure_class": "logical | environmental | null",  // null when verdict == pass
+      "evidence":      "string"
+    }
   ],
   "gap_trajectory": [
-    { "attempt": "integer", "failed_criteria": ["string"] }
+    {
+      "attempt":        "integer",
+      "failed_criteria": [
+        { "criterion": "string", "failure_class": "logical | environmental" }
+      ]
+    }
   ]
 }
 ```
@@ -554,8 +585,10 @@ User
 | SubTask IDs are UUIDs assigned by Go runtime, never by LLM | Dispatcher |
 | R4b LLM is not invoked when any SubTaskOutcome.status == "failed" | R4b code gate |
 | R4a verdict is aggregation of per-criterion booleans; one false = failed | R4a scoring loop |
+| R4a criterion verdict includes failure_class (logical \| environmental) | R4a LLM output schema |
 | R2 plan cannot reuse an approach flagged in a MUST NOT constraint | R2 plan validator |
 | Memory calibration runs before every plan, including replans | R2 protocol |
+| Memory calibration (Steps 1–3) involves no LLM call; bounded at 10 entries | R2 Go code |
 
 ---
 
@@ -575,5 +608,6 @@ User
 |---|---|---|
 | Q1 | How does R2 determine "approach reuse" for MUST NOT enforcement — tool name match, intent similarity, or LLM-judged equivalence? | R2 plan validator |
 | Q2 | What is the retry budget for R4a — fixed count (current: 2) or gap-score threshold? | R4a |
-| Q3 | How does R2 differ its replan from a prior failed plan when the root cause is environmental (e.g. network timeout) rather than approach failure? | R2 |
+| Q3 | How does R2 differ its replan from a prior failed plan when the root cause is environmental (failure_class="environmental") rather than logical? The failure_class in the ReplanRequest gives R2 the signal; the replanning strategy is: environmental → same tool sequence but different path/parameters; logical → different tool or approach entirely | R2 |
 | Q4 | Should criteria_verdicts in SubTaskOutcome be persisted to MemoryEntry so future R2 calibration knows which specific criteria tend to fail for certain task types? | R4a, R5 |
+| Q5 | When the Dreamer arrives in v0.7, should R5 expose a separate "semantic" vs "raw" read API, or should R5 remain schema-agnostic and the Dreamer simply write entries with a different type tag (e.g. type: "semantic")? | R5, Dreamer |
