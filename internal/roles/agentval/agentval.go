@@ -77,6 +77,13 @@ func (a *AgentValidator) Run(
 	resultCh <-chan types.ExecutionResult,
 	correctionCh chan<- types.CorrectionSignal,
 ) types.SubTaskOutcome {
+	// Log full criteria once before the loop so they're always visible in the debug log.
+	log.Printf("[R4a] subtask=%s seq=%d intent=%q criteria(%d):",
+		subTask.SubTaskID, subTask.Sequence, subTask.Intent, len(subTask.SuccessCriteria))
+	for i, c := range subTask.SuccessCriteria {
+		log.Printf("[R4a]   [%d] %s", i+1, c)
+	}
+
 	var trajectory []types.GapTrajectoryPoint
 	attempt := 0
 
@@ -115,6 +122,25 @@ func (a *AgentValidator) Run(
 			log.Printf("[R4a] ERROR scoring: %v", err)
 			reason := fmt.Sprintf("scoring error: %v", err)
 			v = &verdict{Verdict: "failed", Score: 0, FailureReason: reason}
+		}
+
+		// Log the full verdict so operators can see exactly what passed/failed.
+		log.Printf("[R4a] subtask=%s attempt=%d verdict=%s score=%.2f",
+			subTask.SubTaskID, attempt, v.Verdict, v.Score)
+		if len(v.UnmetCriteria) > 0 {
+			log.Printf("[R4a]   unmet criteria:")
+			for i, c := range v.UnmetCriteria {
+				log.Printf("[R4a]     [%d] %s", i+1, c)
+			}
+		}
+		if v.WhatWasWrong != "" {
+			log.Printf("[R4a]   wrong: %s", v.WhatWasWrong)
+		}
+		if v.WhatToDo != "" {
+			log.Printf("[R4a]   todo:  %s", v.WhatToDo)
+		}
+		if v.FailureReason != "" {
+			log.Printf("[R4a]   reason: %s", v.FailureReason)
 		}
 
 		trajectory = append(trajectory, types.GapTrajectoryPoint{

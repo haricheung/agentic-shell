@@ -365,7 +365,11 @@ func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt,
 			Type:      types.MsgSubTask,
 			Payload:   st,
 		})
-		log.Printf("[R2] dispatched subtask=%s sequence=%d", st.SubTaskID, st.Sequence)
+		log.Printf("[R2] dispatched subtask=%s sequence=%d intent=%q criteria(%d):",
+			st.SubTaskID, st.Sequence, st.Intent, len(st.SuccessCriteria))
+		for i, c := range st.SuccessCriteria {
+			log.Printf("[R2]   [%d] %s", i+1, c)
+		}
 	}
 
 	return nil
