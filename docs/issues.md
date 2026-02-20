@@ -839,10 +839,18 @@ LLM, not an enforced code constraint.
 The user receives a partial or wrong result and is told the task succeeded. Incorrect
 answers are delivered silently with no signal that part of the execution failed.
 
-**Fix needed**
-R4b must reject (or replan) if any subtask status is `failed`, enforced in Go code
-before the LLM is called. The LLM should only be invoked to merge outputs from subtasks
-that all passed.
+**Fix**
+Added a code-enforced hard gate in `evaluate()` before any LLM call:
+```go
+if len(failedIDs) > 0 {
+    m.triggerReplan(...)  // LLM never reached
+    return
+}
+// LLM called only when ALL subtasks matched — merge outputs only
+```
+Extracted `triggerReplan()` shared by the hard gate and the LLM-verdict replan path.
+The LLM can no longer override a `status=failed` outcome by reasoning about "overall goal".
+Tests added in `metaval_test.go` covering all `computeGapTrend` expectations.
 
 ---
 
