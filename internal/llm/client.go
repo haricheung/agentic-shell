@@ -20,17 +20,26 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// normalizeBaseURL strips trailing slashes and the "/chat/completions" suffix
+// from a raw OPENAI_BASE_URL value so the path is never doubled when the
+// client appends "/chat/completions" itself.
+//
+// Expectations:
+//   - Strips a trailing "/chat/completions" suffix
+//   - Strips a trailing slash without "/chat/completions"
+//   - Strips trailing slash AND "/chat/completions" when both are present
+//   - Returns the URL unchanged when neither suffix is present
+//   - Returns "" for empty input
+func normalizeBaseURL(raw string) string {
+	s := strings.TrimRight(raw, "/")
+	return strings.TrimSuffix(s, "/chat/completions")
+}
+
 // New creates a Client from environment variables:
 //   OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
-//
-// OPENAI_BASE_URL should be the API root (e.g. "https://api.openai.com/v1").
-// If it already ends with "/chat/completions" (a common copy-paste mistake),
-// that suffix is stripped so the path is not doubled.
 func New() *Client {
-	base := strings.TrimRight(os.Getenv("OPENAI_BASE_URL"), "/")
-	base = strings.TrimSuffix(base, "/chat/completions")
 	return &Client{
-		baseURL: base,
+		baseURL: normalizeBaseURL(os.Getenv("OPENAI_BASE_URL")),
 		apiKey:  os.Getenv("OPENAI_API_KEY"),
 		model:   os.Getenv("OPENAI_MODEL"),
 		httpClient: &http.Client{
