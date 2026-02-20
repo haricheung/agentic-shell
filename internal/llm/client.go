@@ -22,9 +22,15 @@ type Client struct {
 
 // New creates a Client from environment variables:
 //   OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+//
+// OPENAI_BASE_URL should be the API root (e.g. "https://api.openai.com/v1").
+// If it already ends with "/chat/completions" (a common copy-paste mistake),
+// that suffix is stripped so the path is not doubled.
 func New() *Client {
+	base := strings.TrimRight(os.Getenv("OPENAI_BASE_URL"), "/")
+	base = strings.TrimSuffix(base, "/chat/completions")
 	return &Client{
-		baseURL: strings.TrimRight(os.Getenv("OPENAI_BASE_URL"), "/"),
+		baseURL: base,
 		apiKey:  os.Getenv("OPENAI_API_KEY"),
 		model:   os.Getenv("OPENAI_MODEL"),
 		httpClient: &http.Client{

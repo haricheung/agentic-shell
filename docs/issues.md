@@ -1039,3 +1039,31 @@ Updated `msgDetail()`:
 **Added**
 - Tests: `internal/ui/display_test.go` — one test per documented expectation
 - Expectation comments on `msgDetail()`
+
+---
+
+## Issue #35 — Model switch fails: doubled `/chat/completions` path in URL
+
+**Symptom**
+Switching the active model (e.g. from DeepSeek to kimi-k2.5 / Aliyun DashScope)
+caused all LLM calls to fail with HTTP 404 or connection errors.
+
+**Root cause**
+Some provider base URLs include the full endpoint path:
+```
+OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+```
+`client.go` always appended `/chat/completions` to the base URL, producing:
+```
+https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions/chat/completions
+```
+The correct convention is `OPENAI_BASE_URL` = base root only (e.g.
+`https://dashscope.aliyuncs.com/compatible-mode/v1`), but this was easy to
+copy-paste wrong from provider documentation.
+
+**Fix**
+In `llm.New()`, strip any trailing `/chat/completions` suffix from the base URL
+before storing it, so both forms of the env var work:
+```go
+base = strings.TrimSuffix(base, "/chat/completions")
+```
