@@ -178,6 +178,14 @@ type finalResult struct {
 func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *types.CorrectionSignal, priorToolCalls []string) (types.ExecutionResult, []string, error) {
 	wd, _ := os.Getwd()
 
+	if correction == nil {
+		log.Printf("[R3] execute subtask=%s seq=%d intent=%q", st.SubTaskID, st.Sequence, st.Intent)
+	} else {
+		log.Printf("[R3] re-execute subtask=%s seq=%d attempt=%d intent=%q",
+			st.SubTaskID, st.Sequence, correction.AttemptNumber+1, st.Intent)
+		log.Printf("[R3]   correction: wrong=%q todo=%q", correction.WhatWasWrong, correction.WhatToDo)
+	}
+
 	var userPrompt string
 	if correction != nil {
 		prior := strings.Join(priorToolCalls, ", ")
@@ -212,6 +220,9 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		// Try to parse as final result first
 		var fr finalResult
 		if err := json.Unmarshal([]byte(raw), &fr); err == nil && fr.Action == "result" {
+			outStr, _ := json.Marshal(fr.Output)
+			log.Printf("[R3] result subtask=%s status=%s output=%s",
+				st.SubTaskID, fr.Status, firstN(strings.TrimSpace(string(outStr)), 500))
 			return types.ExecutionResult{
 				SubTaskID:   st.SubTaskID,
 				Status:      fr.Status,
@@ -229,18 +240,38 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 
 		detail := tc.Command + tc.Path + tc.Query + tc.Pattern + tc.Name + firstN(tc.Script, 40)
 		toolCallHistory = append(toolCallHistory, tc.Tool+":"+firstN(detail, 60))
-		log.Printf("[R3] running tool=%s cmd=%s path=%s query=%s script=%s name=%s",
-			tc.Tool, firstN(tc.Command, 80), tc.Path, tc.Query, firstN(tc.Script, 60), tc.Name)
+
+		// Log tool invocation with the most relevant param per tool type.
+		switch tc.Tool {
+		case "shell":
+			log.Printf("[R3] tool[%d] shell: %s", i+1, firstN(tc.Command, 120))
+		case "mdfind":
+			log.Printf("[R3] tool[%d] mdfind: query=%q", i+1, tc.Query)
+		case "glob":
+			log.Printf("[R3] tool[%d] glob: pattern=%q root=%q", i+1, tc.Pattern, tc.Root)
+		case "read_file":
+			log.Printf("[R3] tool[%d] read_file: %s", i+1, tc.Path)
+		case "write_file":
+			log.Printf("[R3] tool[%d] write_file: %s (%d bytes)", i+1, tc.Path, len(tc.Content))
+		case "applescript":
+			log.Printf("[R3] tool[%d] applescript: %s", i+1, firstN(tc.Script, 100))
+		case "shortcuts":
+			log.Printf("[R3] tool[%d] shortcuts: name=%q", i+1, tc.Name)
+		case "search":
+			log.Printf("[R3] tool[%d] search: query=%q", i+1, tc.Query)
+		default:
+			log.Printf("[R3] tool[%d] %s", i+1, tc.Tool)
+		}
 
 		result, err := e.runTool(ctx, tc)
 		if err != nil {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s ERROR: %v\n", tc.Tool, err))
-			log.Printf("[R3] tool %s error: %v", tc.Tool, err)
+			log.Printf("[R3] tool[%d] → ERROR: %v", i+1, err)
 			// Append error evidence to tool_calls so R4a can verify
 			toolCallHistory[len(toolCallHistory)-1] += " → ERROR: " + firstN(err.Error(), 80)
 		} else {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, headTail(result, 4000)))
-			log.Printf("[R3] tool %s result: %s", tc.Tool, firstN(result, 200))
+			log.Printf("[R3] tool[%d] → %s", i+1, firstN(strings.TrimSpace(result), 500))
 			// Append output tail to tool_calls so R4a sees concrete evidence, not just a prose claim
 			toolCallHistory[len(toolCallHistory)-1] += " → " + lastN(strings.TrimSpace(result), 120)
 		}
