@@ -267,3 +267,74 @@ Three places where the biological metaphor risks misleading implementation:
 | Credit assignment in Goal Gradient Solver | When multiple agents contribute to a failure, attributing responsibility across them requires both causal attribution (which agent caused the gap) and temporal attribution (did the gap emerge immediately or accumulate across correction cycles) | The dynamic dimension of the GGS — its gap trajectory history — is what makes temporal attribution possible; an implementation that discards trajectory history loses this capability |
 | Auditor blind spot | The Auditor can only observe messages that pass through the bus; in-process state changes or side effects that do not produce bus messages are invisible to it | All state changes with operational significance must produce a bus message; silent state mutation by any role is a design violation |
 | Auditor suppression | An agent that learns the Auditor's detection patterns could produce outputs that avoid triggering alerts while still producing bad results | The Auditor's detection logic must not be visible to operational agents; its configuration is controlled by the human operator only |
+
+---
+
+## Architectural Rules
+
+System-level invariants that apply across all roles. These are not role contracts — they
+are properties the system as a whole must preserve. Each rule has a status: **settled**
+(conclusion reached, implemented or pending implementation) or **open** (discussion
+in progress, conclusion pending).
+
+---
+
+### Rule #1 — Best Effort Without Self-Harm
+
+**Status**: partially settled — open question remaining (see below)
+
+**Statement**: The system must pursue the user's goal as hard as possible, but must not
+degrade its own capacity to function in the process.
+
+**Rationale**: A system that stops at the first obstacle is useless. A system that runs
+itself to exhaustion or corrupts its own state to complete one task is also useless — it
+makes the next task harder or impossible. These two failure modes are symmetric: both
+represent abandoning the user, one by giving up too early, the other by destroying the
+instrument.
+
+**What "best effort" means in this architecture**:
+- Exhaust the full fast-loop retry budget (R4a: maxRetries) before escalating to replan
+- Exhaust the full medium-loop replan budget (R4b: maxReplans) before abandoning
+- Use `failure_class` to distinguish environmental from logical failures and route
+  replanning accordingly — environmental failures deserve a different approach, not the
+  same approach retried
+
+**What "not harm itself" means in this architecture**:
+
+1. **Convergence integrity**: if `gap_trend` is worsening for 2 consecutive replans
+   (not just present once), the system must stop. Continuing to consume replan budget
+   on a diverging trajectory is self-harm — it exhausts resources without improving the
+   outcome. The stopping condition must be convergence-aware, not just count-based.
+
+2. **Memory integrity**: never write a `MemoryEntry` that misattributes a failure cause.
+   A procedural entry that records the wrong lesson (e.g. blames approach X when the
+   real failure was environmental) poisons future calibration. Writing false memory is
+   self-harm — it makes the system worse at the next task.
+
+3. **Scope integrity**: do not silently expand the task's stated scope to make it
+   achievable. If the task as specified is impossible, report that honestly rather than
+   solving a nearby easier problem and claiming success. Scope creep is self-harm —
+   it teaches the system that the original goal was achieved when it was not, corrupting
+   the feedback signal.
+
+**What is already implemented**:
+- R4a retry cap (maxRetries=2): fast-loop bound ✓
+- R4b replan cap (maxReplans=3): medium-loop bound ✓
+- `gap_trend` detection in ReplanRequest ✓
+- `failure_class` in criterion verdicts (logical | environmental) — spec complete, pending implementation
+
+**What is not yet specified**:
+- Convergence kill-switch: 2 consecutive worsening replans → abort, not count-down
+- Memory integrity enforcement: who validates that a procedural entry's root cause is
+  correctly attributed before it is written?
+
+**Open question (⚠ conclusion pending — resume discussion)**:
+Does "not harm itself" extend to the user's environment? For example: executing a
+destructive shell command (deletion, overwrite) that cannot be undone harms the user's
+state and also corrupts the system's memory of what the task achieved. Is this a
+sub-case of Rule #1 (the system harmed its own feedback signal), or a separate Rule #2
+(execution safety)?
+
+The answer determines whether Rule #1 is purely about **system health** (loops, memory
+integrity, resource budget) or also covers **execution safety** (irreversible operations,
+scope creep into the user's environment).
