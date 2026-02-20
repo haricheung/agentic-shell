@@ -303,7 +303,14 @@ func msgDetail(msg types.Message) string {
 	case types.MsgSubTask:
 		var s types.SubTask
 		if remarshal(msg.Payload, &s) == nil && s.Intent != "" {
-			return fmt.Sprintf("#%d %s", s.Sequence, clip(s.Intent, 50))
+			detail := fmt.Sprintf("#%d %s", s.Sequence, clip(s.Intent, 36))
+			if len(s.SuccessCriteria) > 0 {
+				detail += " | " + clip(s.SuccessCriteria[0], 32)
+				if len(s.SuccessCriteria) > 1 {
+					detail += fmt.Sprintf(" (+%d)", len(s.SuccessCriteria)-1)
+				}
+			}
+			return detail
 		}
 	case types.MsgExecutionResult:
 		var r types.ExecutionResult
@@ -313,6 +320,12 @@ func msgDetail(msg types.Message) string {
 	case types.MsgSubTaskOutcome:
 		var o types.SubTaskOutcome
 		if remarshal(msg.Payload, &o) == nil && o.Status != "" {
+			if o.Status == "failed" && len(o.GapTrajectory) > 0 {
+				last := o.GapTrajectory[len(o.GapTrajectory)-1]
+				if len(last.UnmetCriteria) > 0 {
+					return fmt.Sprintf("failed | unmet: %s", clip(last.UnmetCriteria[0], 38))
+				}
+			}
 			return o.Status
 		}
 	case types.MsgCorrectionSignal:
