@@ -15,17 +15,29 @@ import (
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
+// persistedStats mirrors the window stats fields that survive process restarts.
+type persistedStats struct {
+	WindowStart        time.Time          `json:"window_start"`
+	TasksObserved      int                `json:"tasks_observed"`
+	TotalCorrections   int                `json:"total_corrections"`
+	GapTrends          types.GapTrendDist `json:"gap_trends"`
+	BoundaryViolations []string           `json:"boundary_violations"`
+	DriftAlerts        []string           `json:"drift_alerts"`
+	Anomalies          []string           `json:"anomalies"`
+}
+
 // Auditor (R6) taps the message bus read-only for passive observation, and also
 // subscribes to MsgAuditQuery to respond to on-demand report requests.
 // It detects boundary violations, convergence failures, and thrashing, accumulates
 // window statistics, and publishes AuditReport messages either on-demand or periodically.
 type Auditor struct {
-	b        *bus.Bus
-	tap      <-chan types.Message
-	logPath  string
-	mu       sync.Mutex
-	logFile  *os.File
-	interval time.Duration // 0 = periodic reports disabled
+	b         *bus.Bus
+	tap       <-chan types.Message
+	logPath   string
+	statsPath string
+	mu        sync.Mutex
+	logFile   *os.File
+	interval  time.Duration // 0 = periodic reports disabled
 
 	// convergence tracking (per task, reset on MsgFinalResult)
 	correctionCounts map[string]int
@@ -42,16 +54,65 @@ type Auditor struct {
 }
 
 // New creates an Auditor. tap must be a dedicated bus tap (NewTap()).
+// statsPath is the path to the JSON file used to persist window stats across restarts.
 // interval sets the periodic report cadence; pass 0 to disable periodic reports.
-func New(b *bus.Bus, tap <-chan types.Message, logPath string, interval time.Duration) *Auditor {
-	return &Auditor{
+func New(b *bus.Bus, tap <-chan types.Message, logPath string, statsPath string, interval time.Duration) *Auditor {
+	a := &Auditor{
 		b:                b,
 		tap:              tap,
 		logPath:          logPath,
+		statsPath:        statsPath,
 		interval:         interval,
 		correctionCounts: make(map[string]int),
 		replanCounts:     make(map[string]int),
 		windowStart:      time.Now().UTC(),
+	}
+	a.loadStats()
+	return a
+}
+
+// loadStats reads persisted window stats from statsPath. Safe to call before Run().
+func (a *Auditor) loadStats() {
+	data, err := os.ReadFile(a.statsPath)
+	if err != nil {
+		return // absent on first run — start fresh
+	}
+	var ps persistedStats
+	if err := json.Unmarshal(data, &ps); err != nil {
+		log.Printf("[AUDIT] WARNING: could not load persisted stats: %v", err)
+		return
+	}
+	a.windowStart = ps.WindowStart
+	a.tasksObserved = ps.TasksObserved
+	a.totalCorrections = ps.TotalCorrections
+	a.gapTrends = ps.GapTrends
+	a.boundaryViolations = ps.BoundaryViolations
+	a.driftAlerts = ps.DriftAlerts
+	a.anomalies = ps.Anomalies
+	log.Printf("[AUDIT] loaded persisted stats: tasks=%d corrections=%d window_start=%s",
+		ps.TasksObserved, ps.TotalCorrections, ps.WindowStart.Format(time.RFC3339))
+}
+
+// saveStats writes current window stats to statsPath. Called from the auditor goroutine.
+func (a *Auditor) saveStats() {
+	a.mu.Lock()
+	ps := persistedStats{
+		WindowStart:        a.windowStart,
+		TasksObserved:      a.tasksObserved,
+		TotalCorrections:   a.totalCorrections,
+		GapTrends:          a.gapTrends,
+		BoundaryViolations: a.boundaryViolations,
+		DriftAlerts:        a.driftAlerts,
+		Anomalies:          a.anomalies,
+	}
+	a.mu.Unlock()
+	data, err := json.Marshal(ps)
+	if err != nil {
+		log.Printf("[AUDIT] WARNING: could not marshal stats: %v", err)
+		return
+	}
+	if err := os.WriteFile(a.statsPath, data, 0o644); err != nil {
+		log.Printf("[AUDIT] WARNING: could not save stats: %v", err)
 	}
 }
 
@@ -206,6 +267,11 @@ func (a *Auditor) process(msg types.Message) {
 	}
 
 	a.writeEvent(event)
+
+	// Persist stats only on messages that mutate them, not on every tap message.
+	if msg.Type == types.MsgDispatchManifest || msg.Type == types.MsgReplanRequest || anomaly != "none" {
+		a.saveStats()
+	}
 }
 
 func (a *Auditor) publishReport(trigger string) {
@@ -228,6 +294,9 @@ func (a *Auditor) publishReport(trigger string) {
 	a.driftAlerts = nil
 	a.anomalies = nil
 	a.mu.Unlock()
+
+	// Persist zeroed window immediately so a crash after reset doesn't replay old stats.
+	a.saveStats()
 
 	avgCorrections := 0.0
 	if tasks > 0 {

@@ -58,7 +58,10 @@ func main() {
 
 	// Infrastructure roles
 	mem := memory.New(b, filepath.Join(cacheDir, "memory.json"))
-	aud := auditor.New(b, b.NewTap(), filepath.Join(cacheDir, "audit.jsonl"), 5*time.Minute)
+	aud := auditor.New(b, b.NewTap(),
+		filepath.Join(cacheDir, "audit.jsonl"),
+		filepath.Join(cacheDir, "audit_stats.json"),
+		5*time.Minute)
 
 	// Sci-fi terminal UI — reads its own independent tap of every bus message
 	disp := ui.New(b.NewTap())

@@ -581,3 +581,56 @@ Routing rules:
 - `find ~ -name "*.pdf"` → `mdfind -name '*.pdf'` (redirected)
 - `find . -name "*.go"` → unchanged (project search)
 - `find /tmp -name "*.log"` → unchanged (system path)
+
+---
+
+## Issue #22 — `/audit` always shows zeros on process restart
+
+**Symptom**
+After exiting and restarting agsh, `/audit` immediately showed:
+```
+Tasks observed:  0
+Avg corrections: 0.00
+Gap trends:      ↑improving=0  →stable=0  ↓worsening=0
+No anomalies detected.
+```
+even though several tasks had been run in the previous session.
+
+**Root cause**
+The auditor's window stats (`tasksObserved`, `totalCorrections`, `gapTrends`,
+`boundaryViolations`, `driftAlerts`, `anomalies`, `windowStart`) were held only in
+memory. On process restart they were initialised to zero values in `New()`, discarding
+all accumulated data from prior runs.
+
+**Fix**
+Persist window stats to `~/.cache/agsh/audit_stats.json` and reload on startup:
+
+- **`persistedStats` struct**: mirrors the seven window fields with JSON tags.
+- **`loadStats()`**: called synchronously inside `New()` before returning. Reads
+  `audit_stats.json`; silently no-ops if absent (first run). Restores all seven fields
+  so the window is correct from message #1 of the new session.
+- **`saveStats()`**: acquires the mutex to snapshot current window fields, then writes
+  JSON to `audit_stats.json` with `os.WriteFile`. Called from the auditor goroutine only
+  (no extra lock needed for the write itself).
+- **`process()` call site**: `saveStats()` is called only after `MsgDispatchManifest`,
+  `MsgReplanRequest`, or any anomaly — the three event types that actually mutate stats.
+  Not called on every tap message (20+ per task).
+- **`publishReport()` call site**: `saveStats()` is called immediately after the window
+  reset so a crash right after `/audit` doesn't replay old stats on next start.
+- **`auditor.New()` signature updated**: `statsPath string` added as fourth parameter
+  (before `interval`).
+- **`main.go`**: passes `filepath.Join(cacheDir, "audit_stats.json")` as `statsPath`.
+
+**Behaviour after fix**
+```
+Session 1:
+  agsh> list all go files      ← tasks=1 recorded
+  agsh> exit
+
+Session 2:
+  agsh> /audit
+  Tasks observed:  1            ← restored from audit_stats.json
+  window_start: 2026-02-19...
+```
+After `/audit` triggers a report the window resets and the zeroed stats are immediately
+persisted, so restarting again shows tasks=0 with the new `window_start`.

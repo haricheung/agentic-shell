@@ -16,6 +16,7 @@ Cache / log files written to `~/.cache/agsh/`:
 |---|---|
 | `memory.json` | Persistent episodic + procedural memory |
 | `audit.jsonl` | Structured audit events |
+| `audit_stats.json` | Persisted auditor window stats (tasks, corrections, trends, violations) |
 | `debug.log` | Internal role debug logs (redirected from stderr at startup) |
 
 To watch debug output live: `tail -f ~/.cache/agsh/debug.log`
@@ -145,7 +146,7 @@ R6 is a fully active entity — it both observes and reports:
 - **Periodic ticker**: fires every 5 minutes (configurable via `auditor.New(... interval)`). Calls `publishReport("periodic")`.
 - **Window stats**: each report window accumulates `tasksObserved`, `totalCorrections`, `gapTrends`, `boundaryViolations`, `driftAlerts`, `anomalies`. Stats reset after each report.
 - **`/audit` REPL command**: publishes `MsgAuditQuery` (From=User, To=R6) and waits up to 3 s for the `MsgAuditReport` response, then pretty-prints it. Bypasses the Perceiver — it is a meta-system command, not a task.
-- **`auditor.New()` signature**: `New(b *bus.Bus, tap <-chan types.Message, logPath string, interval time.Duration)` — pass `b.NewTap()` for the tap and `0` to disable periodic reports.
+- **`auditor.New()` signature**: `New(b *bus.Bus, tap <-chan types.Message, logPath string, statsPath string, interval time.Duration)` — pass `b.NewTap()` for the tap, `statsPath` for persisted window stats, and `0` to disable periodic reports.
 
 Periodic reports that arrive mid-task are drained from `auditReportCh` in the `waitResult` loop and printed inline.
 
