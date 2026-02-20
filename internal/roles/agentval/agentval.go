@@ -33,16 +33,16 @@ Empty-result rule:
 - If task is to find/list items AND tool_calls show a real search ran AND result is empty → "matched". Absence is a valid answer.
 - Send "retry" for empty results ONLY if tool_calls is empty or the search target was clearly wrong (wrong directory, wrong pattern).
 
-Output — choose ONE:
+Output — choose ONE. Always include criteria_results with one entry per success criterion.
 
 Gap closed:
-{"verdict":"matched","score":1.0,"unmet_criteria":[]}
+{"verdict":"matched","score":1.0,"criteria_results":[{"criterion":"<exact criterion text>","met":true,"evidence":"<one-line tool output snippet>"}],"unmet_criteria":[]}
 
 Gap non-zero, retries remain:
-{"verdict":"retry","score":0.5,"unmet_criteria":["..."],"what_was_wrong":"<specific observation>","what_to_do":"<concrete alternative action>"}
+{"verdict":"retry","score":0.5,"criteria_results":[{"criterion":"<exact criterion text>","met":false,"evidence":"<why it failed>"}],"unmet_criteria":["..."],"what_was_wrong":"<specific observation>","what_to_do":"<concrete alternative action>"}
 
 Failed or infrastructure error:
-{"verdict":"failed","score":0.0,"unmet_criteria":["..."],"failure_reason":"..."}
+{"verdict":"failed","score":0.0,"criteria_results":[{"criterion":"<exact criterion text>","met":false,"evidence":"<why it failed>"}],"unmet_criteria":["..."],"failure_reason":"..."}
 
 No markdown, no prose, no code fences.`
 
@@ -59,13 +59,20 @@ func New(b *bus.Bus, llmClient *llm.Client) *AgentValidator {
 	return &AgentValidator{llm: llmClient, b: b}
 }
 
+type criterionResult struct {
+	Criterion string `json:"criterion"`
+	Met       bool   `json:"met"`
+	Evidence  string `json:"evidence,omitempty"`
+}
+
 type verdict struct {
-	Verdict       string   `json:"verdict"` // "matched" | "retry" | "failed"
-	Score         float64  `json:"score"`
-	UnmetCriteria []string `json:"unmet_criteria"`
-	WhatWasWrong  string   `json:"what_was_wrong,omitempty"`
-	WhatToDo      string   `json:"what_to_do,omitempty"`
-	FailureReason string   `json:"failure_reason,omitempty"`
+	Verdict         string            `json:"verdict"` // "matched" | "retry" | "failed"
+	Score           float64           `json:"score"`
+	CriteriaResults []criterionResult `json:"criteria_results,omitempty"`
+	UnmetCriteria   []string          `json:"unmet_criteria"`
+	WhatWasWrong    string            `json:"what_was_wrong,omitempty"`
+	WhatToDo        string            `json:"what_to_do,omitempty"`
+	FailureReason   string            `json:"failure_reason,omitempty"`
 }
 
 // Run drives the fast loop for one sub-task.
@@ -124,21 +131,27 @@ func (a *AgentValidator) Run(
 			v = &verdict{Verdict: "failed", Score: 0, FailureReason: reason}
 		}
 
-		// Log the full verdict cross-referenced against the original criteria so the
-		// reader never has to scroll up to correlate criteria with the outcome.
+		// Log the full verdict with per-criterion ✓/✗ so the gap between
+		// criteria and outcome is explicit — no manual cross-referencing needed.
 		log.Printf("[R4a] subtask=%s attempt=%d verdict=%s score=%.2f",
 			subTask.SubTaskID, attempt, v.Verdict, v.Score)
-		if v.Verdict == "matched" {
-			// All criteria satisfied — list them explicitly.
-			for i, c := range subTask.SuccessCriteria {
-				log.Printf("[R4a]   [✓] [%d] %s", i+1, c)
+		if len(v.CriteriaResults) > 0 {
+			// Preferred path: LLM returned per-criterion breakdown.
+			for i, cr := range v.CriteriaResults {
+				mark := "✓"
+				if !cr.Met {
+					mark = "✗"
+				}
+				if cr.Evidence != "" {
+					log.Printf("[R4a]   [%s] [%d] %s — %s", mark, i+1, cr.Criterion, cr.Evidence)
+				} else {
+					log.Printf("[R4a]   [%s] [%d] %s", mark, i+1, cr.Criterion)
+				}
 			}
 		} else {
-			// Show original criteria, then the validator's unmet list, so the
-			// reader can compare them even when the LLM paraphrases.
-			log.Printf("[R4a]   original criteria:")
+			// Fallback: LLM omitted criteria_results; show original list untagged.
 			for i, c := range subTask.SuccessCriteria {
-				log.Printf("[R4a]     [%d] %s", i+1, c)
+				log.Printf("[R4a]   [?] [%d] %s", i+1, c)
 			}
 			if len(v.UnmetCriteria) > 0 {
 				log.Printf("[R4a]   unmet (validator's assessment):")
@@ -146,15 +159,15 @@ func (a *AgentValidator) Run(
 					log.Printf("[R4a]     [%d] %s", i+1, c)
 				}
 			}
-			if v.WhatWasWrong != "" {
-				log.Printf("[R4a]   wrong:  %s", v.WhatWasWrong)
-			}
-			if v.WhatToDo != "" {
-				log.Printf("[R4a]   todo:   %s", v.WhatToDo)
-			}
-			if v.FailureReason != "" {
-				log.Printf("[R4a]   reason: %s", v.FailureReason)
-			}
+		}
+		if v.WhatWasWrong != "" {
+			log.Printf("[R4a]   wrong:  %s", v.WhatWasWrong)
+		}
+		if v.WhatToDo != "" {
+			log.Printf("[R4a]   todo:   %s", v.WhatToDo)
+		}
+		if v.FailureReason != "" {
+			log.Printf("[R4a]   reason: %s", v.FailureReason)
 		}
 
 		trajectory = append(trajectory, types.GapTrajectoryPoint{
