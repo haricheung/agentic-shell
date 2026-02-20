@@ -84,11 +84,13 @@ func (a *AgentValidator) Run(
 	resultCh <-chan types.ExecutionResult,
 	correctionCh chan<- types.CorrectionSignal,
 ) types.SubTaskOutcome {
-	// Log full criteria once before the loop so they're always visible in the debug log.
-	log.Printf("[R4a] subtask=%s seq=%d intent=%q criteria(%d):",
-		subTask.SubTaskID, subTask.Sequence, subTask.Intent, len(subTask.SuccessCriteria))
+	// Log all criteria on a single line (JSON) so they're always visible in one entry,
+	// then repeat as numbered lines for easier reading.
+	criteriaJSON, _ := json.Marshal(subTask.SuccessCriteria)
+	log.Printf("[R4a] subtask=%s seq=%d intent=%q criteria(%d)=%s",
+		subTask.SubTaskID, subTask.Sequence, subTask.Intent, len(subTask.SuccessCriteria), criteriaJSON)
 	for i, c := range subTask.SuccessCriteria {
-		log.Printf("[R4a]   [%d] %s", i+1, c)
+		log.Printf("[R4a]   [%d] %q", i+1, c)
 	}
 
 	var trajectory []types.GapTrajectoryPoint
@@ -137,27 +139,28 @@ func (a *AgentValidator) Run(
 			subTask.SubTaskID, attempt, v.Verdict, v.Score)
 		if len(v.CriteriaResults) > 0 {
 			// Preferred path: LLM returned per-criterion breakdown.
+			// Print summary JSON on one line first (never lost in scrollback),
+			// then repeat as readable numbered lines.
+			crJSON, _ := json.Marshal(v.CriteriaResults)
+			log.Printf("[R4a]   criteria_results=%s", crJSON)
 			for i, cr := range v.CriteriaResults {
 				mark := "✓"
 				if !cr.Met {
 					mark = "✗"
 				}
 				if cr.Evidence != "" {
-					log.Printf("[R4a]   [%s] [%d] %s — %s", mark, i+1, cr.Criterion, cr.Evidence)
+					log.Printf("[R4a]   [%s] [%d] %q — %s", mark, i+1, cr.Criterion, cr.Evidence)
 				} else {
-					log.Printf("[R4a]   [%s] [%d] %s", mark, i+1, cr.Criterion)
+					log.Printf("[R4a]   [%s] [%d] %q", mark, i+1, cr.Criterion)
 				}
 			}
 		} else {
-			// Fallback: LLM omitted criteria_results; show original list untagged.
+			// Fallback: LLM omitted criteria_results; show original list untagged
+			// and the unmet list so reader can compare.
+			unmetJSON, _ := json.Marshal(v.UnmetCriteria)
+			log.Printf("[R4a]   criteria_results=(none) unmet=%s", unmetJSON)
 			for i, c := range subTask.SuccessCriteria {
-				log.Printf("[R4a]   [?] [%d] %s", i+1, c)
-			}
-			if len(v.UnmetCriteria) > 0 {
-				log.Printf("[R4a]   unmet (validator's assessment):")
-				for i, c := range v.UnmetCriteria {
-					log.Printf("[R4a]     [%d] %s", i+1, c)
-				}
+				log.Printf("[R4a]   [?] [%d] %q", i+1, c)
 			}
 		}
 		if v.WhatWasWrong != "" {
