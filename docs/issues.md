@@ -746,3 +746,31 @@ fmt.Printf("\033[33m?\033[0m %s\n", question)
 ans, err := rl.Readline()
 ```
 The question is now printed exactly once; readline only manages its own `❯ ` line.
+
+---
+
+## Issue #26 — `/audit` opens a pipeline box that never closes; REPL appears stuck
+
+**Symptom**
+After running `/audit`, the pipeline box opened (`┌─── ⚡ agsh pipeline`) and never
+closed. The spinner kept running and the `❯` prompt was continuously erased by the 80ms
+ticker's `\r\033[K`, making the REPL appear completely frozen.
+
+**Root cause**
+The display goroutine's tap handler treated `MsgAuditQuery` as a normal task pipeline
+message. When `/audit` published `MsgAuditQuery`, the display saw it, called `startTask()`
+(opening the pipeline box and setting `inTask = true`), and started the spinner. The
+corresponding response `MsgAuditReport` was published later, but the display's `endTask()`
+is only triggered by `MsgFinalResult` — `MsgAuditReport` never matched. So `inTask` stayed
+`true` indefinitely; the spinner kept firing every 80ms and erasing whatever was on the
+current terminal line, including the readline prompt.
+
+**Fix** (`internal/ui/display.go`):
+Skip both `MsgAuditQuery` and `MsgAuditReport` at the top of the tap handler before any
+`startTask()` logic. Audit messages are meta-system events, not task pipeline events; they
+must never open a pipeline box.
+```go
+if msg.Type == types.MsgAuditQuery || msg.Type == types.MsgAuditReport {
+    continue
+}
+```
