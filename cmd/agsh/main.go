@@ -508,9 +508,11 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 		taskMu.Unlock()
 
 		clarifyFn := func(question string) (string, error) {
-			rl.SetPrompt(fmt.Sprintf("\033[33m?\033[0m %s\n\033[36m❯\033[0m ", question))
+			// Print the question as plain output — NOT embedded in the readline prompt.
+			// A \n inside SetPrompt causes readline to miscalculate cursor position and
+			// reprint the question line on every internal redraw, flooding the terminal.
+			fmt.Printf("\033[33m?\033[0m %s\n", question)
 			ans, err := rl.Readline()
-			rl.SetPrompt("\033[36m❯\033[0m ")
 			if err != nil {
 				return "", fmt.Errorf("no input")
 			}

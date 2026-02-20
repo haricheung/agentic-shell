@@ -620,6 +620,42 @@ Order after fix (deterministic):
 
 ---
 
+## Issue #25 — Clarification question reprinted on every readline internal redraw
+
+**Symptom**
+```
+? Are you asking for the physical monitor size (like 27 inches) or...
+? Are you asking for the physical monitor size (like 27 inches) or...
+... (×20+)
+```
+The question line repeated dozens of times during a single `clarifyFn` call, even
+after the Issue #23 loop cap was in place.
+
+**Root cause**
+The readline prompt was set with an embedded newline:
+```go
+rl.SetPrompt(fmt.Sprintf("\033[33m?\033[0m %s\n\033[36m❯\033[0m ", question))
+```
+The chzyer/readline library calculates prompt width assuming a single line. When the
+prompt contains `\n`, readline only tracks the portion after the newline (`❯ `) as
+the "active" prompt line. On every internal redraw (terminal resize, interference from
+concurrent writes, cursor movement), readline erases and redraws from the `❯` position
+— but the `? question` line above it is raw output that was already scrolled into
+history. Each redraw cycle prints another copy of the full two-line prompt, leaving the
+previous `? question` line stranded above it. With enough redraws, dozens of copies
+accumulate before the user types anything.
+
+**Fix** (`cmd/agsh/main.go`):
+Print the question with `fmt.Printf` as plain output before calling `rl.Readline()`.
+The readline prompt stays as the simple single-line `❯ ` which readline tracks correctly.
+```go
+fmt.Printf("\033[33m?\033[0m %s\n", question)
+ans, err := rl.Readline()
+```
+The question is now printed exactly once; readline only manages its own `❯ ` line.
+
+---
+
 ## Issue #23 — Clarification question printed dozens of times before user types anything
 
 **Symptom**
