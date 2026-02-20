@@ -124,23 +124,37 @@ func (a *AgentValidator) Run(
 			v = &verdict{Verdict: "failed", Score: 0, FailureReason: reason}
 		}
 
-		// Log the full verdict so operators can see exactly what passed/failed.
+		// Log the full verdict cross-referenced against the original criteria so the
+		// reader never has to scroll up to correlate criteria with the outcome.
 		log.Printf("[R4a] subtask=%s attempt=%d verdict=%s score=%.2f",
 			subTask.SubTaskID, attempt, v.Verdict, v.Score)
-		if len(v.UnmetCriteria) > 0 {
-			log.Printf("[R4a]   unmet criteria:")
-			for i, c := range v.UnmetCriteria {
+		if v.Verdict == "matched" {
+			// All criteria satisfied — list them explicitly.
+			for i, c := range subTask.SuccessCriteria {
+				log.Printf("[R4a]   [✓] [%d] %s", i+1, c)
+			}
+		} else {
+			// Show original criteria, then the validator's unmet list, so the
+			// reader can compare them even when the LLM paraphrases.
+			log.Printf("[R4a]   original criteria:")
+			for i, c := range subTask.SuccessCriteria {
 				log.Printf("[R4a]     [%d] %s", i+1, c)
 			}
-		}
-		if v.WhatWasWrong != "" {
-			log.Printf("[R4a]   wrong: %s", v.WhatWasWrong)
-		}
-		if v.WhatToDo != "" {
-			log.Printf("[R4a]   todo:  %s", v.WhatToDo)
-		}
-		if v.FailureReason != "" {
-			log.Printf("[R4a]   reason: %s", v.FailureReason)
+			if len(v.UnmetCriteria) > 0 {
+				log.Printf("[R4a]   unmet (validator's assessment):")
+				for i, c := range v.UnmetCriteria {
+					log.Printf("[R4a]     [%d] %s", i+1, c)
+				}
+			}
+			if v.WhatWasWrong != "" {
+				log.Printf("[R4a]   wrong:  %s", v.WhatWasWrong)
+			}
+			if v.WhatToDo != "" {
+				log.Printf("[R4a]   todo:   %s", v.WhatToDo)
+			}
+			if v.FailureReason != "" {
+				log.Printf("[R4a]   reason: %s", v.FailureReason)
+			}
 		}
 
 		trajectory = append(trajectory, types.GapTrajectoryPoint{
