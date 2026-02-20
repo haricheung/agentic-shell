@@ -15,7 +15,8 @@
 | R4a — criterion verdicts now include failure_class (logical \| environmental) | Hard per-criterion evaluation is correct but the error signal was too coarse. Environmental failures (network, permissions, not found) need a different controller response than logical failures (wrong answer). Enriching the signal enables targeted replanning without weakening the gate |
 | R4b — LLM gate: hard-fail on any failed subtask enforced in code before LLM | v0.5 let the LLM merge all outcomes together and reason holistically; it accepted 1-matched + 1-failed as success. LLM is now only invoked when all subtasks passed |
 | SubTask IDs removed from planner LLM output; assigned by runtime | Planner LLM fabricated fake sequential UUIDs (top ID reused 270 times), breaking all dispatcher routing guarantees. IDs are now assigned by Go after parsing |
-| R1 success_criteria quality constraint strengthened | Criteria must be independently falsifiable from tool output alone; vague criteria disable all downstream validation. Most validator "rigidity" problems are upstream criteria quality failures, not validator failures |
+| R1 success_criteria removed from TaskSpec | R1 is a transducer (arm), not a decision-maker. Deriving verifiable criteria requires knowing what tools can measure — that is R2's domain knowledge, not R1's. R1 carries intent faithfully; R2 operationalizes it into testable predicates |
+| R2 owns all criteria derivation — task-level and subtask-level | Task-level success_criteria (for R4b) now live in DispatchManifest, produced by R2. Subtask-level criteria live in SubTask as before. Accountability for criteria quality shifts from R1 to R2 |
 | R1 confirmed memory-blind (explicit) | R1 is a transducer (reference signal), not a decision-maker. Memory belongs to R2 (brain). Made explicit rather than implicit |
 
 ---
@@ -88,29 +89,30 @@ permitted — every message must be routable.
 
 ## R1 — Perceiver
 
-**Mission**: Translate raw user input into a structured, unambiguous task specification.
-If the downstream system acts on a wrong or underspecified goal, this role is
-accountable — not the Planner for planning poorly, not the Executor for executing the
-wrong thing.
+**Mission**: Faithfully translate raw user input into a structured intent specification.
+R1 is a transducer — it carries the user's signal into the system without interpretation
+or elaboration. If the system acts on a wrong or ambiguously specified intent, this role
+is accountable. It is not accountable for how success is measured — that belongs to R2.
 
-**Loop position**: Reference signal. The `TaskSpec` it produces is the target that all
-feedback loops are driving toward. Its quality is the ceiling for every correction the
-system can make.
+**Loop position**: Reference signal. The `TaskSpec` it produces is the raw target.
+R2 operationalizes it into measurable criteria. R1's quality is the ceiling for how
+accurately the system understands *what* the user wants; R2's quality is the ceiling
+for how correctly the system verifies *whether* it was achieved.
 
 **Skills**:
 - Parse natural language into structured intent
-- Identify ambiguities and ask clarifying questions (max 2 rounds; batch into one turn;
-  proceed on empty answer rather than looping)
-- Extract success criteria that are independently falsifiable from tool output alone —
-  each criterion must be checkable by an automated test reading only stdout, file
-  contents, or return values; vague criteria ("task completed correctly") are invalid
-- Identify scope constraints (file paths, time bounds, domains)
-- Produce a validated `TaskSpec` JSON
+- Identify ambiguities in *references* (which file? what time range? which account?)
+  and ask clarifying questions (max 2 rounds; batch into one turn; proceed on empty
+  answer rather than looping)
+- Identify scope constraints (file paths, time bounds, domains) as stated by the user
+- Produce a `TaskSpec` JSON that faithfully represents the user's stated goal
 
-**Success criteria quality rule** (enforced in R1 prompt):
-> Each criterion must specify a concrete, observable signal: what value, in what field,
-> satisfies it. A criterion that cannot be turned into a pass/fail check by reading tool
-> output is not a criterion — rewrite it until it is.
+**Does NOT**:
+- Derive success criteria — R1 does not know what the executor can measure; that is R2's job
+- Decompose the task into sub-tasks (R2)
+- Evaluate whether a result satisfies the user (R4b)
+- Access memory or prior task history (R5) — R1 is a transducer, not a decision-maker
+- Elaborate or intellectualize the user's goal — carry it faithfully, nothing more
 
 **Contract**:
 
@@ -122,22 +124,15 @@ system can make.
 
 ```json
 TaskSpec {
-  "task_id":          "string",          // short snake_case; assigned by R1
-  "intent":           "string",          // one sentence, action-oriented
-  "success_criteria": ["string"],        // independently falsifiable predicates
+  "task_id":    "string",   // short snake_case; assigned by R1
+  "intent":     "string",   // one sentence, action-oriented; user's words, not paraphrase
   "constraints": {
-    "scope":    "string | null",
+    "scope":    "string | null",   // as stated by user (path, domain, app name, etc.)
     "deadline": "ISO8601 | null"
   },
-  "raw_input": "string"
+  "raw_input":  "string"    // verbatim user input, unmodified
 }
 ```
-
-**Does NOT**:
-- Decompose the task into sub-tasks (R2)
-- Evaluate whether a result satisfies the user (R4b)
-- Access memory or prior task history (R5) — R1 is a transducer, not a decision-maker
-- Make any decision about how the task will be executed
 
 ---
 
@@ -154,10 +149,13 @@ correction.
 
 **Skills**:
 - Execute the memory calibration protocol before producing any plan (see below)
+- Derive task-level `success_criteria` from `TaskSpec.intent` — independently falsifiable
+  predicates that R4b can verify from tool output alone; R2 knows what the executor can
+  measure, R1 does not; criteria quality is R2's accountability
 - Decompose a `TaskSpec` into an ordered or parallel set of atomic `SubTask` objects,
   each self-contained, each with independently falsifiable success criteria derived from
-  the parent `TaskSpec`
-- Dispatch sub-tasks and send a `DispatchManifest` to R4b
+  the task-level criteria above
+- Dispatch sub-tasks and send a `DispatchManifest` (including task-level criteria) to R4b
 - Receive `ReplanRequest` and apply the constraints it implies — plan must differ from
   the recorded failed approach; cannot reissue an identical plan
 - Write episodic/procedural `MemoryEntry` objects to R5 (on task completion/failure)
@@ -213,16 +211,18 @@ SubTask {
   //             after parsing LLM output, before dispatch
   "parent_task_id":   "string",
   "intent":           "string",
-  "success_criteria": ["string"],  // independently falsifiable; derived from TaskSpec
+  "success_criteria": ["string"],  // independently falsifiable; derived from task_criteria below
   "context":          "string",
   "deadline":         "ISO8601 | null",
   "sequence":         "integer"    // same value = parallel; different = ordered dependency
 }
 
 DispatchManifest {
-  "task_id":      "string",
-  "subtask_ids":  ["string"],      // IDs assigned by runtime, sent after SubTask dispatch
-  "dispatched_at":"ISO8601"
+  "task_id":        "string",
+  "subtask_ids":    ["string"],      // IDs assigned by runtime, sent after SubTask dispatch
+  "task_criteria":  ["string"],      // task-level success criteria; derived by R2 from TaskSpec.intent
+                                     // R4b verifies merged result against these
+  "dispatched_at":  "ISO8601"
 }
 ```
 
@@ -233,6 +233,7 @@ DispatchManifest {
 - Treat memory entries as optional hints — memory calibration output is a constraint, not context
 - Compute the direction of correction — in MVP it does this itself as a known limitation; in steady state this belongs to GGS
 - Consolidate or reorganize memory (deferred — Dreamer)
+- Expect success_criteria from R1 — TaskSpec carries no criteria; R2 derives them from intent
 
 ---
 
@@ -416,9 +417,10 @@ pass/fail.
 - Receive `DispatchManifest` to know when all parallel outcomes have arrived
 - Apply the fan-in gate (code-enforced)
 - Invoke LLM to merge all `matched` outputs into a single coherent result
-- Verify merged result against `TaskSpec.success_criteria` (same per-criterion model as R4a)
+- Verify merged result against `DispatchManifest.task_criteria` (same per-criterion model as R4a;
+  criteria were derived by R2 and carried in the manifest — R4b does not re-derive them)
 - Compute `gap_trend` from correction history across subtasks
-- Emit `ReplanRequest` when gate fails or merged result fails TaskSpec verification
+- Emit `ReplanRequest` when gate fails or merged result fails task_criteria verification
 - Write `MemoryEntry` to R5 and deliver final result to user on acceptance
 
 **Contract**:
@@ -426,8 +428,8 @@ pass/fail.
 | Direction | Counterparty | Format |
 |---|---|---|
 | Receives | Agent-Validator (R4a) | `SubTaskOutcome` JSON (one per sub-task in manifest) |
-| Receives | Planner (R2) | `TaskSpec` JSON + `DispatchManifest` JSON |
-| Produces | Planner (R2) | `ReplanRequest` JSON (gate fail or TaskSpec verification fail) |
+| Receives | Planner (R2) | `DispatchManifest` JSON (carries task_criteria; R4b does not receive TaskSpec) |
+| Produces | Planner (R2) | `ReplanRequest` JSON (gate fail or task_criteria verification fail) |
 | Produces | Shared Memory (R5) | `MemoryEntry` JSON (on acceptance) |
 | Produces | User | Final merged result (text) |
 
@@ -559,7 +561,7 @@ User
       └───────────┴──►[R3 × N Executors]──►[R4a × N Agent-Validators]
                                               (per-criterion evaluation)
                                               ALL pass → matched
-                                              ANY fail → failed
+                                              ANY fail → failed (+ failure_class)
 ```
 
 ---
@@ -568,11 +570,12 @@ User
 
 | Failure | Accountable Role |
 |---|---|
-| System acts on wrong or underspecified goal | R1 Perceiver |
+| System acts on wrong or ambiguously specified intent | R1 Perceiver |
+| Success criteria wrong, vague, or not independently falsifiable | R2 Planner |
 | Goal not achieved despite correct execution; prior failure lessons not applied | R2 Planner |
 | Feasible sub-task not correctly executed | R3 Executor |
 | Gap between sub-task output and goal goes unresolved or unreported | R4a Agent-Validator |
-| Failed subtask accepted as success; merged result outside plausible range | R4b Meta-Validator |
+| Failed subtask accepted as success; merged result fails task_criteria | R4b Meta-Validator |
 | Data lost, corrupted, or wrongly retrieved | R5 Shared Memory |
 | Systematic failures go undetected and unreported to human operator | R6 Auditor |
 
@@ -583,6 +586,8 @@ User
 | Invariant | Enforced by |
 |---|---|
 | SubTask IDs are UUIDs assigned by Go runtime, never by LLM | Dispatcher |
+| TaskSpec carries no success_criteria — R2 derives all criteria from intent | R2 planner prompt |
+| task_criteria live in DispatchManifest; R4b reads them from there, not from TaskSpec | R4b code |
 | R4b LLM is not invoked when any SubTaskOutcome.status == "failed" | R4b code gate |
 | R4a verdict is aggregation of per-criterion booleans; one false = failed | R4a scoring loop |
 | R4a criterion verdict includes failure_class (logical \| environmental) | R4a LLM output schema |
