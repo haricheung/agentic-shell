@@ -1067,3 +1067,87 @@ before storing it, so both forms of the env var work:
 ```go
 base = strings.TrimSuffix(base, "/chat/completions")
 ```
+
+---
+
+## Issue #36 — Left-arrow cursor movement broken in REPL input
+
+**Symptom**
+Pressing the left arrow key while editing a REPL input line moved the terminal
+cursor to the wrong column. The cursor appeared stuck or jumped incorrectly,
+especially noticeable when editing CJK text.
+
+**Root cause**
+`chzyer/readline` measures prompt width by counting raw bytes, not visual
+characters. The prompt `"\033[36m❯\033[0m "` contains ANSI escape sequences
+that are invisible (zero visual width) but 5–7 bytes long. readline counted
+those bytes as columns, so its cursor offset was wrong by ~12 columns and
+left-arrow movement landed in the wrong position.
+
+**Fix**
+Wrap every ANSI escape sequence in the prompt with `\x01` (start of
+non-printing region) and `\x02` (end), which is readline's standard marker
+for zero-width spans (equivalent to `\[`/`\]` in bash PS1):
+```
+before: "\033[36m❯\033[0m "
+after:  "\x01\033[36m\x02❯\x01\033[0m\x02 "
+```
+
+---
+
+## Issue #37 — R4b check logic had no criteria to evaluate against
+
+**Symptom**
+R4b (Meta-Validator) frequently accepted tasks where subtasks had actually
+failed important criteria, or replanned unnecessarily. Its `verdict=accept`
+was unreliable.
+
+**Root cause — structural data gap**
+`SubTaskOutcome` carried only `status`/`output`/`gap_trajectory` — no
+`success_criteria`. R4b's system prompt said "check every success criterion
+in the TaskSpec", but `TaskSpec` has no criteria (R1 is a pure transducer;
+R2 owns criteria derivation). R4b was making verdicts with no criteria at
+all — guessing from intent text alone.
+
+**Fix**
+1. Added `Intent string` and `SuccessCriteria []string` to `SubTaskOutcome`
+   (types.go) so criteria travel with the outcome to R4b.
+2. R4a populates both fields in every outcome it produces (extracted
+   `outcome()`/`publish()` helpers to eliminate 6 duplicated struct
+   literals).
+3. R4b system prompt updated: check `success_criteria` in each
+   `SubTaskOutcome`, not "criteria in TaskSpec".
+4. R4b user prompt labels make the criteria-per-outcome structure explicit.
+5. R4b `evaluate()` logs each outcome's criteria before calling the LLM
+   for full auditability.
+
+**Still unresolved / related**
+- Issue #28 (R4b accepts 1-matched + 1-failed): the new criteria-per-outcome
+  structure gives R4b the data to catch this, but the prompt still says
+  "failed subtasks are acceptable if the overall goal is met". This wording
+  should be tightened to require all criteria to be positively demonstrated.
+
+---
+
+## Issue #38 — success_criteria were intent echoes, not assertions
+
+**Symptom**
+R2 generated `success_criteria` that restated the intent as a question:
+`"今天是星期几"` ("what day is today") instead of a verifiable assertion:
+`"output explicitly states which day of the week today is"`. R4a could not
+meaningfully score these — any output trivially satisfied an intent echo.
+
+**Root cause**
+The schema placeholder `"<verifiable from tool output>"` was too vague.
+The LLM interpreted "verifiable" as "something related to the goal" rather
+than "a falsifiable assertion checkable from raw tool output alone".
+
+**Fix**
+Added explicit "Success criteria rules" block to the R2 system prompt with
+bad/good examples covering the three failure modes:
+- Intent echo (bad: question form; good: assertion form with expected value)
+- Missing concrete value (bad: "check PM2.5"; good: "output contains a
+  numeric PM2.5 value")
+- Not falsifiable without context
+Updated the JSON schema placeholder to `"<assertion checkable against tool
+output>"`.
