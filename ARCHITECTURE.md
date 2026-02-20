@@ -121,13 +121,41 @@ Formally, this is the controller in a closed-loop control system. Its inputs are
 
 ### Effector Agent
 
-Each effector executes one atomic sub-task. It is intentionally narrow — it has no view of sibling agents or the global task state. Contains:
+Each effector executes one atomic sub-task. It is intentionally narrow — it has no view
+of sibling agents or the global task state.
 
-**Executor** — executes the sub-task using available tools. Its only obligation is to produce a result and report its status honestly, including infeasibility.
+**Effector Agents are ephemeral by design.** A new instance is spawned per sub-task and
+terminates when the sub-task completes. There is no persistent "same agent" across tasks;
+two Executor instances are interchangeable workers with no shared identity. This has a
+direct consequence for memory: private per-agent memory is meaningless for ephemeral
+agents — there is no continuity of identity to accumulate knowledge into. All long-term
+learning is centralized in Shared Memory, organized by the Metaagent.
 
-**Agent-Validator** — closes the gap between the Executor's output and the sub-task goal. The retry loop is entirely internal: the metaagent sees neither raw execution results nor retry counts. The agent speaks upward only when the gap is closed (matched outcome) or irresolvable (failure outcome). This keeps the metaagent's coordination bandwidth focused on goal-level decisions, not execution-level noise.
+Effector Agents do not query Shared Memory directly. Their access to prior experience is
+**indirect**: R2 reads and calibrates memory at planning time, then injects the relevant
+context into each `SubTask.context` field before dispatch. The Executor receives
+history-informed instructions without ever touching the memory store itself. A direct
+memory query by an Executor would bypass R2's calibration gate, create an unobservable
+information path (the Auditor cannot see it), and duplicate calibration logic that belongs
+to R2.
 
-**Dreamer (agent-level)** — runs after sub-task completion. Consolidates episodic memory from this execution: what was tried, what worked, what failed. Feeds into Shared Memory as raw material for the metaagent Dreamer's semantic consolidation.
+Contains:
+
+**Executor** — executes the sub-task using available tools. Its only obligation is to
+produce a result and report its status honestly, including infeasibility.
+
+**Agent-Validator** — closes the gap between the Executor's output and the sub-task goal.
+The retry loop is entirely internal: the metaagent sees neither raw execution results nor
+retry counts. The agent speaks upward only when the gap is closed (matched outcome) or
+irresolvable (failure outcome). This keeps the metaagent's coordination bandwidth focused
+on goal-level decisions, not execution-level noise.
+
+**Dreamer (agent-level)** — a *teardown step*, not a persistent process. Runs once,
+immediately before the Effector Agent terminates. Writes one episodic `MemoryEntry` to
+Shared Memory capturing what was tried, what worked, and what failed in this execution.
+This is the Effector's sole contribution to Shared Memory — it writes on exit, then the
+agent instance is gone. The Metaagent Dreamer later consolidates these raw episodic
+entries into semantic knowledge asynchronously, between tasks.
 
 ### Auditor
 
@@ -149,12 +177,27 @@ This is a first-class architectural constraint, not an infrastructure detail. It
 
 ### Shared Memory
 
-A single persistent store accessible to all components. It is the substrate that makes the framework learn across tasks, not just within them. Two classes of memory coexist:
+A single persistent store. All agents benefit from shared history; no agent holds private
+persistent memory. Two classes of memory coexist:
 
-- **Episodic** — written by agent Dreamers after each sub-task: what happened, verbatim
-- **Semantic** — written by the metaagent Dreamer after consolidation: patterns and generalizations extracted from episodic records
+- **Episodic** — written by agent-level Dreamers on Effector exit: what happened, verbatim
+- **Semantic** — written by the metaagent Dreamer asynchronously: patterns and
+  generalizations consolidated from episodic records across tasks
 
-The Planner reads from Shared Memory before decomposing a new task, allowing prior experience to inform current planning.
+**Access pattern by agent class**:
+
+| Agent | Access | Mechanism |
+|---|---|---|
+| Metaagent (R2 Planner) | Direct read + calibration | Queries R5 at planning time; applies calibration protocol; derives MUST NOT / SHOULD PREFER constraints |
+| Metaagent (R4b Meta-Validator) | Direct write | Writes `MemoryEntry` after task acceptance or failure |
+| Metaagent Dreamer | Direct read + write | Consolidates episodic → semantic asynchronously between tasks |
+| Effector Agent (R3 Executor, R4a Agent-Validator) | **Indirect only** | Receives memory-informed context via `SubTask.context`; never queries R5 directly |
+| Effector Dreamer | Direct write (exit only) | Writes one episodic entry on teardown; then agent terminates |
+
+The Metaagent is the sole authority on what history means. Effector Agents benefit from
+memory through the context R2 injects — they never interpret memory themselves. This
+keeps calibration logic in one place, all memory access observable through the bus, and
+eliminates the reconciliation problem that private per-agent memories would create.
 
 ---
 
@@ -235,7 +278,18 @@ There is no separate retry policy, timeout manager, or error handler. The Agent-
 
 ### Centralized Shared Memory
 
-One persistent store rather than per-agent private memories. Private memories would make cross-agent learning impossible — the metaagent Dreamer could not consolidate across agents, and the Goal Gradient Solver could not retrieve relevant prior plans. The shared store is what gives the framework memory that compounds across tasks.
+One persistent store rather than per-agent private memories. The design choice follows
+directly from the ephemerality of Effector Agents: a private memory for an agent that
+is spawned fresh per sub-task and terminated on completion is meaningless — there is no
+persistent identity to accumulate knowledge into. Even if you persisted per-agent-type
+memory (all Executors share one private store), you have reinvented a filtered view of
+shared memory with worse calibration and no Dreamer to organize it.
+
+Centralized memory also prevents the O(n²) reconciliation problem: if N agents hold
+private memories that can diverge, aligning them requires N² comparisons and an
+arbitration mechanism. One shared store with one Dreamer for reorganization avoids this
+entirely. All learning compounds in one place; the Metaagent is the sole authority on
+what it means.
 
 ### Independent Auditor with Separate Principal
 

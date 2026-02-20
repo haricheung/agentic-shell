@@ -19,6 +19,7 @@
 | R1 success_criteria removed from TaskSpec | R1 is a transducer (arm), not a decision-maker. Deriving verifiable criteria requires knowing what tools can measure — that is R2's domain knowledge, not R1's. R1 carries intent faithfully; R2 operationalizes it into testable predicates |
 | R2 owns all criteria derivation — task-level and subtask-level | Task-level success_criteria (for R4b) now live in DispatchManifest, produced by R2. Subtask-level criteria live in SubTask as before. Accountability for criteria quality shifts from R1 to R2 |
 | R1 confirmed memory-blind (explicit) | R1 is a transducer (reference signal), not a decision-maker. Memory belongs to R2 (brain). Made explicit rather than implicit |
+| Effector Agents confirmed memory-blind (direct access) | Effector Agents are ephemeral — spawned per sub-task, terminated on completion. No persistent identity means no private memory. They receive history-informed context via SubTask.context (injected by R2); direct R5 queries are prohibited. R3 and R4a Does NOT updated accordingly |
 
 ---
 
@@ -284,7 +285,10 @@ ExecutionResult {
 - Decide to retry itself — the Agent-Validator owns retry and correction
 - Communicate with other Executors or with R2 directly
 - Report results to anyone other than R4a
-- Write to Shared Memory
+- Query Shared Memory (R5) directly — receives history-informed context via
+  `SubTask.context`, injected by R2 at planning time; direct memory access would
+  bypass R2's calibration gate and create an unobservable information path
+- Write to Shared Memory — that is the Effector Dreamer's exit-time job (v0.7)
 
 ---
 
@@ -503,20 +507,24 @@ from a query result, this role is accountable.
 - Store `MemoryEntry` objects (episodic and procedural) keyed by entry ID
 - Retrieve entries by task ID, tags, or keyword query against serialised content
 - Return results ranked by recency and relevance
-- Enforce write permission: only R4b may write
+- Enforce access control: only Metaagent roles (R2, R4b, Dreamer) may query or write
+  directly; Effector Agents (R3, R4a) have no direct access
 
 **Contract**:
 
 | Direction | Counterparty | Format |
 |---|---|---|
-| Receives (write) | Meta-Validator (R4b) | `MemoryEntry` JSON |
+| Receives (write) | Meta-Validator (R4b) | `MemoryEntry` JSON (MVP); Effector Dreamer on agent exit (v0.7) |
 | Receives (read) | Planner (R2) | Query (intent string + key terms) |
 | Produces | Planner (R2) | `MemoryEntry[]` ranked by relevance |
 
 **Does NOT**:
 - Reorganize, summarize, or cross-link entries (deferred — Dreamer)
 - Evaluate or judge content quality
-- Accept writes from R1, R2, R3, R4a, or R6
+- Accept direct reads or writes from Effector Agents (R3, R4a) — they access memory
+  indirectly through context injected by R2 into SubTask; direct access would bypass
+  R2's calibration gate and create unobservable information paths
+- Accept writes from R1 or R6
 
 ---
 
