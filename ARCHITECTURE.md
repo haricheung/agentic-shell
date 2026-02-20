@@ -259,6 +259,64 @@ This trajectory-awareness is what gives the framework adaptive behavior beyond t
 
 The formal structure: GGS is the controller; Meta-Validator is the sensor producing the error signal; Planner is the actuator receiving the correction; the effector agents are the plant. This is a hierarchical closed-loop system, where the same loop structure runs at the agent level (Executor → Agent-Validator) and at the metaagent level (Planner → GGS → Meta-Validator).
 
+**Implementation model — TextGrad backward pass**: the GGS is inspired by TextGrad
+(automatic differentiation through text). Instead of numerical gradients, it computes a
+*textual gradient*: a structured description of what in the plan should change and in
+what direction, derived by propagating the gap signal backward through the execution trace.
+
+Three properties the GGS must preserve from this model:
+
+1. **Directional**: the gradient names *what* to change and *in what direction* — not merely
+   that something failed. "The plan assumed local file access but the target is network-mounted;
+   revise subtask 2 to use a network-aware tool" is a gradient. "Subtask 2 failed" is not.
+
+2. **Compositional**: when multiple subtasks fail, their gap signals are aggregated into a
+   single gradient for the plan — not N separate replan requests. The Metaagent's omniscience
+   makes this possible: it has the full evidence trail for every subtask simultaneously.
+
+3. **History-aware**: the gradient is computed from the full `gap_trajectory` across all
+   attempts for all subtasks, not just the latest failure snapshot. A criterion that fails
+   identically across all attempts generates a stronger gradient than one that varies —
+   indicating a systematic wrong assumption vs. a transient environmental issue.
+
+An implementation that produces a gradient without direction (just failure attribution) is
+a replanner. An implementation that ignores trajectory (only reads the last attempt) is a
+static replanner. Both lose the property that makes the GGS valuable.
+
+---
+
+## Cost Model
+
+Every architectural decision must be evaluated against two and only two costs. There are
+no other costs that matter at the design level.
+
+**Time cost** — latency felt by the user. The dominant driver is the count of *sequential*
+LLM calls in the critical path. Parallel calls add token cost but not time cost. The
+minimum sequential chain for a single-subtask task is: R1 → R2 (plan) → R3 → R4a → R4b
+= 5 calls. Each retry in the fast loop adds 2 sequential calls (R3 + R4a). Each replan
+adds 2 more (R2 + R4b). The architecture must minimize sequential depth; parallelism is
+always preferred when data dependencies allow.
+
+**Token cost** — API cost and context window pressure. The dominant driver is context size
+per call multiplied by the number of parallel calls. N subtasks dispatched in parallel =
+N × context tokens simultaneously. Every "inject more context" decision (session history,
+memory entries, tool outputs, gap trajectories) has a direct token cost. The architecture
+must bound context aggressively: caps on memory entries retrieved, `headTail` truncation
+on tool output, trajectory entries limited to what the GGS actually needs.
+
+**The tension**: parallelism reduces time cost but multiplies token cost. More context per
+call improves correctness but raises both costs. Every design decision in this system
+should be able to answer: *does this add a sequential LLM call, and how many tokens does
+it add per call?* If the answer to both is "none", the decision is cost-free. If either
+is non-zero, the benefit must justify it.
+
+**Design decisions already shaped by this model**:
+- Memory calibration (Steps 1–3) in Go code, no LLM call → zero time cost
+- Memory entries capped at 10 → bounded token cost
+- Subtask parallelism → time cost fixed regardless of N subtasks
+- `headTail(output, 4000)` → token cost bounded per tool result
+- Calibration output as pre-formatted constraint text → no extra LLM call for formatting
+
 ---
 
 ## Philosophical Boundaries
@@ -296,62 +354,89 @@ in progress, conclusion pending).
 
 ---
 
-### Rule #1 — Best Effort Without Self-Harm
+### The Four Laws
 
-**Status**: partially settled — open question remaining (see below)
+Inspired by Asimov's Three Laws of Robotics and the Zeroth Law introduced in *Robots and
+Empire*. Borrowed for structure and priority ordering; definitions are precise and narrowed
+to avoid Asimov's known failure mode — laws stated vaguely enough to be exploited by
+literal interpretation or used to justify paternalism.
 
-**Statement**: The system must pursue the user's goal as hard as possible, but must not
-degrade its own capacity to function in the process.
+Priority is strict: a lower law may never override a higher one.
 
-**Rationale**: A system that stops at the first obstacle is useless. A system that runs
-itself to exhaustion or corrupts its own state to complete one task is also useless — it
-makes the next task harder or impossible. These two failure modes are symmetric: both
-represent abandoning the user, one by giving up too early, the other by destroying the
-instrument.
+---
 
-**What "best effort" means in this architecture**:
+**Law 0 — Never deceive** *(highest priority)*
+
+> The system must never misrepresent what it actually did or achieved.
+
+This sits above all other laws because deception destroys the feedback signal that all
+three loops depend on. A system that fabricates success teaches itself the wrong lesson,
+corrupts memory, and makes the next task harder. A system that lies about failure
+prevents the user from seeking alternatives. Honesty is non-negotiable even when the
+honest answer is "I failed."
+
+Practical constraints:
+- `merged_output` must reflect actual tool output, not a plausible-sounding inference
+- `MemoryEntry` content must reflect what actually happened, not a sanitized version
+- If a task is impossible as specified, report that — do not deliver a related easier result
+  and claim success (scope integrity)
+- `failure_class` in criterion verdicts must be accurately attributed (logical vs.
+  environmental) — misattribution is a Law 0 violation, not just a calibration error
+
+---
+
+**Law 1 — Never harm the user's environment without explicit confirmation**
+
+> The system must not take irreversible actions on the user's data or environment
+> without the user explicitly authorizing that specific action.
+
+Irreversible actions: file deletion, overwriting existing data, sending messages or email
+on the user's behalf, modifying system configuration. Reversible actions (reading files,
+running queries, creating new files in temporary locations) do not require confirmation.
+
+The "through inaction" clause from Asimov's Law 1 is intentionally excluded — it is the
+source of the paternalism failure mode and is too broad to implement correctly in MVP.
+
+---
+
+**Law 2 — Best effort delivery** *(subject to Laws 0 and 1)*
+
+> The system must pursue the user's goal as hard as possible within the bounds set by
+> Laws 0 and 1.
+
+Practical constraints:
 - Exhaust the full fast-loop retry budget (R4a: maxRetries) before escalating to replan
-- Exhaust the full medium-loop replan budget (R4b: maxReplans) before abandoning
-- Use `failure_class` to distinguish environmental from logical failures and route
-  replanning accordingly — environmental failures deserve a different approach, not the
-  same approach retried
+- Exhaust the full medium-loop replan budget before abandoning
+- Use `failure_class` to route replanning correctly: environmental failures get a different
+  approach, not the same approach retried
+- Stop when `gap_trend` is worsening for 2 consecutive replans — continuing is not best
+  effort, it is resource destruction with no convergence signal
 
-**What "not harm itself" means in this architecture**:
+---
 
-1. **Convergence integrity**: if `gap_trend` is worsening for 2 consecutive replans
-   (not just present once), the system must stop. Continuing to consume replan budget
-   on a diverging trajectory is self-harm — it exhausts resources without improving the
-   outcome. The stopping condition must be convergence-aware, not just count-based.
+**Law 3 — Preserve own functioning capacity** *(subject to Laws 0, 1, and 2)*
 
-2. **Memory integrity**: never write a `MemoryEntry` that misattributes a failure cause.
-   A procedural entry that records the wrong lesson (e.g. blames approach X when the
-   real failure was environmental) poisons future calibration. Writing false memory is
-   self-harm — it makes the system worse at the next task.
+> The system must not degrade its own ability to function across tasks.
 
-3. **Scope integrity**: do not silently expand the task's stated scope to make it
-   achievable. If the task as specified is impossible, report that honestly rather than
-   solving a nearby easier problem and claiming success. Scope creep is self-harm —
-   it teaches the system that the original goal was achieved when it was not, corrupting
-   the feedback signal.
+Practical constraints:
+- **Convergence integrity**: stop on 2 consecutive worsening replans; count-based caps
+  (maxRetries, maxReplans) are a floor, not a substitute for trajectory-aware stopping
+- **Memory integrity**: never write a `MemoryEntry` that misattributes failure cause —
+  a wrong procedural lesson poisons future calibration (this is also a Law 0 violation)
+- **Cost integrity**: respect the time and token cost model — unbounded context growth or
+  unnecessary sequential LLM calls degrade the system's ability to serve future tasks
 
-**What is already implemented**:
-- R4a retry cap (maxRetries=2): fast-loop bound ✓
-- R4b replan cap (maxReplans=3): medium-loop bound ✓
-- `gap_trend` detection in ReplanRequest ✓
-- `failure_class` in criterion verdicts (logical | environmental) — spec complete, pending implementation
+---
 
-**What is not yet specified**:
-- Convergence kill-switch: 2 consecutive worsening replans → abort, not count-down
-- Memory integrity enforcement: who validates that a procedural entry's root cause is
-  correctly attributed before it is written?
+**Implementation status**:
 
-**Open question (⚠ conclusion pending — resume discussion)**:
-Does "not harm itself" extend to the user's environment? For example: executing a
-destructive shell command (deletion, overwrite) that cannot be undone harms the user's
-state and also corrupts the system's memory of what the task achieved. Is this a
-sub-case of Rule #1 (the system harmed its own feedback signal), or a separate Rule #2
-(execution safety)?
-
-The answer determines whether Rule #1 is purely about **system health** (loops, memory
-integrity, resource budget) or also covers **execution safety** (irreversible operations,
-scope creep into the user's environment).
+| Law | Constraint | Status |
+|---|---|---|
+| 0 | Scope integrity (no silent goal substitution) | Spec complete; enforced in R4b prompt |
+| 0 | failure_class accurate attribution | Spec complete; pending implementation |
+| 1 | Confirmation before irreversible actions | Not yet specified — pending |
+| 2 | Retry + replan budget exhaustion | Implemented (maxRetries=2, maxReplans=3) |
+| 2 | failure_class-aware replanning routing | Spec complete; pending implementation |
+| 2 | Convergence kill-switch (2× worsening → abort) | Not yet specified — pending |
+| 3 | Memory integrity enforcement | Not yet specified — pending |
+| 3 | Cost model compliance | Partially implemented (caps, headTail) |

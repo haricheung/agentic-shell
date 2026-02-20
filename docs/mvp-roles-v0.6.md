@@ -13,6 +13,7 @@
 | R2 — calibration step is code-side only (keyword match + recency); no LLM call | Separate LLM call for calibration would add 1-2 s latency per task. The Dreamer (v0.7) pre-organizes semantic memory so calibration degrades to a near-zero read; in v0.6 calibration is bounded by capping entries at 10 and doing filtering in Go code, not in the LLM |
 | R4a — holistic scoring replaced with per-criterion independent evaluation | v0.5 asked LLM to "score the result overall"; LLM accepted plausible-sounding outputs even when specific criteria were unmet. Each criterion must produce a binary verdict independently |
 | R4a — criterion verdicts now include failure_class (logical \| environmental) | Hard per-criterion evaluation is correct but the error signal was too coarse. Environmental failures (network, permissions, not found) need a different controller response than logical failures (wrong answer). Enriching the signal enables targeted replanning without weakening the gate |
+| R4a — two-mode validation: verifiable (binary) and plausible (evidence-weighted) | Some criteria have no mechanical oracle (summary quality, explanation clarity). Applying hard binary pass/fail to judgment criteria is too brittle. R2 tags each criterion with its mode at planning time; R4a applies Wei's asymmetry for verifiable and Pólya's plausible reasoning for plausible. gap_trajectory is the Pólya accumulation mechanism |
 | R4b — LLM gate: hard-fail on any failed subtask enforced in code before LLM | v0.5 let the LLM merge all outcomes together and reason holistically; it accepted 1-matched + 1-failed as success. LLM is now only invoked when all subtasks passed |
 | SubTask IDs removed from planner LLM output; assigned by runtime | Planner LLM fabricated fake sequential UUIDs (top ID reused 270 times), breaking all dispatcher routing guarantees. IDs are now assigned by Go after parsing |
 | R1 success_criteria removed from TaskSpec | R1 is a transducer (arm), not a decision-maker. Deriving verifiable criteria requires knowing what tools can measure — that is R2's domain knowledge, not R1's. R1 carries intent faithfully; R2 operationalizes it into testable predicates |
@@ -149,12 +150,15 @@ correction.
 
 **Skills**:
 - Execute the memory calibration protocol before producing any plan (see below)
-- Derive task-level `success_criteria` from `TaskSpec.intent` — independently falsifiable
-  predicates that R4b can verify from tool output alone; R2 knows what the executor can
-  measure, R1 does not; criteria quality is R2's accountability
+- Derive task-level `success_criteria` from `TaskSpec.intent` — R2 knows what the
+  executor can measure, R1 does not; criteria quality is R2's accountability
+- **Tag each criterion with a validation mode** (see Two-Mode Validation below):
+  - `verifiable`: binary, checkable mechanically from tool output — exploit Wei's
+    asymmetry; R4a applies hard pass/fail
+  - `plausible`: judgment-dependent, no mechanical oracle — R4a applies Pólya's
+    plausible reasoning; the gap_trajectory accumulates evidence across attempts
 - Decompose a `TaskSpec` into an ordered or parallel set of atomic `SubTask` objects,
-  each self-contained, each with independently falsifiable success criteria derived from
-  the task-level criteria above
+  each self-contained, each with criteria tagged with the same validation modes
 - Dispatch sub-tasks and send a `DispatchManifest` (including task-level criteria) to R4b
 - Receive `ReplanRequest` and apply the constraints it implies — plan must differ from
   the recorded failed approach; cannot reissue an identical plan
@@ -211,7 +215,9 @@ SubTask {
   //             after parsing LLM output, before dispatch
   "parent_task_id":   "string",
   "intent":           "string",
-  "success_criteria": ["string"],  // independently falsifiable; derived from task_criteria below
+  "success_criteria": [             // derived from task_criteria below; each tagged with mode
+    { "criterion": "string", "mode": "verifiable | plausible" }
+  ],
   "context":          "string",
   "deadline":         "ISO8601 | null",
   "sequence":         "integer"    // same value = parallel; different = ordered dependency
@@ -220,8 +226,9 @@ SubTask {
 DispatchManifest {
   "task_id":        "string",
   "subtask_ids":    ["string"],      // IDs assigned by runtime, sent after SubTask dispatch
-  "task_criteria":  ["string"],      // task-level success criteria; derived by R2 from TaskSpec.intent
-                                     // R4b verifies merged result against these
+  "task_criteria":  [                // task-level criteria; derived by R2 from TaskSpec.intent
+    { "criterion": "string", "mode": "verifiable | plausible" }
+  ],                                 // R4b verifies merged result against these
   "dispatched_at":  "ISO8601"
 }
 ```
@@ -291,10 +298,29 @@ accountable.
 between execution output and sub-task criteria. As controller: computes a directed
 `CorrectionSignal` targeting the specific failed criterion.
 
+### Two-Mode Validation
+
+Inspired by Jason Wei's *Asymmetry of Validation* (checking is cheaper than generating)
+and Pólya's plausible reasoning (evidence accumulates toward a probability, not a proof).
+
+The mode for each criterion is **set by R2 at planning time**, not decided by R4a at
+evaluation time. R2 knows what the executor can mechanically verify; R4a does not.
+
+| Mode | When to use | R4a behaviour |
+|---|---|---|
+| `verifiable` | Criterion is mechanically checkable from tool output alone: file exists, value matches, command exit code, count equals N | Hard binary pass/fail; exploit Wei's asymmetry — checking is cheap, apply it strictly |
+| `plausible` | Criterion requires judgment: summary covers main topics, explanation is clear, output is reasonable | Accumulate evidence across attempts via `gap_trajectory`; a criterion that fails consistently is a strong signal; one that fluctuates is weak; no single-attempt hard fail |
+
+For `plausible` criteria, the `gap_trajectory` IS the Pólya mechanism: sequential
+binary snapshots across attempts convert into a plausibility trend that the GGS reads.
+R4a's job is to supply accurate per-attempt evidence — not to make a probabilistic
+judgment itself. The trajectory does that over time.
+
 ### Validation Model (per-criterion, not holistic)
 
-R4a must evaluate each `success_criterion` in the `SubTask` **independently**. Holistic
-reasoning about the overall result is not permitted during the evaluation phase.
+R4a must evaluate each `success_criterion` in the `SubTask` **independently**, applying
+the validation mode tagged by R2. Holistic reasoning about the overall result is not
+permitted during the evaluation phase.
 
 For each criterion:
 1. Examine `tool_calls` evidence and `output` for that specific criterion only
@@ -357,6 +383,7 @@ SubTaskOutcome {
   "criteria_verdicts": [
     {
       "criterion":     "string",
+      "mode":          "verifiable | plausible",          // set by R2; R4a does not change it
       "verdict":       "pass | fail",
       "failure_class": "logical | environmental | null",  // null when verdict == pass
       "evidence":      "string"
