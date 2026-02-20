@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +14,8 @@ import (
 	"github.com/haricheung/agentic-shell/internal/llm"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
+
+const maxMemoryEntries = 10
 
 const systemPrompt = `You are R2 — Planner. Decompose a TaskSpec into the minimum necessary SubTask objects.
 
@@ -30,6 +34,10 @@ Sequence rules (critical):
 Context field rules:
 - Always populate context with everything the executor needs beyond the intent: known file paths, format requirements, constraints, relevant memory.
 - For sequence N+1 subtasks, you do NOT need to repeat how to find a file already located in sequence N — the dispatcher will inject prior outputs.
+
+Memory constraint rules (when a MEMORY CONSTRAINTS block is present):
+- Every "MUST NOT" line records an approach that failed before for a similar task. You MUST NOT use that approach regardless of how promising it seems.
+- Every "SHOULD PREFER" line records an approach that worked before. Prefer it over untested alternatives.
 
 Output ONLY a JSON array (no wrapper, no markdown, no prose):
 [
@@ -54,11 +62,12 @@ ReplanRequest:
 Original TaskSpec:
 %s
 
-Prior memory entries (if any):
+Memory Constraints (code-derived — MUST NOT constraints are mandatory):
 %s
 
 Rules:
 - Do NOT repeat the same approach that already failed (gap_summary and failed_subtasks describe what went wrong).
+- You MUST respect every MUST NOT constraint above — these record approaches that failed on prior tasks.
 - Apply the same sequence, context, and decomposition rules as the initial plan.
 - Output ONLY a JSON array of SubTask objects as specified in your system prompt.`
 
@@ -163,19 +172,125 @@ func (p *Planner) Run(ctx context.Context) {
 
 func (p *Planner) plan(ctx context.Context, spec types.TaskSpec, memory []types.MemoryEntry) error {
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
-	memJSON, _ := json.MarshalIndent(memory, "", "  ")
+	constraints := calibrate(memory, spec.Intent)
 
-	userPrompt := fmt.Sprintf("TaskSpec:\n%s\n\nPrior memory entries:\n%s", specJSON, memJSON)
+	var userPrompt string
+	if constraints != "" {
+		log.Printf("[R2] calibration: injecting constraints from %d memory entries", len(memory))
+		userPrompt = fmt.Sprintf(
+			"TaskSpec:\n%s\n\n--- MEMORY CONSTRAINTS (code-derived) ---\n%s--- END CONSTRAINTS ---",
+			specJSON, constraints)
+	} else {
+		log.Printf("[R2] calibration: no relevant memory entries")
+		userPrompt = fmt.Sprintf("TaskSpec:\n%s", specJSON)
+	}
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt)
 }
 
 func (p *Planner) replan(ctx context.Context, spec types.TaskSpec, rr types.ReplanRequest, memory []types.MemoryEntry) error {
 	rrJSON, _ := json.MarshalIndent(rr, "", "  ")
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
-	memJSON, _ := json.MarshalIndent(memory, "", "  ")
-
-	userPrompt := fmt.Sprintf(replanPrompt, rrJSON, specJSON, memJSON)
+	constraints := calibrate(memory, spec.Intent)
+	if constraints == "" {
+		constraints = "(none)"
+	}
+	userPrompt := fmt.Sprintf(replanPrompt, rrJSON, specJSON, constraints)
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt)
+}
+
+// calibrate implements Steps 1–3 of the Memory Calibration Protocol.
+// Step 1 — Retrieve: caller provides entries already fetched from R5 (no LLM call).
+// Step 2 — Calibrate: sort by recency (newest first), cap at maxMemoryEntries,
+//
+//	keyword-filter against current intent (discard zero-overlap entries).
+//
+// Step 3 — Constrain: derive MUST NOT (procedural) and SHOULD PREFER (episodic) lines.
+// Returns an empty string when no relevant entries exist.
+func calibrate(entries []types.MemoryEntry, intent string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+
+	// Step 2 — sort newest first (ISO8601 timestamps sort lexicographically)
+	sorted := make([]types.MemoryEntry, len(entries))
+	copy(sorted, entries)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Timestamp > sorted[j].Timestamp
+	})
+	if len(sorted) > maxMemoryEntries {
+		sorted = sorted[:maxMemoryEntries]
+	}
+
+	// Step 2 — keyword filter: keep entries with any keyword overlap against intent
+	intentKW := memTokenize(intent)
+	var relevant []types.MemoryEntry
+	for _, e := range sorted {
+		raw, _ := json.Marshal(e)
+		haystack := strings.ToLower(string(raw))
+		for _, kw := range intentKW {
+			if strings.Contains(haystack, kw) {
+				relevant = append(relevant, e)
+				break
+			}
+		}
+	}
+	if len(relevant) == 0 {
+		return ""
+	}
+
+	// Step 3 — derive constraint lines
+	var mustNots, shouldPrefers []string
+	for _, e := range relevant {
+		line := "  - " + entrySummary(e)
+		switch e.Type {
+		case "procedural":
+			mustNots = append(mustNots, line)
+		case "episodic":
+			shouldPrefers = append(shouldPrefers, line)
+		}
+	}
+
+	var sb strings.Builder
+	if len(mustNots) > 0 {
+		sb.WriteString("MUST NOT (prior failures — do not repeat these approaches):\n")
+		for _, c := range mustNots {
+			sb.WriteString(c + "\n")
+		}
+	}
+	if len(shouldPrefers) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("SHOULD PREFER (prior successes — these approaches worked):\n")
+		for _, c := range shouldPrefers {
+			sb.WriteString(c + "\n")
+		}
+	}
+	return sb.String()
+}
+
+// entrySummary produces a short readable description of a memory entry for constraint text.
+func entrySummary(e types.MemoryEntry) string {
+	raw, _ := json.Marshal(e.Content)
+	s := string(raw)
+	if len(s) > 180 {
+		s = s[:180] + "…"
+	}
+	if len(e.Tags) > 0 {
+		return fmt.Sprintf("[tags: %s] %s", strings.Join(e.Tags, ", "), s)
+	}
+	return s
+}
+
+// memTokenize splits s into lowercase keywords of length >= 3.
+func memTokenize(s string) []string {
+	var words []string
+	for _, w := range strings.Fields(strings.ToLower(s)) {
+		if len(w) >= 3 {
+			words = append(words, w)
+		}
+	}
+	return words
 }
 
 func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string) error {
