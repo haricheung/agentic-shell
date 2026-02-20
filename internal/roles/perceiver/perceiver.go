@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,28 +49,23 @@ func New(b *bus.Bus, llmClient *llm.Client, clarifyFn func(string) (string, erro
 	return &Perceiver{llm: llmClient, b: b, clarify: clarifyFn}
 }
 
+// maxClarificationRounds caps how many times R1 may ask the user a clarifying question
+// before giving up and proceeding with its best interpretation.
+const maxClarificationRounds = 2
+
 // Process takes raw user input, possibly asks a clarifying question, and publishes a TaskSpec.
 // It returns the task ID so the caller can correlate the eventual FinalResult.
 // sessionContext is a summary of recent REPL history; pass "" for one-shot mode.
 func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string) (string, error) {
 	input := rawInput
-	for {
+	for round := 0; round < maxClarificationRounds; round++ {
 		spec, needsClarification, question, err := p.perceive(ctx, input, sessionContext)
 		if err != nil {
 			return "", fmt.Errorf("perceiver: %w", err)
 		}
 
 		if !needsClarification {
-			p.b.Publish(types.Message{
-				ID:        uuid.New().String(),
-				Timestamp: time.Now().UTC(),
-				From:      types.RolePerceiver,
-				To:        types.RolePlanner,
-				Type:      types.MsgTaskSpec,
-				Payload:   spec,
-			})
-			log.Printf("[R1] published TaskSpec task_id=%s", spec.TaskID)
-			return spec.TaskID, nil
+			return p.publish(spec)
 		}
 
 		// Ask user for clarification
@@ -77,10 +73,35 @@ func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string
 		if err != nil {
 			return "", fmt.Errorf("perceiver: clarification: %w", err)
 		}
-		// Append the Q&A to the input for next round; keep session context unchanged
+		// Empty answer means "just do your best" — stop asking and proceed.
+		if strings.TrimSpace(answer) == "" {
+			break
+		}
+		// Append the Q&A to the input for next round; keep session context unchanged.
 		input = fmt.Sprintf("%s\n\nClarification: Q: %s A: %s", rawInput, question, answer)
 		sessionContext = "" // already embedded in the first prompt; don't duplicate
 	}
+
+	// Max rounds reached or user gave empty answer — one final call with instruction to commit.
+	finalInput := input + "\n\n[Instruction: proceed with the best interpretation; do not request further clarification.]"
+	spec, _, _, err := p.perceive(ctx, finalInput, "")
+	if err != nil {
+		return "", fmt.Errorf("perceiver: %w", err)
+	}
+	return p.publish(spec)
+}
+
+func (p *Perceiver) publish(spec types.TaskSpec) (string, error) {
+	p.b.Publish(types.Message{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now().UTC(),
+		From:      types.RolePerceiver,
+		To:        types.RolePlanner,
+		Type:      types.MsgTaskSpec,
+		Payload:   spec,
+	})
+	log.Printf("[R1] published TaskSpec task_id=%s", spec.TaskID)
+	return spec.TaskID, nil
 }
 
 func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) (types.TaskSpec, bool, string, error) {

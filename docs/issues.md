@@ -584,6 +584,46 @@ Routing rules:
 
 ---
 
+## Issue #23 — Clarification question printed dozens of times before user types anything
+
+**Symptom**
+```
+❯ 算算目前我用的外接显示器是什么尺寸的
+? 您需要我通过什么方式来确定外接显示器的尺寸？...
+? 您需要我通过什么方式来确定外接显示器的尺寸？...
+... (×12)
+❯ up to you
+```
+The same clarification question appeared ~12 times before the user had typed any answer.
+
+**Root causes**
+1. **No cap on clarification rounds**: `perceiver.Process()` looped unconditionally — if the
+   model returned `needs_clarification: true` more than once, the loop continued forever.
+2. **IME-buffered empty keystrokes**: Typing Chinese input via an IME can leave residual
+   keystrokes in the terminal buffer. When `rl.Readline()` was called inside `clarifyFn`,
+   it consumed those buffered empty strokes and returned `""` immediately — without blocking
+   for real user input. Each empty answer caused the model to be called again with a blank
+   clarification, which returned `needs_clarification: true` again, calling `clarifyFn`
+   again, and so on until the buffer was drained.
+
+**Fix** (`perceiver/perceiver.go`):
+- **`maxClarificationRounds = 2`**: `Process()` now loops at most twice before giving up.
+- **Empty answer → break**: if the user provides an empty answer (Enter with no text),
+  treat it as "proceed with your best interpretation" and exit the loop immediately.
+- **Final commit call**: after the loop exits (max rounds or empty answer), `perceive()` is
+  called one final time with an appended instruction
+  `"[Instruction: proceed with the best interpretation; do not request further clarification.]"`
+  to force the model to emit a `TaskSpec` instead of another `needs_clarification`.
+- **`publish()` helper**: extracted from the loop body to avoid duplicating the bus publish +
+  log line.
+
+**Behaviour after fix**
+- First clarification round: model asks → user sees question → user types answer → loop
+- Second clarification round (if model still unclear): model asks once more → user answers
+- After two rounds, or on empty answer: model is forced to commit; task proceeds.
+
+---
+
 ## Issue #22 — `/audit` always shows zeros on process restart
 
 **Symptom**
