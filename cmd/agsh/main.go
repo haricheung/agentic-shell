@@ -398,7 +398,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 	fmt.Println("\033[1m\033[36m⚡ agsh\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.cache/agsh/debug.log)\033[0m")
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:            "\033[36m❯\033[0m ",
+		Prompt:            "\x01\033[36m\x02❯\x01\033[0m\x02 ",
 		HistoryFile:       filepath.Join(cacheDir, "history"),
 		HistorySearchFold: true,
 		InterruptPrompt:   "^C",
