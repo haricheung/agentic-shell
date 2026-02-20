@@ -168,14 +168,23 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		log.Printf("[R4b]   subtask=%s status=%s criteria=%s", o.SubTaskID, o.Status, criteriaJSON)
 	}
 
-	// Ask LLM to merge and assess.
-	// SubTaskOutcomes now carry intent + success_criteria so the LLM has the
-	// full criteria set to check against — not just the intent from TaskSpec.
+	// Hard gate (code-enforced, not LLM-dependent): any failed subtask forces
+	// replan immediately. The LLM is only called when ALL subtasks matched so
+	// it cannot override a failed status by reasoning about "overall goal".
+	if len(failedIDs) > 0 {
+		log.Printf("[R4b] task=%s hard-gate REPLAN: %d failed subtask(s): %v", taskID, len(failedIDs), failedIDs)
+		m.triggerReplan(ctx, tracker, failedIDs, totalCorrections, gapTrend,
+			fmt.Sprintf("%d subtask(s) failed: %v", len(failedIDs), failedIDs))
+		return
+	}
+
+	// All subtasks matched — call LLM only to merge outputs and produce the
+	// user-facing summary. It can no longer influence accept/replan decision.
 	outcomesJSON, _ := json.MarshalIndent(tracker.outcomes, "", "  ")
 	specJSON, _ := json.MarshalIndent(tracker.spec, "", "  ")
 	userPrompt := fmt.Sprintf(
-		"TaskSpec (intent and constraints):\n%s\n\nSubTaskOutcomes (each carries its own success_criteria):\n%s\n\nFailed subtasks: %v\nGap trend: %s",
-		specJSON, outcomesJSON, failedIDs, gapTrend)
+		"TaskSpec (intent and constraints):\n%s\n\nSubTaskOutcomes (each carries its own success_criteria):\n%s\n\nAll subtasks matched. Merge their outputs into a single user-facing result.",
+		specJSON, outcomesJSON)
 
 	raw, err := m.llm.Chat(ctx, systemPrompt, userPrompt)
 	if err != nil {
@@ -259,96 +268,104 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		m.mu.Unlock()
 
 	case "replan":
-		const maxReplans = 3
+		m.triggerReplan(ctx, tracker, failedIDs, totalCorrections, gapTrend, v.GapSummary)
+	}
+}
 
+// triggerReplan handles the replan path for both the hard gate (code-enforced
+// failed subtask check) and the LLM-driven replan verdict. It writes a
+// procedural memory entry, publishes a ReplanRequest, and resets the tracker.
+//
+// Expectations:
+//   - Abandons and publishes FinalResult when replanCount >= maxReplans
+//   - Writes a procedural MemoryEntry before publishing ReplanRequest
+//   - Resets tracker.outcomes so the next round starts clean
+//   - Increments replanCounts before checking the limit
+func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTracker, failedIDs []string, totalCorrections int, gapTrend, gapSummary string) {
+	const maxReplans = 3
+	taskID := tracker.manifest.TaskID
+
+	m.mu.Lock()
+	m.replanCounts[taskID]++
+	replanCount := m.replanCounts[taskID]
+	m.mu.Unlock()
+
+	if replanCount >= maxReplans {
+		log.Printf("[R4b] task=%s ABANDONED after %d replan rounds", taskID, replanCount)
+		summary := fmt.Sprintf("❌ Task abandoned after %d failed attempts. %s", replanCount, gapSummary)
+		m.b.Publish(types.Message{
+			ID:        uuid.New().String(),
+			Timestamp: time.Now().UTC(),
+			From:      types.RoleMetaVal,
+			To:        types.RoleUser,
+			Type:      types.MsgFinalResult,
+			Payload:   types.FinalResult{TaskID: taskID, Summary: summary},
+		})
+		if m.outputFn != nil {
+			m.outputFn(taskID, summary, nil)
+		}
 		m.mu.Lock()
-		m.replanCounts[taskID]++
-		replanCount := m.replanCounts[taskID]
+		delete(m.trackers, taskID)
+		delete(m.replanCounts, taskID)
+		delete(m.prevFailedCounts, taskID)
 		m.mu.Unlock()
+		return
+	}
 
-		// Abandon after too many failed replan rounds to prevent infinite loops.
-		if replanCount >= maxReplans {
-			log.Printf("[R4b] task=%s ABANDONED after %d replan rounds", taskID, replanCount)
-			summary := fmt.Sprintf("❌ Task abandoned after %d failed attempts. %s", replanCount, v.GapSummary)
-			finalResult := types.FinalResult{TaskID: taskID, Summary: summary}
-			m.b.Publish(types.Message{
-				ID:        uuid.New().String(),
-				Timestamp: time.Now().UTC(),
-				From:      types.RoleMetaVal,
-				To:        types.RoleUser,
-				Type:      types.MsgFinalResult,
-				Payload:   finalResult,
-			})
-			if m.outputFn != nil {
-				m.outputFn(taskID, summary, nil)
-			}
-			m.mu.Lock()
-			delete(m.trackers, taskID)
-			delete(m.replanCounts, taskID)
-			delete(m.prevFailedCounts, taskID)
-			m.mu.Unlock()
-			return
+	// Write procedural memory so the planner can avoid repeating the failure.
+	type failureLesson struct {
+		Lesson      string   `json:"lesson"`
+		GapSummary  string   `json:"gap_summary"`
+		FailedTasks []string `json:"failed_subtasks"`
+	}
+	lesson := failureLesson{
+		Lesson:      "Task failed: " + gapSummary + ". Avoid repeating the same approach.",
+		GapSummary:  gapSummary,
+		FailedTasks: failedIDs,
+	}
+	tags := []string{"failure", "replan", taskID}
+	for _, word := range strings.Fields(gapSummary) {
+		if len(word) >= 4 {
+			tags = append(tags, strings.ToLower(strings.Trim(word, ".,;:!?")))
 		}
-
-		// Write a procedural memory entry so the planner can avoid the same mistakes
-		type failureLesson struct {
-			Lesson      string   `json:"lesson"`
-			GapSummary  string   `json:"gap_summary"`
-			FailedTasks []string `json:"failed_subtasks"`
-		}
-		lesson := failureLesson{
-			Lesson:      "Task failed: " + v.GapSummary + ". Avoid repeating the same approach.",
-			GapSummary:  v.GapSummary,
-			FailedTasks: failedIDs,
-		}
-		// Build tags from gap summary keywords for retrieval
-		tags := []string{"failure", "replan", taskID}
-		for _, word := range strings.Fields(v.GapSummary) {
-			if len(word) >= 4 {
-				tags = append(tags, strings.ToLower(strings.Trim(word, ".,;:!?")))
-			}
-		}
-		failEntry := types.MemoryEntry{
+	}
+	m.b.Publish(types.Message{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now().UTC(),
+		From:      types.RoleMetaVal,
+		To:        types.RoleMemory,
+		Type:      types.MsgMemoryWrite,
+		Payload: types.MemoryEntry{
 			EntryID:   uuid.New().String(),
 			TaskID:    taskID,
 			Type:      "procedural",
 			Content:   lesson,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 			Tags:      tags,
-		}
-		m.b.Publish(types.Message{
-			ID:        uuid.New().String(),
-			Timestamp: time.Now().UTC(),
-			From:      types.RoleMetaVal,
-			To:        types.RoleMemory,
-			Type:      types.MsgMemoryWrite,
-			Payload:   failEntry,
-		})
+		},
+	})
 
-		rr := types.ReplanRequest{
-			TaskID:          taskID,
-			MergedResult:    v.MergedOutput,
-			GapSummary:      v.GapSummary,
-			FailedSubTasks:  failedIDs,
-			CorrectionCount: totalCorrections,
-			GapTrend:        gapTrend,
-			Recommendation:  v.Recommendation,
-		}
-		log.Printf("[R4b] task=%s requesting REPLAN gap_trend=%s", taskID, gapTrend)
-		m.b.Publish(types.Message{
-			ID:        uuid.New().String(),
-			Timestamp: time.Now().UTC(),
-			From:      types.RoleMetaVal,
-			To:        types.RolePlanner,
-			Type:      types.MsgReplanRequest,
-			Payload:   rr,
-		})
-
-		// Reset tracker for next round
-		m.mu.Lock()
-		tracker.outcomes = nil
-		m.mu.Unlock()
+	rr := types.ReplanRequest{
+		TaskID:          taskID,
+		GapSummary:      gapSummary,
+		FailedSubTasks:  failedIDs,
+		CorrectionCount: totalCorrections,
+		GapTrend:        gapTrend,
+		Recommendation:  "replan",
 	}
+	log.Printf("[R4b] task=%s requesting REPLAN round=%d gap=%q", taskID, replanCount, gapSummary)
+	m.b.Publish(types.Message{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now().UTC(),
+		From:      types.RoleMetaVal,
+		To:        types.RolePlanner,
+		Type:      types.MsgReplanRequest,
+		Payload:   rr,
+	})
+
+	m.mu.Lock()
+	tracker.outcomes = nil
+	m.mu.Unlock()
 }
 
 func computeGapTrend(currentFailed, prevFailed, replanCount int) string {
