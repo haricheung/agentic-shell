@@ -1269,3 +1269,31 @@ Files changed:
 - `internal/roles/agentval/agentval.go`
 - `internal/roles/metaval/metaval.go`
 - `cmd/agsh/main.go`
+
+---
+
+## Issue #42 — `search` tool always fails: DuckDuckGo API unreachable from mainland China
+
+**Symptom**
+Every `search` tool call times out after 15 seconds:
+```
+[R3] tool[5] → ERROR: websearch: http request: context deadline exceeded
+```
+The GFW blocks `api.duckduckgo.com`. The tool was never usable from the deployment environment.
+
+**Root cause**
+`internal/tools/websearch.go` used the DuckDuckGo Instant Answer API
+(`https://api.duckduckgo.com/`), which is blocked in mainland China.
+
+**Fix**
+Replaced with the Bocha web search API (`https://api.bochaai.com/v1/web-search`):
+- POST request with JSON body; auth via `BOCHA_API_KEY` env var (Bearer token)
+- Returns `webPages.value[]` with title, snippet/summary, URL, date
+- Fails fast with a clear error when `BOCHA_API_KEY` is not set
+- `formatBochaResult` prefers `summary` over `snippet` when both are present
+- Caps at 5 results; separates each with a blank line
+
+Files changed:
+- `internal/tools/websearch.go` — full rewrite (Bocha API)
+- `internal/tools/websearch_test.go` (new, 7 tests for `formatBochaResult`)
+- `CLAUDE.md` — updated tool table and env config section
