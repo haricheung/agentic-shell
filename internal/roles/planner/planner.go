@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -16,7 +17,10 @@ import (
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
-const maxMemoryEntries = 10
+const (
+	maxMemoryEntries = 10
+	maxCCCalls       = 2 // max times R2 may call cc per planning session
+)
 
 const systemPrompt = `You are R2 — Planner. Decompose a TaskSpec into the minimum necessary SubTask objects.
 
@@ -50,7 +54,19 @@ Memory constraint rules (when a MEMORY CONSTRAINTS block is present):
 - Every "MUST NOT" line records an approach that failed before for a similar task. You MUST NOT use that approach regardless of how promising it seems.
 - Every "SHOULD PREFER" line records an approach that worked before. Prefer it over untested alternatives.
 
-Output ONLY a JSON array (no wrapper, no markdown, no prose):
+OPTIONAL TOOL — cc (Claude Code):
+Before finalising the SubTask array you may consult the local Claude Code assistant when:
+- The task involves project code/files and you need to understand structure or APIs.
+- You are genuinely uncertain how to decompose a step correctly.
+- You want to verify that a proposed tool or command will work in this codebase.
+
+To call cc, output EXACTLY this JSON object (nothing else on the turn):
+{"action":"call_cc","prompt":"<your specific question>"}
+
+You will receive cc's response and may call it again (limit: 2 times total).
+Only call cc when it materially improves planning — skip it for simple tasks.
+
+When ready to finalise, output ONLY a JSON array (no wrapper, no markdown, no prose):
 [
   {
     "subtask_id": "<uuid>",
@@ -348,14 +364,75 @@ func memTokenize(s string) []string {
 	return words
 }
 
-func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string, tl *tasklog.TaskLog) error {
-	raw, usage, err := p.llm.Chat(ctx, sysPrompt, userPrompt)
-	tl.LLMCall("planner", sysPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
+// runCC invokes the local Claude Code CLI ("cc --print <prompt>") and returns
+// its trimmed stdout as a plain string. It is used by R2 to consult Claude Code
+// during planning when the task involves code or file structure analysis.
+//
+// Expectations:
+//   - Returns trimmed stdout when cc exits successfully (exit code 0)
+//   - Returns "[cc error: <msg>]" string (not a Go error) when cc is unavailable or exits non-zero
+//   - Truncates output at 4000 chars, appending "…" when trimmed
+//   - Respects ctx cancellation; times out after 60 s regardless
+func runCC(ctx context.Context, prompt string) string {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "cc", "--print", prompt).Output()
 	if err != nil {
-		return fmt.Errorf("llm: %w", err)
+		return fmt.Sprintf("[cc error: %v]", err)
 	}
-	raw = llm.StripFences(raw)
+	result := strings.TrimSpace(string(out))
+	if len(result) > 4000 {
+		result = result[:4000] + "…"
+	}
+	return result
+}
 
+// dispatch runs the brain LLM with an optional cc tool loop.
+// The LLM may call cc up to maxCCCalls times before producing the final SubTask array.
+//
+// Expectations:
+//   - Parses and emits SubTask array directly when LLM skips the cc tool
+//   - Calls runCC and feeds result back when LLM outputs {"action":"call_cc","prompt":"..."}
+//   - Hard-stops after maxCCCalls cc calls and requests final plan
+//   - Falls back to SubTask JSON parse when output does not match the cc action shape
+func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string, tl *tasklog.TaskLog) error {
+	currentUser := userPrompt
+	var ccHistory strings.Builder
+	ccCalls := 0
+
+	for {
+		raw, usage, err := p.llm.Chat(ctx, sysPrompt, currentUser)
+		tl.LLMCall("planner", sysPrompt, currentUser, raw, usage.PromptTokens, usage.CompletionTokens, 0)
+		if err != nil {
+			return fmt.Errorf("llm: %w", err)
+		}
+		raw = llm.StripFences(raw)
+
+		// Attempt to detect a cc tool call before treating output as final plan.
+		trimmed := strings.TrimSpace(raw)
+		if !strings.HasPrefix(trimmed, "[") && ccCalls < maxCCCalls {
+			var act struct {
+				Action string `json:"action"`
+				Prompt string `json:"prompt"`
+			}
+			if json.Unmarshal([]byte(trimmed), &act) == nil && act.Action == "call_cc" && act.Prompt != "" {
+				log.Printf("[R2] cc call %d/%d: %q", ccCalls+1, maxCCCalls, act.Prompt)
+				ccOut := runCC(ctx, act.Prompt)
+				log.Printf("[R2] cc response (%d chars): %.300s", len(ccOut), ccOut)
+				ccCalls++
+				ccHistory.WriteString(fmt.Sprintf("\n\n[cc call %d]\nQ: %s\nA: %s", ccCalls, act.Prompt, ccOut))
+				currentUser = userPrompt + ccHistory.String() + "\n\nNow output the final SubTask JSON array:"
+				continue
+			}
+		}
+
+		// Final plan — parse and emit.
+		return p.emitSubTasks(spec, raw)
+	}
+}
+
+// emitSubTasks parses a raw SubTask JSON array and fans it out on the bus.
+func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string) error {
 	var subTasks []types.SubTask
 	if err := json.Unmarshal([]byte(raw), &subTasks); err != nil {
 		return fmt.Errorf("parse SubTasks: %w (raw: %s)", err, raw)

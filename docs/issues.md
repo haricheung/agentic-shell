@@ -5,6 +5,23 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #48 — R2 has no way to consult a stronger model for complex planning
+
+**Symptom**: Brain model (deepseek-v3.2) must plan blindly — it cannot inspect the codebase, verify tool availability, or ask Claude for architectural insight before decomposing a task.
+
+**Root cause**: R2's `dispatch()` made a single LLM call and parsed the result directly as a SubTask JSON array. No mechanism existed for the brain to call an external tool before finalising the plan.
+
+**Fix**: Added an optional `cc` (Claude Code CLI) tool loop to R2's `dispatch()`:
+- Brain LLM may output `{"action":"call_cc","prompt":"..."}` before the final SubTask array.
+- `runCC(ctx, prompt)` shells out to `cc --print <prompt>` (60 s timeout, 4000 char truncation).
+- R2 appends the response to the context and calls the brain LLM again for the final plan.
+- Hard-capped at `maxCCCalls=2` per planning session to prevent loops.
+- Direct `[...]` array output bypasses the tool loop entirely (backward compatible).
+- System prompt updated with `OPTIONAL TOOL — cc` section describing when and how to call it.
+- 5 new tests in `planner_test.go` covering cc detection, array bypass, and constant guards.
+
+---
+
 ## Issue #47 — Abandon message shows only subtask ID, not failure reason
 
 **Symptom**: `❌ Task abandoned after 3 failed attempts. 1 subtask(s) failed: [a7b8c9d0-...]` — the user sees a UUID, not why it failed.
