@@ -78,10 +78,11 @@ type SubTask struct {
 
 // DispatchManifest is sent by R2 to R4b so it knows expected sub-task count
 type DispatchManifest struct {
-	TaskID      string    `json:"task_id"`
-	SubTaskIDs  []string  `json:"subtask_ids"`
-	TaskSpec    *TaskSpec `json:"task_spec,omitempty"`
-	DispatchedAt string   `json:"dispatched_at"`
+	TaskID       string    `json:"task_id"`
+	SubTaskIDs   []string  `json:"subtask_ids"`
+	TaskSpec     *TaskSpec `json:"task_spec,omitempty"`
+	DispatchedAt string    `json:"dispatched_at"`
+	CCCalls      int       `json:"cc_calls"` // 0 = brain model only; >0 = cc was consulted N times
 }
 
 // ExecutionResult is produced by R3 Executor and consumed by R4a Agent-Validator

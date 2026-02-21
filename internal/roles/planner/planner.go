@@ -447,12 +447,12 @@ func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt,
 		}
 
 		// Final plan — parse and emit.
-		return p.emitSubTasks(spec, raw)
+		return p.emitSubTasks(spec, raw, ccCalls)
 	}
 }
 
 // emitSubTasks parses a raw SubTask JSON array and fans it out on the bus.
-func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string) error {
+func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string, ccCalls int) error {
 	var subTasks []types.SubTask
 	if err := json.Unmarshal([]byte(raw), &subTasks); err != nil {
 		return fmt.Errorf("parse SubTasks: %w (raw: %s)", err, raw)
@@ -478,6 +478,7 @@ func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string) error {
 		SubTaskIDs:   subtaskIDs,
 		TaskSpec:     &spec,
 		DispatchedAt: time.Now().UTC().Format(time.RFC3339),
+		CCCalls:      ccCalls,
 	}
 	p.b.Publish(types.Message{
 		ID:        uuid.New().String(),

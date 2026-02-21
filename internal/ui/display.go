@@ -360,10 +360,14 @@ func msgDetail(msg types.Message) string {
 		var m types.DispatchManifest
 		if remarshal(msg.Payload, &m) == nil {
 			n := len(m.SubTaskIDs)
-			if n == 1 {
-				return "1 subtask"
+			subtaskStr := "1 subtask"
+			if n != 1 {
+				subtaskStr = fmt.Sprintf("%d subtasks", n)
 			}
-			return fmt.Sprintf("%d subtasks", n)
+			if m.CCCalls > 0 {
+				return fmt.Sprintf("%s | via cc (%d call)", subtaskStr, m.CCCalls)
+			}
+			return subtaskStr + " | via brain"
 		}
 	case types.MsgReplanRequest:
 		var r types.ReplanRequest

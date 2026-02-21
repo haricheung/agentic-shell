@@ -5,6 +5,19 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #51 — No UI visibility into whether R2 used brain model or cc for planning
+
+**Symptom**: `DispatchManifest` line in pipeline always reads "N subtasks" — no indication of whether R2 called cc or planned with the brain model directly.
+
+**Root cause**: `DispatchManifest` carried no `cc_calls` field; `display.go` had no logic to distinguish the two paths.
+
+**Fix**:
+- Added `CCCalls int` field to `types.DispatchManifest` (0 = brain only; >0 = cc consulted N times).
+- `emitSubTasks(spec, raw, ccCalls int)` now accepts and sets `CCCalls` in the manifest.
+- `display.go` DispatchManifest detail renders `"N subtasks | via brain"` or `"N subtasks | via cc (N call)"`.
+
+---
+
 ## Issue #50 — R4a has no current date in context; cannot resolve relative dates
 
 **Symptom**: R4a fails criterion "at least one source is within the last 6 months" when search results show relative dates ("13 days ago", "5 months ago"), even though the dates clearly resolve to within 6 months.
