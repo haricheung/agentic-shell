@@ -5,6 +5,16 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #47 — Abandon message shows only subtask ID, not failure reason
+
+**Symptom**: `❌ Task abandoned after 3 failed attempts. 1 subtask(s) failed: [a7b8c9d0-...]` — the user sees a UUID, not why it failed.
+
+**Root cause**: The hard-gate replan path in `metaval.go` built `gapSummary` as `"N subtask(s) failed: [<ids>]"` — the `SubTaskOutcome.FailureReason` field (populated by R4a) was never extracted. The abandon message therefore showed only the opaque subtask ID.
+
+**Fix**: At the hard-gate call site, iterate failed outcomes and join their `FailureReason` strings into `gapSummary`. Inside `triggerReplan`, do the same when composing the user-facing abandon message. Both GGS (via `ReplanRequest.GapSummary`) and the final displayed message now show the actual R4a failure reason.
+
+---
+
 ## Issue #46 — GGS timeBudgetMs too tight; tasks abandoned at 91% Ω due to LLM latency
 
 **Symptom**: Tasks that ultimately succeed are abandoned mid-run with "budget pressure=91%". The abandon was triggered by the time sub-component of Ω alone: at elapsed=211 s with one replan, `Ω = 0.6*(1/3) + 0.4*(211845/120000) = 0.906 ≥ 0.8`.

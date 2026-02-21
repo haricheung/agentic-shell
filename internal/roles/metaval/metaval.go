@@ -170,8 +170,23 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 	// it cannot override a failed status by reasoning about "overall goal".
 	if len(failedIDs) > 0 {
 		log.Printf("[R4b] task=%s hard-gate REPLAN: %d failed subtask(s): %v", taskID, len(failedIDs), failedIDs)
-		m.triggerReplan(ctx, tracker, failedIDs, totalCorrections,
-			fmt.Sprintf("%d subtask(s) failed: %v", len(failedIDs), failedIDs))
+		// Build gap summary with actual failure reasons so GGS and memory get
+		// actionable text, not just subtask IDs.
+		var gapParts []string
+		for _, o := range tracker.outcomes {
+			if o.Status == "failed" {
+				if o.FailureReason != nil && *o.FailureReason != "" {
+					gapParts = append(gapParts, *o.FailureReason)
+				} else {
+					gapParts = append(gapParts, o.SubTaskID)
+				}
+			}
+		}
+		gapSummary := strings.Join(gapParts, "; ")
+		if gapSummary == "" {
+			gapSummary = fmt.Sprintf("%d subtask(s) failed: %v", len(failedIDs), failedIDs)
+		}
+		m.triggerReplan(ctx, tracker, failedIDs, totalCorrections, gapSummary)
 		return
 	}
 
@@ -313,7 +328,19 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 	if replanCount >= maxReplans {
 		log.Printf("[R4b] task=%s ABANDONED (safety net) after %d replan rounds", taskID, replanCount)
 		m.logReg.Close(taskID, "abandoned")
-		summary := fmt.Sprintf("❌ Task abandoned after %d failed attempts. %s", replanCount, gapSummary)
+		// Build a human-readable reason from the last failure outcomes so the
+		// user sees WHY it failed, not just which subtask ID.
+		var reasons []string
+		for _, o := range outcomes {
+			if o.Status == "failed" && o.FailureReason != nil && *o.FailureReason != "" {
+				reasons = append(reasons, *o.FailureReason)
+			}
+		}
+		detail := gapSummary
+		if len(reasons) > 0 {
+			detail = strings.Join(reasons, "; ")
+		}
+		summary := fmt.Sprintf("❌ Task abandoned after %d failed attempts. %s", replanCount, detail)
 		m.b.Publish(types.Message{
 			ID:        uuid.New().String(),
 			Timestamp: time.Now().UTC(),
