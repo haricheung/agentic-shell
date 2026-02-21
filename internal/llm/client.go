@@ -58,19 +58,27 @@ type chatMsg struct {
 	Content string `json:"content"`
 }
 
+// Usage reports token consumption for one LLM call.
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
+	Usage Usage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
 }
 
-// Chat sends a system + user prompt and returns the assistant's text response.
-func (c *Client) Chat(ctx context.Context, system, user string) (string, error) {
+// Chat sends a system + user prompt and returns the assistant's text response and token usage.
+func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, error) {
 	payload := chatRequest{
 		Model: c.model,
 		Messages: []chatMsg{
@@ -81,46 +89,46 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, error) 
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("llm: marshal request: %w", err)
+		return "", Usage{}, fmt.Errorf("llm: marshal request: %w", err)
 	}
 
 	url := c.baseURL + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("llm: create request: %w", err)
+		return "", Usage{}, fmt.Errorf("llm: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("llm: http request: %w", err)
+		return "", Usage{}, fmt.Errorf("llm: http request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("llm: read response: %w", err)
+		return "", Usage{}, fmt.Errorf("llm: read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("llm: HTTP %d: %s", resp.StatusCode, string(respBody))
+		return "", Usage{}, fmt.Errorf("llm: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var chatResp chatResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		return "", fmt.Errorf("llm: unmarshal response: %w", err)
+		return "", Usage{}, fmt.Errorf("llm: unmarshal response: %w", err)
 	}
 
 	if chatResp.Error != nil {
-		return "", fmt.Errorf("llm: API error: %s", chatResp.Error.Message)
+		return "", Usage{}, fmt.Errorf("llm: API error: %s", chatResp.Error.Message)
 	}
 
 	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("llm: no choices in response")
+		return "", Usage{}, fmt.Errorf("llm: no choices in response")
 	}
 
-	return chatResp.Choices[0].Message.Content, nil
+	return chatResp.Choices[0].Message.Content, chatResp.Usage, nil
 }
 
 // StripFences removes markdown code fences (```json ... ```) from LLM output

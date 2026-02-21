@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/llm"
+	"github.com/haricheung/agentic-shell/internal/tasklog"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
@@ -104,11 +105,13 @@ func (a *AgentValidator) publish(o types.SubTaskOutcome) {
 // Run drives the fast loop for one sub-task.
 // resultCh receives ExecutionResult messages from the Executor.
 // correctionCh is for sending CorrectionSignals back to the Executor.
+// tlog may be nil — all TaskLog methods are nil-safe.
 func (a *AgentValidator) Run(
 	ctx context.Context,
 	subTask types.SubTask,
 	resultCh <-chan types.ExecutionResult,
 	correctionCh chan<- types.CorrectionSignal,
+	tlog *tasklog.TaskLog,
 ) types.SubTaskOutcome {
 	// Log all criteria on a single line (JSON) so they're always visible in one entry,
 	// then repeat as numbered lines for easier reading.
@@ -128,11 +131,15 @@ func (a *AgentValidator) Run(
 		select {
 		case <-ctx.Done():
 			reason := "context cancelled"
-			return a.outcome(subTask, "failed", nil, &reason, trajectory)
+			o := a.outcome(subTask, "failed", nil, &reason, trajectory)
+			tlog.SubtaskEnd(subTask.SubTaskID, "failed")
+			return o
 		case r, ok := <-resultCh:
 			if !ok {
 				reason := "result channel closed"
-				return a.outcome(subTask, "failed", nil, &reason, trajectory)
+				o := a.outcome(subTask, "failed", nil, &reason, trajectory)
+				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
+				return o
 			}
 			result = r
 		}
@@ -140,7 +147,7 @@ func (a *AgentValidator) Run(
 		attempt++
 		log.Printf("[R4a] scoring subtask=%s attempt=%d status=%s", subTask.SubTaskID, attempt, result.Status)
 
-		v, err := a.score(ctx, subTask, result)
+		v, err := a.score(ctx, subTask, result, tlog)
 		if err != nil {
 			log.Printf("[R4a] ERROR scoring: %v", err)
 			reason := fmt.Sprintf("scoring error: %v", err)
@@ -187,6 +194,11 @@ func (a *AgentValidator) Run(
 			log.Printf("[R4a]   reason: %s", v.FailureReason)
 		}
 
+		// Log per-criterion verdicts to the task log.
+		for _, cr := range v.CriteriaResults {
+			tlog.CriterionVerdict(subTask.SubTaskID, cr.Criterion, cr.Met, cr.Evidence, attempt)
+		}
+
 		trajectory = append(trajectory, types.GapTrajectoryPoint{
 			Attempt:       attempt,
 			Score:         v.Score,
@@ -197,6 +209,7 @@ func (a *AgentValidator) Run(
 		case "matched":
 			log.Printf("[R4a] subtask=%s MATCHED on attempt=%d", subTask.SubTaskID, attempt)
 			o := a.outcome(subTask, "matched", result.Output, nil, trajectory)
+			tlog.SubtaskEnd(subTask.SubTaskID, "matched")
 			a.publish(o)
 			return o
 
@@ -205,6 +218,7 @@ func (a *AgentValidator) Run(
 				log.Printf("[R4a] subtask=%s max retries reached, reporting failed", subTask.SubTaskID)
 				reason := fmt.Sprintf("max retries (%d) reached; last issue: %s", maxRetries, v.WhatWasWrong)
 				o := a.outcome(subTask, "failed", result.Output, &reason, trajectory)
+				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 				a.publish(o)
 				return o
 			}
@@ -215,6 +229,7 @@ func (a *AgentValidator) Run(
 				WhatWasWrong:  v.WhatWasWrong,
 				WhatToDo:      v.WhatToDo,
 			}
+			tlog.Correction(subTask.SubTaskID, v.WhatWasWrong, v.WhatToDo, attempt)
 			a.b.Publish(types.Message{
 				ID:        uuid.New().String(),
 				Timestamp: time.Now().UTC(),
@@ -227,7 +242,9 @@ func (a *AgentValidator) Run(
 			case correctionCh <- correction:
 			case <-ctx.Done():
 				reason := "context cancelled during correction"
-				return a.outcome(subTask, "failed", nil, &reason, trajectory)
+				o := a.outcome(subTask, "failed", nil, &reason, trajectory)
+				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
+				return o
 			}
 
 		default: // "failed"
@@ -237,19 +254,21 @@ func (a *AgentValidator) Run(
 			}
 			log.Printf("[R4a] subtask=%s FAILED: %s", subTask.SubTaskID, reason)
 			o := a.outcome(subTask, "failed", result.Output, &reason, trajectory)
+			tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 			a.publish(o)
 			return o
 		}
 	}
 }
 
-func (a *AgentValidator) score(ctx context.Context, st types.SubTask, result types.ExecutionResult) (*verdict, error) {
+func (a *AgentValidator) score(ctx context.Context, st types.SubTask, result types.ExecutionResult, tlog *tasklog.TaskLog) (*verdict, error) {
 	taskJSON, _ := json.MarshalIndent(st, "", "  ")
 	resultJSON, _ := json.MarshalIndent(result, "", "  ")
 
 	userPrompt := fmt.Sprintf("SubTask:\n%s\n\nExecutionResult:\n%s", taskJSON, resultJSON)
 
-	raw, err := a.llm.Chat(ctx, systemPrompt, userPrompt)
+	raw, usage, err := a.llm.Chat(ctx, systemPrompt, userPrompt)
+	tlog.LLMCall("agentval", systemPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
 	if err != nil {
 		return nil, err
 	}

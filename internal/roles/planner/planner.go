@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/llm"
+	"github.com/haricheung/agentic-shell/internal/tasklog"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
@@ -83,13 +84,14 @@ Rules:
 
 // Planner is R2. It decomposes TaskSpec into SubTasks and handles replanning.
 type Planner struct {
-	llm *llm.Client
-	b   *bus.Bus
+	llm    *llm.Client
+	b      *bus.Bus
+	logReg *tasklog.Registry
 }
 
 // New creates a Planner.
-func New(b *bus.Bus, llmClient *llm.Client) *Planner {
-	return &Planner{llm: llmClient, b: b}
+func New(b *bus.Bus, llmClient *llm.Client, logReg *tasklog.Registry) *Planner {
+	return &Planner{llm: llmClient, b: b, logReg: logReg}
 }
 
 // Run listens for TaskSpec and ReplanRequest messages.
@@ -181,6 +183,9 @@ func (p *Planner) Run(ctx context.Context) {
 }
 
 func (p *Planner) plan(ctx context.Context, spec types.TaskSpec, memory []types.MemoryEntry) error {
+	// Open (or retrieve existing) task log — idempotent across replan rounds.
+	tl := p.logReg.Open(spec.TaskID, spec.Intent)
+
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
 	constraints := calibrate(memory, spec.Intent)
 
@@ -194,10 +199,12 @@ func (p *Planner) plan(ctx context.Context, spec types.TaskSpec, memory []types.
 		log.Printf("[R2] calibration: no relevant memory entries")
 		userPrompt = fmt.Sprintf("TaskSpec:\n%s", specJSON)
 	}
-	return p.dispatch(ctx, spec, userPrompt, systemPrompt)
+	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
 }
 
 func (p *Planner) replan(ctx context.Context, spec types.TaskSpec, rr types.ReplanRequest, memory []types.MemoryEntry) error {
+	tl := p.logReg.Get(spec.TaskID) // log already open from initial plan()
+
 	rrJSON, _ := json.MarshalIndent(rr, "", "  ")
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
 	constraints := calibrate(memory, spec.Intent)
@@ -205,7 +212,7 @@ func (p *Planner) replan(ctx context.Context, spec types.TaskSpec, rr types.Repl
 		constraints = "(none)"
 	}
 	userPrompt := fmt.Sprintf(replanPrompt, rrJSON, specJSON, constraints)
-	return p.dispatch(ctx, spec, userPrompt, systemPrompt)
+	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
 }
 
 // calibrate implements Steps 1–3 of the Memory Calibration Protocol.
@@ -322,8 +329,9 @@ func memTokenize(s string) []string {
 	return words
 }
 
-func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string) error {
-	raw, err := p.llm.Chat(ctx, sysPrompt, userPrompt)
+func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string, tl *tasklog.TaskLog) error {
+	raw, usage, err := p.llm.Chat(ctx, sysPrompt, userPrompt)
+	tl.LLMCall("planner", sysPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
 	if err != nil {
 		return fmt.Errorf("llm: %w", err)
 	}

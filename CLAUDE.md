@@ -18,6 +18,7 @@ Cache / log files written to `~/.cache/agsh/`:
 | `audit.jsonl` | Structured audit events |
 | `audit_stats.json` | Persisted auditor window stats (tasks, corrections, trends, violations) |
 | `debug.log` | Internal role debug logs (redirected from stderr at startup) |
+| `tasks/<task_id>.jsonl` | Per-task structured log: LLM calls (with full prompts), tool calls, criterion verdicts, corrections, replans |
 
 To watch debug output live: `tail -f ~/.cache/agsh/debug.log`
 
@@ -69,12 +70,13 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `cmd/agsh/main.go` | Entry point | REPL + one-shot; wires all roles; session history |
 | `internal/types/types.go` | Shared schemas | All message and data types |
 | `internal/bus/bus.go` | Message bus | Foundation; all roles depend on this |
-| `internal/llm/client.go` | LLM client | Single `Chat(ctx, system, user)` method; `StripFences()` helper |
+| `internal/llm/client.go` | LLM client | `Chat(ctx, system, user) (string, Usage, error)` — returns token usage; `StripFences()` helper |
+| `internal/tasklog/tasklog.go` | Task log | `Registry` + nil-safe `TaskLog`; writes one JSONL per task to `tasks/<id>.jsonl`; events: task_begin/end, subtask_begin/end, llm_call (full prompts), tool_call, criterion_verdict, correction, replan |
 | `internal/roles/perceiver/` | R1 | Translates input → TaskSpec (short snake_case task_id; binary success_criteria); session-history aware |
-| `internal/roles/planner/` | R2 | TaskSpec → SubTask[]; queries memory first; assigns sequence numbers for dependency ordering; handles ReplanRequest |
-| `internal/roles/executor/` | R3 | Executes one SubTask via numbered tool priority chain; correction-aware; `correctionPrompt` repeats format and tools; `headTail(result, 4000)` for tool result context; each `ToolCalls` entry includes `→ <last 120 chars of output>` for R4a evidence |
-| `internal/roles/agentval/` | R4a | Scores ExecutionResult; drives retry loop; maxRetries=2; infrastructure errors → immediate fail; trusts `ToolCalls` output snippets as concrete evidence |
-| `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3 |
+| `internal/roles/planner/` | R2 | TaskSpec → SubTask[]; queries memory first; assigns sequence numbers for dependency ordering; handles ReplanRequest; opens task log via `logReg.Open()` |
+| `internal/roles/executor/` | R3 | Executes one SubTask via numbered tool priority chain; correction-aware; `correctionPrompt` repeats format and tools; `headTail(result, 4000)` for tool result context; each `ToolCalls` entry includes `→ <last 120 chars of output>` for R4a evidence; logs LLM calls and tool calls to task log |
+| `internal/roles/agentval/` | R4a | Scores ExecutionResult; drives retry loop; maxRetries=2; infrastructure errors → immediate fail; trusts `ToolCalls` output snippets as concrete evidence; logs criterion verdicts, corrections, subtask end to task log |
+| `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3; closes task log via `logReg.Close()` |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
 | `internal/roles/auditor/` | R6 | Active entity: taps bus read-only (passive observation) + subscribes to `MsgAuditQuery` (on-demand) + publishes `MsgAuditReport`; 5-min periodic ticker; accumulates window stats (tasks, corrections, gap trends, violations, drift alerts); resets window after each report |
 | `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; `Abort()` sets `suppressed=true` to block stale post-abort messages; `Resume()` lifts it before each new task; spinner uses `\r\033[K` to prevent line-wrap flood |

@@ -1227,3 +1227,45 @@ of `clip(c.WhatToDo, 38)`. With column-aware clipping, 38 CJK runes → capped a
 Files changed:
 - `internal/ui/display.go` — added `runeWidth`, `clipCols`; updated `dynamicStatus`
 - `internal/ui/display_test.go` — 8 new tests covering `runeWidth`, `clipCols`, and `dynamicStatus` CJK case
+
+---
+
+## Issue #41 — LLM token usage discarded; no per-task structured log for gradient computation
+
+**Symptom**
+No machine-readable record of LLM calls, tool calls, criterion verdicts, corrections, or replan
+events per task. Token counts were discarded (API returned `usage` field but client ignored it).
+Debugging required reading human-readable debug.log; GGS (v0.7) had no raw data to compute its
+loss function components D, P, Ω.
+
+**Root cause**
+`llm.Chat()` returned `(string, error)` and discarded the `usage` field from the API response.
+No structured logging existed in any role — only `log.Printf` to the shared debug.log.
+
+**Fix**
+1. `internal/llm/client.go` — added `Usage` struct; changed `Chat()` to `(string, Usage, error)`.
+2. `internal/tasklog/tasklog.go` (new) — `Registry` + `TaskLog` with 9 event kinds
+   (`task_begin`, `task_end`, `subtask_begin`, `subtask_end`, `llm_call`, `tool_call`,
+   `criterion_verdict`, `correction`, `replan`). All `TaskLog` methods nil-safe.
+   One JSONL file per task written to `~/.cache/agsh/tasks/<task_id>.jsonl`.
+3. `internal/roles/planner/planner.go` — `logReg *tasklog.Registry` in constructor;
+   `Open()` on plan start (idempotent across replan rounds); LLM call logged in `dispatch()`.
+4. `internal/roles/executor/executor.go` — `tlog *tasklog.TaskLog` param on `RunSubTask`;
+   `SubtaskBegin` at goroutine start; `LLMCall` per iteration; `ToolCall` per tool invocation.
+5. `internal/roles/agentval/agentval.go` — `tlog` param on `Run`/`score`; `LLMCall` in
+   `score()`; `CriterionVerdict` per criterion; `Correction` before retry; `SubtaskEnd`
+   at every return path.
+6. `internal/roles/metaval/metaval.go` — `logReg` in constructor; `LLMCall` in `evaluate()`;
+   `Replan` in `triggerReplan()`; `Close("accepted")`/`Close("abandoned")` at task end.
+7. `cmd/agsh/main.go` — creates `logReg`; passes to planner/metaval constructors and
+   `runSubtaskDispatcher`; `logReg.Get(parentTaskID)` wires tlog into each subtask pair.
+
+Files changed:
+- `internal/tasklog/tasklog.go` (new)
+- `internal/tasklog/tasklog_test.go` (new, 9 tests)
+- `internal/llm/client.go`
+- `internal/roles/planner/planner.go`
+- `internal/roles/executor/executor.go`
+- `internal/roles/agentval/agentval.go`
+- `internal/roles/metaval/metaval.go`
+- `cmd/agsh/main.go`

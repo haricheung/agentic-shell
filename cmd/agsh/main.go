@@ -27,6 +27,7 @@ import (
 	"github.com/haricheung/agentic-shell/internal/roles/metaval"
 	"github.com/haricheung/agentic-shell/internal/roles/perceiver"
 	"github.com/haricheung/agentic-shell/internal/roles/planner"
+	"github.com/haricheung/agentic-shell/internal/tasklog"
 	"github.com/haricheung/agentic-shell/internal/types"
 	"github.com/haricheung/agentic-shell/internal/ui"
 )
@@ -73,9 +74,12 @@ func main() {
 		resultCh <- types.FinalResult{TaskID: taskID, Summary: summary, Output: output}
 	}
 
+	// Per-task structured log registry — one JSONL file per task under tasks/
+	logReg := tasklog.NewRegistry(filepath.Join(cacheDir, "tasks"))
+
 	// Logical roles
-	plan := planner.New(b, llmClient)
-	mv := metaval.New(b, llmClient, outputFn)
+	plan := planner.New(b, llmClient, logReg)
+	mv := metaval.New(b, llmClient, outputFn, logReg)
 	exec := executor.New(b, llmClient)
 	av := agentval.New(b, llmClient)
 
@@ -119,7 +123,7 @@ func main() {
 	abortTaskCh := make(chan string, 4)
 
 	// Subtask dispatcher: subscribes to SubTask messages and spawns paired executor/agentval goroutines
-	go runSubtaskDispatcher(ctx, b, exec, av, abortTaskCh)
+	go runSubtaskDispatcher(ctx, b, exec, av, abortTaskCh, logReg)
 
 	// REPL or one-shot
 	if len(os.Args) > 1 && os.Args[1] != "" {
@@ -157,7 +161,7 @@ func main() {
 // started once the current group fully completes. Outputs from each completed group are
 // appended to the context of the next group so later subtasks can see earlier results
 // (e.g. a "locate file" subtask feeds its path to an "extract audio" subtask).
-func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Executor, av *agentval.AgentValidator, abortTaskCh <-chan string) {
+func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Executor, av *agentval.AgentValidator, abortTaskCh <-chan string, logReg *tasklog.Registry) {
 	manifestCh := b.Subscribe(types.MsgDispatchManifest)
 	subTaskCh := b.Subscribe(types.MsgSubTask)
 	execResultCh := b.Subscribe(types.MsgExecutionResult)
@@ -199,9 +203,10 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 
 		log.Printf("[DISPATCHER] spawning executor+agentval for subtask=%s (seq=%d)", st.SubTaskID, st.Sequence)
 		subTask := st
-		go exec.RunSubTask(td.ctx, subTask, correctionC)
+		tl := logReg.Get(subTask.ParentTaskID)
+		go exec.RunSubTask(td.ctx, subTask, correctionC, tl)
 		go func() {
-			outcome := av.Run(td.ctx, subTask, resultC, correctionC)
+			outcome := av.Run(td.ctx, subTask, resultC, correctionC, tl)
 			mu.Lock()
 			delete(states, subTask.SubTaskID)
 			mu.Unlock()

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/llm"
+	"github.com/haricheung/agentic-shell/internal/tasklog"
 	"github.com/haricheung/agentic-shell/internal/tools"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
@@ -75,10 +76,13 @@ func New(b *bus.Bus, llmClient *llm.Client) *Executor {
 // Run starts the executor goroutine listening for SubTask messages.
 // In the architecture, per-subtask executors are spawned by the planner.
 // This Run method handles a single SubTask channel for a dedicated goroutine.
-func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correctionCh <-chan types.CorrectionSignal) {
+// tlog may be nil — all TaskLog methods are nil-safe.
+func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correctionCh <-chan types.CorrectionSignal, tlog *tasklog.TaskLog) {
+	tlog.SubtaskBegin(subTask.SubTaskID, subTask.Intent, subTask.Sequence, subTask.SuccessCriteria)
+
 	var allToolCalls []string // accumulated across all attempts for correction context
 
-	result, toolCalls, err := e.execute(ctx, subTask, nil, nil)
+	result, toolCalls, err := e.execute(ctx, subTask, nil, nil, tlog)
 	allToolCalls = append(allToolCalls, toolCalls...)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -119,7 +123,7 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 				return
 			}
 			log.Printf("[R3] received CorrectionSignal attempt=%d for subtask=%s", correction.AttemptNumber, correction.SubTaskID)
-			result, toolCalls, err = e.execute(ctx, subTask, &correction, allToolCalls)
+			result, toolCalls, err = e.execute(ctx, subTask, &correction, allToolCalls, tlog)
 			allToolCalls = append(allToolCalls, toolCalls...)
 			if err != nil {
 				if ctx.Err() != nil {
@@ -175,7 +179,7 @@ type finalResult struct {
 	ToolCalls   []string `json:"tool_calls"`
 }
 
-func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *types.CorrectionSignal, priorToolCalls []string) (types.ExecutionResult, []string, error) {
+func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *types.CorrectionSignal, priorToolCalls []string, tlog *tasklog.TaskLog) (types.ExecutionResult, []string, error) {
 	wd, _ := os.Getwd()
 
 	if correction == nil {
@@ -210,7 +214,8 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			prompt += "\nYou have the tool output above. Output the final ExecutionResult JSON now (status=completed). Only make another tool call if the output above is genuinely insufficient."
 		}
 
-		raw, err := e.llm.Chat(ctx, systemPrompt, prompt)
+		raw, usage, err := e.llm.Chat(ctx, systemPrompt, prompt)
+		tlog.LLMCall("executor", systemPrompt, prompt, raw, usage.PromptTokens, usage.CompletionTokens, i+1)
 		if err != nil {
 			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("llm: %w", err)
 		}
@@ -263,17 +268,20 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			log.Printf("[R3] tool[%d] %s", i+1, tc.Tool)
 		}
 
+		tcInputJSON, _ := json.Marshal(tc)
 		result, err := e.runTool(ctx, tc)
 		if err != nil {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s ERROR: %v\n", tc.Tool, err))
 			log.Printf("[R3] tool[%d] → ERROR: %v", i+1, err)
 			// Append error evidence to tool_calls so R4a can verify
 			toolCallHistory[len(toolCallHistory)-1] += " → ERROR: " + firstN(err.Error(), 80)
+			tlog.ToolCall(st.SubTaskID, tc.Tool, string(tcInputJSON), "", err.Error())
 		} else {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, headTail(result, 4000)))
 			log.Printf("[R3] tool[%d] → %s", i+1, firstN(strings.TrimSpace(result), 500))
 			// Append output tail to tool_calls so R4a sees concrete evidence, not just a prose claim
 			toolCallHistory[len(toolCallHistory)-1] += " → " + lastN(strings.TrimSpace(result), 120)
+			tlog.ToolCall(st.SubTaskID, tc.Tool, string(tcInputJSON), firstN(strings.TrimSpace(result), 500), "")
 		}
 	}
 

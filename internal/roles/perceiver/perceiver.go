@@ -109,7 +109,7 @@ func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) 
 	if sessionContext != "" {
 		userPrompt = "Recent session history:\n" + sessionContext + "\n\nNew input: " + input
 	}
-	raw, err := p.llm.Chat(ctx, systemPrompt, userPrompt)
+	raw, _, err := p.llm.Chat(ctx, systemPrompt, userPrompt)
 	if err != nil {
 		return types.TaskSpec{}, false, "", err
 	}

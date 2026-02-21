@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/llm"
+	"github.com/haricheung/agentic-shell/internal/tasklog"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
@@ -50,9 +51,10 @@ type manifestTracker struct {
 
 // MetaValidator is R4b. It collects SubTaskOutcomes and merges results.
 type MetaValidator struct {
-	llm      *llm.Client
-	b        *bus.Bus
-	mu       sync.Mutex
+	llm    *llm.Client
+	b      *bus.Bus
+	logReg *tasklog.Registry
+	mu     sync.Mutex
 	trackers map[string]*manifestTracker // taskID -> tracker
 	// replanCounts tracks per-task correction history for gap_trend
 	replanCounts     map[string]int
@@ -62,10 +64,11 @@ type MetaValidator struct {
 }
 
 // New creates a MetaValidator.
-func New(b *bus.Bus, llmClient *llm.Client, outputFn func(taskID, summary string, output any)) *MetaValidator {
+func New(b *bus.Bus, llmClient *llm.Client, outputFn func(taskID, summary string, output any), logReg *tasklog.Registry) *MetaValidator {
 	return &MetaValidator{
 		llm:              llmClient,
 		b:                b,
+		logReg:           logReg,
 		trackers:         make(map[string]*manifestTracker),
 		replanCounts:     make(map[string]int),
 		prevFailedCounts: make(map[string]int),
@@ -186,7 +189,9 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		"TaskSpec (intent and constraints):\n%s\n\nSubTaskOutcomes (each carries its own success_criteria):\n%s\n\nAll subtasks matched. Merge their outputs into a single user-facing result.",
 		specJSON, outcomesJSON)
 
-	raw, err := m.llm.Chat(ctx, systemPrompt, userPrompt)
+	raw, usage, err := m.llm.Chat(ctx, systemPrompt, userPrompt)
+	tl := m.logReg.Get(taskID)
+	tl.LLMCall("metaval", systemPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
 	if err != nil {
 		log.Printf("[R4b] ERROR: LLM call failed: %v", err)
 		return
@@ -209,6 +214,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 	switch v.Verdict {
 	case "accept":
 		log.Printf("[R4b] task=%s ACCEPTED", taskID)
+		m.logReg.Close(taskID, "accepted") // write task_end and flush before delivering result
 
 		// Build meaningful tags from task intent for cross-task retrieval
 		intentTags := []string{"success", taskID}
@@ -290,8 +296,12 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 	replanCount := m.replanCounts[taskID]
 	m.mu.Unlock()
 
+	tl := m.logReg.Get(taskID)
+	tl.Replan(gapSummary, gapTrend, replanCount)
+
 	if replanCount >= maxReplans {
 		log.Printf("[R4b] task=%s ABANDONED after %d replan rounds", taskID, replanCount)
+		m.logReg.Close(taskID, "abandoned")
 		summary := fmt.Sprintf("❌ Task abandoned after %d failed attempts. %s", replanCount, gapSummary)
 		m.b.Publish(types.Message{
 			ID:        uuid.New().String(),
