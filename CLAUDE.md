@@ -95,7 +95,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/tasklog/tasklog.go` | Task log | `Registry` + nil-safe `TaskLog`; writes one JSONL per task to `tasks/<id>.jsonl`; events: task_begin/end, subtask_begin/end, llm_call (full prompts), tool_call, criterion_verdict, correction, replan |
 | `internal/roles/perceiver/` | R1 | Translates input → TaskSpec (short snake_case task_id; binary success_criteria); session-history aware |
 | `internal/roles/planner/` | R2 | TaskSpec → SubTask[]; queries memory first; assigns sequence numbers for dependency ordering; handles ReplanRequest; opens task log via `logReg.Open()` |
-| `internal/roles/executor/` | R3 | Executes one SubTask via numbered tool priority chain; correction-aware; `correctionPrompt` repeats format and tools; `headTail(result, 4000)` for tool result context; each `ToolCalls` entry includes `→ headTail(output, 240)` for R4a evidence (head+tail so both opening content and closing result are visible); logs LLM calls and tool calls to task log |
+| `internal/roles/executor/` | R3 | Executes one SubTask via numbered tool priority chain; correction-aware; `correctionPrompt` repeats format and tools; `headTail(result, 4000)` for tool result context; each `ToolCalls` entry includes `→ firstN(output, 200)` for R4a evidence (leading content is where search titles, file paths, and shell results appear); logs LLM calls and tool calls to task log |
 | `internal/roles/agentval/` | R4a | Scores ExecutionResult; drives retry loop; maxRetries=2; infrastructure errors → immediate fail; trusts `ToolCalls` output snippets as concrete evidence; logs criterion verdicts, corrections, subtask end to task log |
 | `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3; closes task log via `logReg.Close()` |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
@@ -141,7 +141,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 - May still use `find ~` via shell for personal file searches despite `mdfind` guidance → `redirectPersonalFind()` in `runTool` transparently rewrites these to `mdfind` calls at the code level; no prompt reinforcement needed
 - macOS Spotlight quirk: `mdfind -name 'file.mp4'` returns nothing for CJK filenames with extensions → `RunMdfind` retries with stem only and post-filters by extension
 - Long shell commands (e.g. ffmpeg) emit a large version/config banner before results; `headTail(result, 4000)` ensures the LLM sees both the beginning context and the end result even when total output exceeds 4000 chars
-- R4a will retry `status: completed` results if `ToolCalls` has no output evidence; the `→ headTail(output, 240)` snippet appended to each entry is the mechanism that prevents spurious retries (head captures titles/dates/snippets; tail captures final result)
+- R4a will retry `status: completed` results if `ToolCalls` has no output evidence; the `→ firstN(output, 200)` snippet appended to each entry is the mechanism that prevents spurious retries (leading content is where evidence lives for search, file, and shell tools)
 
 ## Memory System
 

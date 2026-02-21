@@ -11,7 +11,7 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 **Root cause**: The ToolCalls snippet was built with `lastN(result, 120)` — the last 120 chars of search output. For web search results, the useful content (article titles, dates, snippets) appears at the **beginning** of the output; the tail is typically URL metadata or closing JSON. R4a only sees the tail and correctly concludes there is no evidence.
 
-**Fix**: Changed `lastN(result, 120)` to `headTail(result, 240)` — the same head+tail helper already used for executor context. With 240 chars split 1/3 head + 2/3 tail, R4a sees both the opening content (titles, dates) and the closing result, giving it enough evidence to verify search-based claims.
+**Fix**: Changed `lastN(result, 120)` to `firstN(result, 200)`. Nearly all tool outputs (search titles/snippets, file paths, shell results) put the relevant content at the **start**, not the end. `lastN` was only correct for ffmpeg-style commands with banners before results — and those are already handled by `headTail` in the executor's 4000-char context window. The ToolCalls evidence snippet only needs the leading content.
 
 ---
 
