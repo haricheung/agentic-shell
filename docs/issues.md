@@ -5,6 +5,22 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #52 — No way to enforce cc as R2's brain model or switch at runtime
+
+**Symptom**: cc can only be an optional consultation tool called by the LLM brain; there is no way to make cc the primary planning engine, nor to switch between engines without restarting.
+
+**Root cause**: `Planner` struct had no `brainMode` concept — `dispatch()` always called `p.llm.Chat()`.
+
+**Fix**:
+- Added `brainMode string` + `sync.RWMutex` to `Planner`.
+- `New(... brainMode string)` — pass `"cc"` or `"llm"` (default); reads `R2_BRAIN` env var in `main.go`.
+- `SetBrainMode(mode string)` / `BrainMode() string` — thread-safe runtime switch.
+- `dispatch()` branches: `brainMode=="cc"` → `dispatchViaCCBrain()` (cc is primary, 120 s timeout); otherwise → `dispatchViaLLM()` (existing loop with optional cc consultation).
+- `DispatchManifest.PlannerBrain` field propagated to UI: "via brain", "via brain + cc (N)", or "via cc (brain)".
+- `/brain [cc|llm]` REPL command shows or switches the engine at runtime.
+
+---
+
 ## Issue #51 — No UI visibility into whether R2 used brain model or cc for planning
 
 **Symptom**: `DispatchManifest` line in pipeline always reads "N subtasks" — no indication of whether R2 called cc or planned with the brain model directly.

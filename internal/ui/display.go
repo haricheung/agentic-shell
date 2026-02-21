@@ -364,10 +364,14 @@ func msgDetail(msg types.Message) string {
 			if n != 1 {
 				subtaskStr = fmt.Sprintf("%d subtasks", n)
 			}
-			if m.CCCalls > 0 {
-				return fmt.Sprintf("%s | via cc (%d call)", subtaskStr, m.CCCalls)
+			switch {
+			case m.PlannerBrain == "cc":
+				return subtaskStr + " | via cc (brain)"
+			case m.CCCalls > 0:
+				return fmt.Sprintf("%s | via brain + cc (%d)", subtaskStr, m.CCCalls)
+			default:
+				return subtaskStr + " | via brain"
 			}
-			return subtaskStr + " | via brain"
 		}
 	case types.MsgReplanRequest:
 		var r types.ReplanRequest
