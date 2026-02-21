@@ -13,22 +13,22 @@ import (
 )
 
 const (
-	bochaAPIURL     = "https://api.bochaai.com/v1/web-search"
-	bochaMaxResults = 5
+	langSearchAPIURL = "https://api.langsearch.com/v1/web-search"
+	langSearchMax    = 5
 )
 
-// Search queries the Bocha web search API (api.bochaai.com) and returns a
-// formatted text summary. Requires BOCHA_API_KEY in the environment.
+// Search queries the LangSearch web search API (langsearch.com — free, no credit card).
+// Requires LANGSEARCH_API_KEY in the environment.
 //
 // Expectations:
-//   - Returns an error when BOCHA_API_KEY is not set
+//   - Returns an error when LANGSEARCH_API_KEY is not set
 //   - Returns a formatted result string when the API responds with webPages
 //   - Returns a "(no results)" message when webPages.value is empty
-//   - Caps output at bochaMaxResults results
+//   - Caps output at langSearchMax results
 func Search(ctx context.Context, query string) (string, error) {
-	apiKey := os.Getenv("BOCHA_API_KEY")
+	apiKey := os.Getenv("LANGSEARCH_API_KEY")
 	if apiKey == "" {
-		return "", fmt.Errorf("websearch: BOCHA_API_KEY not set")
+		return "", fmt.Errorf("websearch: LANGSEARCH_API_KEY not set")
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -38,13 +38,13 @@ func Search(ctx context.Context, query string) (string, error) {
 		"query":     query,
 		"freshness": "noLimit",
 		"summary":   false,
-		"count":     bochaMaxResults,
+		"count":     langSearchMax,
 	})
 	if err != nil {
 		return "", fmt.Errorf("websearch: marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, bochaAPIURL, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, langSearchAPIURL, bytes.NewReader(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("websearch: create request: %w", err)
 	}
@@ -66,46 +66,48 @@ func Search(ctx context.Context, query string) (string, error) {
 		return "", fmt.Errorf("websearch: HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result bochaResponse
+	var result langSearchResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("websearch: parse response: %w", err)
 	}
 
-	return formatBochaResult(query, &result), nil
+	return formatSearchResult(query, result.Data.WebPages.Value), nil
 }
 
-type bochaResponse struct {
-	WebPages struct {
-		Value []bochaWebPage `json:"value"`
-	} `json:"webPages"`
+type langSearchResponse struct {
+	Data struct {
+		WebPages struct {
+			Value []searchPage `json:"value"`
+		} `json:"webPages"`
+	} `json:"data"`
 }
 
-type bochaWebPage struct {
+type searchPage struct {
 	Name          string `json:"name"`
 	URL           string `json:"url"`
 	Snippet       string `json:"snippet"`
 	Summary       string `json:"summary"`
-	SiteName      string `json:"siteName"`
 	DatePublished string `json:"datePublished"`
 }
 
-// formatBochaResult converts a Bocha API response into a readable text block.
+// formatSearchResult converts a list of search pages into a readable text block.
 //
 // Expectations:
 //   - Returns "(no results)" message when pages slice is empty
 //   - Includes title, snippet, and URL for each result
 //   - Prefers summary over snippet when summary is non-empty
-//   - Omits datePublished when empty
+//   - Includes YYYY-MM-DD date prefix on URL line when datePublished is non-empty
+//   - Omits date when datePublished is empty
 //   - Separates results with a blank line
-func formatBochaResult(query string, r *bochaResponse) string {
-	pages := r.WebPages.Value
+//   - Caps output at langSearchMax results
+func formatSearchResult(query string, pages []searchPage) string {
 	if len(pages) == 0 {
 		return fmt.Sprintf("No results found for: %q", query)
 	}
 
 	var sb strings.Builder
 	for i, p := range pages {
-		if i >= bochaMaxResults {
+		if i >= langSearchMax {
 			break
 		}
 		if i > 0 {
@@ -121,8 +123,8 @@ func formatBochaResult(query string, r *bochaResponse) string {
 			sb.WriteString(text)
 			sb.WriteString("\n")
 		}
-		if p.DatePublished != "" {
-			sb.WriteString(p.DatePublished[:10]) // YYYY-MM-DD only
+		if len(p.DatePublished) >= 10 {
+			sb.WriteString(p.DatePublished[:10])
 			sb.WriteString(" ")
 		}
 		sb.WriteString(p.URL)

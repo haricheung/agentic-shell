@@ -31,7 +31,7 @@ Copy one of the pre-configured env files to `.env` before running:
 
 Both use the OpenAI-compatible convention: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`.
 
-Add `BOCHA_API_KEY=<your-key>` to `.env` to enable the `search` tool (Bocha web search, accessible from mainland China). Get a key at https://open.bochaai.com.
+Add `LANGSEARCH_API_KEY=<your-key>` to `.env` to enable the `search` tool (LangSearch — free, no credit card, accessible from mainland China). Get a key at https://langsearch.com.
 
 ## Architecture
 
@@ -95,7 +95,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `applescript` | `script` | Control macOS apps (Mail, Calendar, Reminders, Messages, Music…); Calendar/Reminders sync to iPhone/iPad/Watch via iCloud |
 | `shortcuts` | `name`, `input` | Run a named Apple Shortcut (iCloud-synced; can trigger iPhone/Watch automations) |
 | `shell` | `command` | General bash; counting/aggregation (`wc -l`), not file discovery |
-| `search` | `query` | Bocha web search (`api.bochaai.com`); requires `BOCHA_API_KEY` in `.env` |
+| `search` | `query` | LangSearch web search (`api.langsearch.com`); requires `LANGSEARCH_API_KEY` in `.env` (free, no credit card) |
 
 **File search hierarchy**: `mdfind` for anything outside the project (user personal files) → `glob` for project files → `shell` only for operations neither handles.
 
