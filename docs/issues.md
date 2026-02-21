@@ -5,6 +5,20 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #53 — cc subprocess invocation fails inside a Claude Code session
+
+**Symptom**: `R2_BRAIN=cc` always errors with `[cc error: exit status 1]`; R2 cannot plan.
+
+**Root cause (two bugs)**:
+1. `CLAUDECODE` env var is set when agsh runs inside a Claude Code session; cc detects this and refuses to launch nested sessions.
+2. `cc` is a zsh alias (`https_proxy=… claude`), not a binary. `exec.Command("cc")` resolves to the system C compiler (`clang`), which rejects `--print` as an unknown flag.
+
+**Fix**:
+- `ccEnviron()` helper strips `CLAUDECODE` from the subprocess environment.
+- Both `runCC()` and `dispatchViaCCBrain()` now invoke `zsh -i -c 'cc --print "$AGSH_PROMPT"'` so shell aliases are loaded. Prompt is passed via `AGSH_PROMPT` env var to avoid shell injection.
+
+---
+
 ## Issue #52 — No way to enforce cc as R2's brain model or switch at runtime
 
 **Symptom**: cc can only be an optional consultation tool called by the LLM brain; there is no way to make cc the primary planning engine, nor to switch between engines without restarting.
