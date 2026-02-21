@@ -5,6 +5,21 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #49 — No UI visibility into whether R2 used cc or the brain model for planning
+
+**Symptom**: When R2 calls `cc`, the pipeline UI shows nothing — only the debug log reveals whether cc was consulted.
+
+**Root cause**: `MsgCCCall` / `MsgCCResponse` message types didn't exist. `runCC()` called the CLI and fed the result back silently with only `log.Printf`.
+
+**Fix**:
+- Added `MsgCCCall` and `MsgCCResponse` message types and `RoleCC = "cc"` role to `types.go`.
+- Added `CCCall` and `CCResponse` payload structs (task_id, call_n, max_n, prompt, chars, response preview).
+- `dispatch()` in `planner.go` now publishes `MsgCCCall` (R2 → cc) before `runCC()` and `MsgCCResponse` (cc → R2) after, carrying the 300-char response preview.
+- `display.go`: added `🤖` emoji for `RoleCC`; cyan color for both cc message types; spinner labels "🤖 consulting cc..." / "📐 planning with cc insight..."; detail lines show `call N/M: <prompt>` and `<chars> chars: <response preview>`.
+- `auditor.go`: added `MsgCCCall → {R2, cc}` and `MsgCCResponse → {cc, R2}` to `allowedPaths`.
+
+---
+
 ## Issue #48 — R2 has no way to consult a stronger model for complex planning
 
 **Symptom**: Brain model (deepseek-v3.2) must plan blindly — it cannot inspect the codebase, verify tool availability, or ask Claude for architectural insight before decomposing a task.

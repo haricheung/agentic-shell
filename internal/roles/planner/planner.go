@@ -416,10 +416,30 @@ func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt,
 				Prompt string `json:"prompt"`
 			}
 			if json.Unmarshal([]byte(trimmed), &act) == nil && act.Action == "call_cc" && act.Prompt != "" {
-				log.Printf("[R2] cc call %d/%d: %q", ccCalls+1, maxCCCalls, act.Prompt)
+				ccCalls++
+				log.Printf("[R2] cc call %d/%d: %q", ccCalls, maxCCCalls, act.Prompt)
+				p.b.Publish(types.Message{
+					ID:        uuid.New().String(),
+					Timestamp: time.Now().UTC(),
+					From:      types.RolePlanner,
+					To:        types.RoleCC,
+					Type:      types.MsgCCCall,
+					Payload:   types.CCCall{TaskID: spec.TaskID, CallN: ccCalls, MaxN: maxCCCalls, Prompt: act.Prompt},
+				})
 				ccOut := runCC(ctx, act.Prompt)
 				log.Printf("[R2] cc response (%d chars): %.300s", len(ccOut), ccOut)
-				ccCalls++
+				preview := ccOut
+				if len([]rune(preview)) > 300 {
+					preview = string([]rune(preview)[:300]) + "…"
+				}
+				p.b.Publish(types.Message{
+					ID:        uuid.New().String(),
+					Timestamp: time.Now().UTC(),
+					From:      types.RoleCC,
+					To:        types.RolePlanner,
+					Type:      types.MsgCCResponse,
+					Payload:   types.CCResponse{TaskID: spec.TaskID, CallN: ccCalls, Chars: len(ccOut), Response: preview},
+				})
 				ccHistory.WriteString(fmt.Sprintf("\n\n[cc call %d]\nQ: %s\nA: %s", ccCalls, act.Prompt, ccOut))
 				currentUser = userPrompt + ccHistory.String() + "\n\nNow output the final SubTask JSON array:"
 				continue

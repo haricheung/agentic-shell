@@ -15,6 +15,7 @@ const (
 	RoleMemory    Role = "R5"
 	RoleAuditor   Role = "R6"
 	RoleGGS       Role = "R7"
+	RoleCC        Role = "cc"  // synthetic role: Claude Code CLI invoked by R2
 )
 
 // MessageType identifies the payload type of a bus message
@@ -36,6 +37,8 @@ const (
 	MsgAuditReport      MessageType = "AuditReport"   // R6 → User: generated report
 	MsgPlanDirective    MessageType = "PlanDirective"    // R7 → R2: gradient-directed planning instruction
 	MsgOutcomeSummary   MessageType = "OutcomeSummary"   // R4b → R7: all subtasks matched; GGS delivers final result
+	MsgCCCall           MessageType = "CCCall"           // R2 → cc: R2 is about to call Claude Code CLI
+	MsgCCResponse       MessageType = "CCResponse"       // cc → R2: Claude Code CLI responded
 )
 
 // Message is the envelope for all inter-role communication on the bus
@@ -230,6 +233,22 @@ type FinalResult struct {
 	TaskID  string `json:"task_id"`
 	Summary string `json:"summary"`
 	Output  any    `json:"output"`
+}
+
+// CCCall is published by R2 just before invoking the Claude Code CLI.
+type CCCall struct {
+	TaskID string `json:"task_id"`
+	CallN  int    `json:"call_n"`  // 1-based call index within this planning session
+	MaxN   int    `json:"max_n"`   // maxCCCalls constant
+	Prompt string `json:"prompt"`  // the question sent to cc
+}
+
+// CCResponse is published by R2 after the Claude Code CLI replies.
+type CCResponse struct {
+	TaskID   string `json:"task_id"`
+	CallN    int    `json:"call_n"`
+	Chars    int    `json:"chars"`    // length of response in bytes
+	Response string `json:"response"` // first 300 chars for display; full response used internally
 }
 
 // Ensure time import is used
