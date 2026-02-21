@@ -5,6 +5,16 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #54 — R4a spuriously retries correct search results because ToolCalls snippet misses leading content
+
+**Symptom**: R4a returns `retry` for a correct, detailed search result (e.g. Trump China visit dates from Reuters/Al Jazeera). All criteria marked `met:false` with evidence "no extractable content about confirmed dates".
+
+**Root cause**: The ToolCalls snippet was built with `lastN(result, 120)` — the last 120 chars of search output. For web search results, the useful content (article titles, dates, snippets) appears at the **beginning** of the output; the tail is typically URL metadata or closing JSON. R4a only sees the tail and correctly concludes there is no evidence.
+
+**Fix**: Changed `lastN(result, 120)` to `headTail(result, 240)` — the same head+tail helper already used for executor context. With 240 chars split 1/3 head + 2/3 tail, R4a sees both the opening content (titles, dates) and the closing result, giving it enough evidence to verify search-based claims.
+
+---
+
 ## Issue #53 — cc subprocess invocation fails inside a Claude Code session
 
 **Symptom**: `R2_BRAIN=cc` always errors with `[cc error: exit status 1]`; R2 cannot plan.

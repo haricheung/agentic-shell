@@ -279,8 +279,10 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		} else {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, headTail(result, 4000)))
 			log.Printf("[R3] tool[%d] → %s", i+1, firstN(strings.TrimSpace(result), 500))
-			// Append output tail to tool_calls so R4a sees concrete evidence, not just a prose claim
-			toolCallHistory[len(toolCallHistory)-1] += " → " + lastN(strings.TrimSpace(result), 120)
+			// Append head+tail snippet to tool_calls so R4a sees concrete evidence.
+			// headTail(240) gives R4a both the opening content (titles, dates, snippets)
+			// and the closing content — lastN alone missed leading evidence in search results.
+			toolCallHistory[len(toolCallHistory)-1] += " → " + headTail(strings.TrimSpace(result), 240)
 			tlog.ToolCall(st.SubTaskID, tc.Tool, string(tcInputJSON), firstN(strings.TrimSpace(result), 500), "")
 		}
 	}
