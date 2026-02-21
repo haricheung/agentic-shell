@@ -34,6 +34,17 @@ Empty-result rule:
 - If task is to find/list items AND tool_calls show a real search ran AND result is empty → "matched". Absence is a valid answer.
 - Send "retry" for empty results ONLY if tool_calls is empty or the search target was clearly wrong (wrong directory, wrong pattern).
 
+Relative-date rule:
+- Web search results often show relative dates ("13 days ago", "5 months ago", "2 weeks ago"). TODAY'S DATE is provided in the user prompt.
+- ALWAYS resolve relative dates to absolute dates using today's date before evaluating any date-based criterion.
+- Example: if today is 2026-02-22 and a result shows "13 days ago" → that is 2026-02-09, which IS within the last 6 months.
+- "5 months ago" from 2026-02-22 → 2025-09-22, still within 6 months. Do not fail a criterion solely because dates are relative.
+
+URL-in-snippet rule:
+- Search result snippets often contain specific article URLs in the body text even when the result's top-level URL is a listing page (e.g. /latest/0, /tag/foo).
+- When evaluating URL criteria, scan BOTH the result URL field AND all URLs appearing in the snippet text.
+- A URL found in snippet text (e.g. "antirez.com/news/157") counts as a verifiable link even if the enclosing result URL is a listing page.
+
 Output — choose ONE. Always include criteria_results with one entry per success criterion.
 
 Gap closed:
@@ -270,7 +281,8 @@ func (a *AgentValidator) score(ctx context.Context, st types.SubTask, result typ
 	taskJSON, _ := json.MarshalIndent(st, "", "  ")
 	resultJSON, _ := json.MarshalIndent(result, "", "  ")
 
-	userPrompt := fmt.Sprintf("SubTask:\n%s\n\nExecutionResult:\n%s", taskJSON, resultJSON)
+	today := time.Now().UTC().Format("2006-01-02")
+	userPrompt := fmt.Sprintf("Today's date: %s\n\nSubTask:\n%s\n\nExecutionResult:\n%s", today, taskJSON, resultJSON)
 
 	raw, usage, err := a.llm.Chat(ctx, systemPrompt, userPrompt)
 	tlog.LLMCall("agentval", systemPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
