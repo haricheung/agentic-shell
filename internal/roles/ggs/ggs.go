@@ -53,9 +53,13 @@ func New(b *bus.Bus, outputFn func(taskID, summary string, output any)) *GGS {
 	}
 }
 
-// Run listens for ReplanRequest messages from R4b and emits PlanDirective to R2.
+// Run listens for ReplanRequest and OutcomeSummary messages from R4b.
+// ReplanRequest → compute loss + gradient → emit PlanDirective (or abandon).
+// OutcomeSummary → all subtasks matched → record final loss (D=0) → emit FinalResult.
+// GGS is always in the medium loop; it is never idle even on the happy path.
 func (g *GGS) Run(ctx context.Context) {
 	replanCh := g.b.Subscribe(types.MsgReplanRequest)
+	acceptCh := g.b.Subscribe(types.MsgOutcomeSummary)
 	for {
 		select {
 		case <-ctx.Done():
@@ -72,6 +76,18 @@ func (g *GGS) Run(ctx context.Context) {
 			log.Printf("[R7] received ReplanRequest task=%s gap=%q corrections=%d elapsed=%dms",
 				rr.TaskID, rr.GapSummary, rr.CorrectionCount, rr.ElapsedMs)
 			go g.process(ctx, rr)
+		case msg, ok := <-acceptCh:
+			if !ok {
+				return
+			}
+			os, err := toOutcomeSummary(msg.Payload)
+			if err != nil {
+				log.Printf("[R7] ERROR: bad OutcomeSummary: %v", err)
+				continue
+			}
+			log.Printf("[R7] received OutcomeSummary task=%s elapsed=%dms — D=0 accept path",
+				os.TaskID, os.ElapsedMs)
+			go g.processAccept(ctx, os)
 		}
 	}
 }
@@ -169,6 +185,65 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		Type:      types.MsgPlanDirective,
 		Payload:   pd,
 	})
+}
+
+// processAccept handles the happy-path case: all subtasks matched, R4b accepted.
+// GGS records the final loss (D=0) and delivers FinalResult to the user.
+// This keeps GGS in the medium loop even when no replanning is needed —
+// a proper closed-loop controller computes the error signal on every cycle,
+// including when the error is zero.
+//
+// Expectations:
+//   - D is always 0.0 (all subtasks matched)
+//   - Ω is computed from prior replan count + elapsed time (rewards fast, first-try solutions)
+//   - gradient is always "stable" (D=0 ≤ δ)
+//   - Emits MsgFinalResult to RoleUser with the merged output and summary
+//   - Calls outputFn so the REPL can display the result
+//   - Cleans up lPrev and replans state for the task
+func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
+	taskID := os.TaskID
+
+	g.mu.Lock()
+	lPrev, hasPrev := g.lPrev[taskID]
+	replanCount := g.replans[taskID] // 0 for first-try accepts; >0 if GGS directed prior replans
+	g.mu.Unlock()
+
+	// D=0: all subtasks matched. P=0.5: no failures → neutral. Ω: elapsed time + prior replans.
+	const D, P = 0.0, 0.5
+	Omega := computeOmega(replanCount, os.ElapsedMs)
+	L := computeLoss(D, P, Omega)
+
+	var gradL float64
+	if hasPrev {
+		gradL = L - lPrev // ∇L across rounds (e.g. L after first replan → 0 on final accept)
+	}
+	gradient := computeGradient(gradL, D) // always "stable": D=0 ≤ δ=0.3
+
+	log.Printf("[R7] task=%s ACCEPT D=0.000 P=0.500 Ω=%.3f L=%.3f ∇L=%.3f gradient=%s replans=%d",
+		taskID, Omega, L, gradL, gradient, replanCount)
+
+	// Clean up per-task state (task is done).
+	g.mu.Lock()
+	delete(g.lPrev, taskID)
+	delete(g.replans, taskID)
+	g.mu.Unlock()
+
+	// GGS is the sole emitter of FinalResult — consistent path for both accept and abandon.
+	g.b.Publish(types.Message{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now().UTC(),
+		From:      types.RoleGGS,
+		To:        types.RoleUser,
+		Type:      types.MsgFinalResult,
+		Payload: types.FinalResult{
+			TaskID:  taskID,
+			Summary: os.Summary,
+			Output:  os.MergedOutput,
+		},
+	})
+	if g.outputFn != nil {
+		g.outputFn(taskID, os.Summary, os.MergedOutput)
+	}
 }
 
 // computeD computes intent-result distance D ∈ [0, 1].
@@ -450,4 +525,13 @@ func toReplanRequest(payload any) (types.ReplanRequest, error) {
 	}
 	var rr types.ReplanRequest
 	return rr, json.Unmarshal(b, &rr)
+}
+
+func toOutcomeSummary(payload any) (types.OutcomeSummary, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return types.OutcomeSummary{}, err
+	}
+	var os types.OutcomeSummary
+	return os, json.Unmarshal(b, &os)
 }

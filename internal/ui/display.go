@@ -46,6 +46,7 @@ var msgColor = map[types.MessageType]string{
 	types.MsgSubTaskOutcome:   ansiMagenta,
 	types.MsgReplanRequest:    ansiRed,
 	types.MsgPlanDirective:    ansiYellow,
+	types.MsgOutcomeSummary:   ansiGreen,
 	types.MsgMemoryWrite:      ansiDim,
 	types.MsgMemoryRead:       ansiDim,
 	types.MsgMemoryResponse:   ansiDim,
@@ -61,6 +62,7 @@ var msgStatus = map[types.MessageType]string{
 	types.MsgSubTaskOutcome:   "🔮 evaluating outcomes...",
 	types.MsgReplanRequest:    "📈 computing gradient...",
 	types.MsgPlanDirective:    "📐 replanning with directive...",
+	types.MsgOutcomeSummary:   "📈 recording final loss...",
 	types.MsgMemoryWrite:      "💾 saving memory...",
 	types.MsgMemoryRead:       "💾 recalling...",
 	types.MsgMemoryResponse:   "📐 planning...",
@@ -367,6 +369,11 @@ func msgDetail(msg types.Message) string {
 		var pd types.PlanDirective
 		if remarshal(msg.Payload, &pd) == nil {
 			return fmt.Sprintf("%s | ∇L=%s Ω=%.0f%%", pd.Directive, pd.Gradient, pd.BudgetPressure*100)
+		}
+	case types.MsgOutcomeSummary:
+		var os types.OutcomeSummary
+		if remarshal(msg.Payload, &os) == nil && os.Summary != "" {
+			return clip(os.Summary, 50)
 		}
 	}
 	return ""

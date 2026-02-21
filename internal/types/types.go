@@ -34,7 +34,8 @@ const (
 	MsgFinalResult      MessageType = "FinalResult"
 	MsgAuditQuery       MessageType = "AuditQuery"    // User → R6: request an on-demand report
 	MsgAuditReport      MessageType = "AuditReport"   // R6 → User: generated report
-	MsgPlanDirective    MessageType = "PlanDirective" // R7 → R2: gradient-directed planning instruction
+	MsgPlanDirective    MessageType = "PlanDirective"    // R7 → R2: gradient-directed planning instruction
+	MsgOutcomeSummary   MessageType = "OutcomeSummary"   // R4b → R7: all subtasks matched; GGS delivers final result
 )
 
 // Message is the envelope for all inter-role communication on the bus
@@ -210,6 +211,18 @@ type GapTrendDist struct {
 type ConvergenceHealth struct {
 	AvgCorrectionCount   float64      `json:"avg_correction_count"`
 	GapTrendDistribution GapTrendDist `json:"gap_trend_distribution"`
+}
+
+// OutcomeSummary is produced by R4b when all subtasks matched and the LLM merge
+// verified all task criteria. R4b forwards it to R7 (GGS) so GGS can record the
+// final loss value, update L_prev, and deliver the result to the user.
+// This closes the medium loop on the happy path — GGS is always the decision-maker.
+type OutcomeSummary struct {
+	TaskID       string           `json:"task_id"`
+	Summary      string           `json:"summary"`       // one-sentence user-facing summary from R4b LLM merge
+	MergedOutput any              `json:"merged_output"` // combined user-facing result
+	ElapsedMs    int64            `json:"elapsed_ms"`    // wall-clock ms since task started; for Ω logging
+	Outcomes     []SubTaskOutcome `json:"outcomes"`      // full outcomes; GGS records final D/L
 }
 
 // FinalResult carries the merged result to the user

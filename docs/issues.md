@@ -27,6 +27,25 @@ Implemented the full v0.7 GGS spec:
 
 ---
 
+## Issue #44 — GGS idle on happy path: medium loop open on task acceptance
+
+**Symptom**
+On successful task completion (all subtasks matched), GGS (R7) was completely bypassed. R4b published `MsgFinalResult` directly to the user and called `outputFn` itself. The pipeline showed no R7 activity on the happy path, violating the "medium loop is complete" invariant from the v0.7 spec.
+
+**Root cause**
+`metaval.go` accept case (verdict="accept") published `MsgFinalResult` to `RoleUser` and called `outputFn`. GGS only ran when R4b's hard gate triggered a `ReplanRequest` (i.e., only on failure). A proper closed-loop controller computes the error signal on every cycle including when the error is zero (D=0).
+
+**Fix**
+- New `types.MsgOutcomeSummary` + `types.OutcomeSummary` struct. R4b sends this to R7 instead of publishing FinalResult directly.
+- R4b accept case: writes episodic memory (unchanged), then publishes `MsgOutcomeSummary` to GGS. No longer calls `outputFn` or publishes `MsgFinalResult`. Also fixed missing cleanup of `taskStart` and `replanCounts` on accept.
+- GGS `Run()`: subscribes to both `MsgReplanRequest` (failure path) and `MsgOutcomeSummary` (accept path).
+- GGS `processAccept()`: computes D=0, P=0.5, Ω from elapsed time + prior replans, logs final L/∇L, emits `MsgFinalResult` + calls `outputFn`. GGS is the sole emitter of FinalResult for both accept and abandon — consistent exit path.
+- Auditor: `MsgOutcomeSummary → {R4b, R7}` added to allowedPaths.
+- UI: `MsgOutcomeSummary` shown in pipeline flow (R4b ──[OutcomeSummary]──► R7) with green colour.
+- 4 new tests for `processAccept` in `ggs_test.go`.
+
+---
+
 ## Issue #1 — Executor returns wrong result: "No .go files found"
 
 **Symptom**

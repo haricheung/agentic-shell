@@ -1,9 +1,12 @@
 package ggs
 
 import (
+	"context"
 	"math"
 	"testing"
+	"time"
 
+	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
@@ -367,5 +370,88 @@ func TestComputeFailureClass_MixedWhenPEqualsHalf(t *testing.T) {
 	got := computeFailureClass(nil) // empty → P = 0.5
 	if got != "mixed" {
 		t.Errorf("expected mixed, got %q", got)
+	}
+}
+
+// ── processAccept ─────────────────────────────────────────────────────────────
+
+func TestProcessAccept_EmitsFinalResultWithCorrectPayload(t *testing.T) {
+	// Emits MsgFinalResult to RoleUser with summary and output from OutcomeSummary
+	b := bus.New()
+	tap := b.NewTap()
+	var gotSummary string
+	var gotOutput any
+	gs := New(b, func(_ string, summary string, output any) {
+		gotSummary = summary
+		gotOutput = output
+	})
+	os := types.OutcomeSummary{
+		TaskID:       "t1",
+		Summary:      "all done",
+		MergedOutput: "result data",
+		ElapsedMs:    5000,
+	}
+	gs.processAccept(context.Background(), os)
+
+	// Drain tap for FinalResult
+	timeout := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case msg := <-tap:
+			if msg.Type == types.MsgFinalResult {
+				if msg.From != types.RoleGGS || msg.To != types.RoleUser {
+					t.Errorf("expected From=R7 To=User, got From=%s To=%s", msg.From, msg.To)
+				}
+				if gotSummary != "all done" {
+					t.Errorf("outputFn summary: expected %q got %q", "all done", gotSummary)
+				}
+				if gotOutput != "result data" {
+					t.Errorf("outputFn output: expected %q got %v", "result data", gotOutput)
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for MsgFinalResult")
+		}
+	}
+}
+
+func TestProcessAccept_CleansUpPerTaskState(t *testing.T) {
+	// Removes lPrev and replans entries after accept
+	b := bus.New()
+	gs := New(b, nil)
+	gs.mu.Lock()
+	gs.lPrev["t2"] = 0.5
+	gs.replans["t2"] = 1
+	gs.mu.Unlock()
+
+	gs.processAccept(context.Background(), types.OutcomeSummary{TaskID: "t2"})
+
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if _, ok := gs.lPrev["t2"]; ok {
+		t.Error("expected lPrev[t2] to be deleted after accept")
+	}
+	if _, ok := gs.replans["t2"]; ok {
+		t.Error("expected replans[t2] to be deleted after accept")
+	}
+}
+
+func TestProcessAccept_DIsAlwaysZero(t *testing.T) {
+	// D=0 because all subtasks matched — computeD on matched outcomes returns 0
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched"},
+		{Status: "matched"},
+	}
+	if got := computeD(outcomes); got != 0.0 {
+		t.Errorf("expected D=0 for all-matched outcomes, got %f", got)
+	}
+}
+
+func TestProcessAccept_OmegaUsesElapsedTimeAndPriorReplans(t *testing.T) {
+	// Ω is non-zero even on first-try accept when significant time has elapsed
+	omega := computeOmega(0, timeBudgetMs/2) // 0 replans, half budget elapsed
+	if math.Abs(omega-w2*0.5) > 1e-9 {
+		t.Errorf("expected Ω=w2*0.5=%.3f, got %.3f", w2*0.5, omega)
 	}
 }

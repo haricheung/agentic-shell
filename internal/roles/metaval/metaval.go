@@ -207,7 +207,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 
 	switch v.Verdict {
 	case "accept":
-		log.Printf("[R4b] task=%s ACCEPTED", taskID)
+		log.Printf("[R4b] task=%s ACCEPTED — forwarding to R7 (GGS) for final loss record and delivery", taskID)
 		m.logReg.Close(taskID, "accepted") // write task_end and flush before delivering result
 
 		// Build meaningful tags from task intent for cross-task retrieval
@@ -220,7 +220,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 			}
 		}
 
-		// Write to memory
+		// Write to memory (R4b's responsibility; GGS does not write memory)
 		entry := types.MemoryEntry{
 			EntryID:   uuid.New().String(),
 			TaskID:    taskID,
@@ -243,28 +243,37 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 			Payload:   entry,
 		})
 
-		// Deliver final result
-		finalResult := types.FinalResult{
-			TaskID:  taskID,
-			Summary: v.Summary,
-			Output:  v.MergedOutput,
+		// Forward to GGS so it records the final loss (D=0) and delivers the result.
+		// GGS is the sole decision-maker in the medium loop — it closes the loop even
+		// on the happy path by computing L_t and updating L_prev before emitting FinalResult.
+		m.mu.Lock()
+		start, hasStart := m.taskStart[taskID]
+		outcomes := append([]types.SubTaskOutcome(nil), tracker.outcomes...)
+		m.mu.Unlock()
+		var elapsedMs int64
+		if hasStart {
+			elapsedMs = time.Since(start).Milliseconds()
 		}
 		m.b.Publish(types.Message{
 			ID:        uuid.New().String(),
 			Timestamp: time.Now().UTC(),
 			From:      types.RoleMetaVal,
-			To:        types.RoleUser,
-			Type:      types.MsgFinalResult,
-			Payload:   finalResult,
+			To:        types.RoleGGS,
+			Type:      types.MsgOutcomeSummary,
+			Payload: types.OutcomeSummary{
+				TaskID:       taskID,
+				Summary:      v.Summary,
+				MergedOutput: v.MergedOutput,
+				ElapsedMs:    elapsedMs,
+				Outcomes:     outcomes,
+			},
 		})
 
-		if m.outputFn != nil {
-			m.outputFn(taskID, v.Summary, v.MergedOutput)
-		}
-
-		// Clean up tracker
+		// Clean up tracker and per-task timing
 		m.mu.Lock()
 		delete(m.trackers, taskID)
+		delete(m.taskStart, taskID)
+		delete(m.replanCounts, taskID)
 		m.mu.Unlock()
 
 	case "replan":

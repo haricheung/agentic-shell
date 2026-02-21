@@ -169,7 +169,8 @@ func (a *Auditor) Run(ctx context.Context) {
 
 // allowed sender→receiver pairs per message type (enforces "Does NOT" boundaries).
 // v0.7: ReplanRequest now goes R4b→R7 (GGS), PlanDirective goes R7→R2.
-// FinalResult can come from R4b (maxReplans safety net) or R7 (Ω-abandon).
+// OutcomeSummary closes the loop on the happy path: R4b→R7 (GGS delivers FinalResult).
+// FinalResult: R7 on accept or abandon; R4b only for the maxReplans safety net.
 var allowedPaths = map[types.MessageType][]struct {
 	from types.Role
 	to   types.Role
@@ -182,6 +183,7 @@ var allowedPaths = map[types.MessageType][]struct {
 	types.MsgSubTaskOutcome:   {{types.RoleAgentVal, types.RoleMetaVal}},
 	types.MsgReplanRequest:    {{types.RoleMetaVal, types.RoleGGS}},
 	types.MsgPlanDirective:    {{types.RoleGGS, types.RolePlanner}},
+	types.MsgOutcomeSummary:   {{types.RoleMetaVal, types.RoleGGS}},
 	types.MsgMemoryWrite:      {{types.RoleMetaVal, types.RoleMemory}},
 	types.MsgMemoryRead:       {{types.RolePlanner, types.RoleMemory}},
 	types.MsgMemoryResponse:   {{types.RoleMemory, types.RolePlanner}},
