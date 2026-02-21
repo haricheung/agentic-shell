@@ -77,7 +77,9 @@ type verdict struct {
 }
 
 // outcome builds a SubTaskOutcome carrying the original criteria so R4b can check them.
-func (a *AgentValidator) outcome(st types.SubTask, status string, output any, reason *string, traj []types.GapTrajectoryPoint) types.SubTaskOutcome {
+// toolCalls are the tool calls from the final execution attempt, forwarded to R7 (GGS)
+// so it can derive blocked_tools for break_symmetry/change_approach directives.
+func (a *AgentValidator) outcome(st types.SubTask, status string, output any, reason *string, traj []types.GapTrajectoryPoint, toolCalls []string) types.SubTaskOutcome {
 	return types.SubTaskOutcome{
 		SubTaskID:       st.SubTaskID,
 		ParentTaskID:    st.ParentTaskID,
@@ -87,6 +89,7 @@ func (a *AgentValidator) outcome(st types.SubTask, status string, output any, re
 		Output:          output,
 		FailureReason:   reason,
 		GapTrajectory:   traj,
+		ToolCalls:       toolCalls,
 	}
 }
 
@@ -124,6 +127,7 @@ func (a *AgentValidator) Run(
 
 	var trajectory []types.GapTrajectoryPoint
 	attempt := 0
+	var lastToolCalls []string // tool calls from the most recent ExecutionResult, forwarded to GGS
 
 	for {
 		// Wait for execution result
@@ -131,17 +135,18 @@ func (a *AgentValidator) Run(
 		select {
 		case <-ctx.Done():
 			reason := "context cancelled"
-			o := a.outcome(subTask, "failed", nil, &reason, trajectory)
+			o := a.outcome(subTask, "failed", nil, &reason, trajectory, lastToolCalls)
 			tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 			return o
 		case r, ok := <-resultCh:
 			if !ok {
 				reason := "result channel closed"
-				o := a.outcome(subTask, "failed", nil, &reason, trajectory)
+				o := a.outcome(subTask, "failed", nil, &reason, trajectory, lastToolCalls)
 				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 				return o
 			}
 			result = r
+			lastToolCalls = result.ToolCalls
 		}
 
 		attempt++
@@ -208,7 +213,7 @@ func (a *AgentValidator) Run(
 		switch v.Verdict {
 		case "matched":
 			log.Printf("[R4a] subtask=%s MATCHED on attempt=%d", subTask.SubTaskID, attempt)
-			o := a.outcome(subTask, "matched", result.Output, nil, trajectory)
+			o := a.outcome(subTask, "matched", result.Output, nil, trajectory, lastToolCalls)
 			tlog.SubtaskEnd(subTask.SubTaskID, "matched")
 			a.publish(o)
 			return o
@@ -217,7 +222,7 @@ func (a *AgentValidator) Run(
 			if attempt >= maxRetries {
 				log.Printf("[R4a] subtask=%s max retries reached, reporting failed", subTask.SubTaskID)
 				reason := fmt.Sprintf("max retries (%d) reached; last issue: %s", maxRetries, v.WhatWasWrong)
-				o := a.outcome(subTask, "failed", result.Output, &reason, trajectory)
+				o := a.outcome(subTask, "failed", result.Output, &reason, trajectory, lastToolCalls)
 				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 				a.publish(o)
 				return o
@@ -242,7 +247,7 @@ func (a *AgentValidator) Run(
 			case correctionCh <- correction:
 			case <-ctx.Done():
 				reason := "context cancelled during correction"
-				o := a.outcome(subTask, "failed", nil, &reason, trajectory)
+				o := a.outcome(subTask, "failed", nil, &reason, trajectory, lastToolCalls)
 				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 				return o
 			}
@@ -253,7 +258,7 @@ func (a *AgentValidator) Run(
 				reason = "validation failed"
 			}
 			log.Printf("[R4a] subtask=%s FAILED: %s", subTask.SubTaskID, reason)
-			o := a.outcome(subTask, "failed", result.Output, &reason, trajectory)
+			o := a.outcome(subTask, "failed", result.Output, &reason, trajectory, lastToolCalls)
 			tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 			a.publish(o)
 			return o

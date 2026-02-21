@@ -55,10 +55,9 @@ type MetaValidator struct {
 	b      *bus.Bus
 	logReg *tasklog.Registry
 	mu     sync.Mutex
-	trackers map[string]*manifestTracker // taskID -> tracker
-	// replanCounts tracks per-task correction history for gap_trend
-	replanCounts     map[string]int
-	prevFailedCounts map[string]int
+	trackers   map[string]*manifestTracker // taskID -> tracker
+	taskStart  map[string]time.Time        // taskID -> time first manifest was received
+	replanCounts map[string]int            // replan round counter for maxReplans safety net
 	// outputFn is called when a final result is ready for the user
 	outputFn func(taskID, summary string, output any)
 }
@@ -66,13 +65,13 @@ type MetaValidator struct {
 // New creates a MetaValidator.
 func New(b *bus.Bus, llmClient *llm.Client, outputFn func(taskID, summary string, output any), logReg *tasklog.Registry) *MetaValidator {
 	return &MetaValidator{
-		llm:              llmClient,
-		b:                b,
-		logReg:           logReg,
-		trackers:         make(map[string]*manifestTracker),
-		replanCounts:     make(map[string]int),
-		prevFailedCounts: make(map[string]int),
-		outputFn:         outputFn,
+		llm:          llmClient,
+		b:            b,
+		logReg:       logReg,
+		trackers:     make(map[string]*manifestTracker),
+		taskStart:    make(map[string]time.Time),
+		replanCounts: make(map[string]int),
+		outputFn:     outputFn,
 	}
 }
 
@@ -106,6 +105,10 @@ func (m *MetaValidator) Run(ctx context.Context) {
 				spec:          spec,
 				manifest:      manifest,
 				expectedCount: len(manifest.SubTaskIDs),
+			}
+			// Record start time on first manifest for GGS Ω elapsed time computation.
+			if _, seen := m.taskStart[manifest.TaskID]; !seen {
+				m.taskStart[manifest.TaskID] = time.Now().UTC()
 			}
 			m.mu.Unlock()
 			log.Printf("[R4b] tracking task=%s expecting %d outcomes", manifest.TaskID, len(manifest.SubTaskIDs))
@@ -154,18 +157,9 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		totalCorrections += len(o.GapTrajectory)
 	}
 
-	// Compute gap_trend
-	m.mu.Lock()
-	prevFailed := m.prevFailedCounts[taskID]
-	m.prevFailedCounts[taskID] = len(failedIDs)
-	replanCount := m.replanCounts[taskID]
-	m.mu.Unlock()
-
-	gapTrend := computeGapTrend(len(failedIDs), prevFailed, replanCount)
-
 	// Log the full criteria set R4b is evaluating against so it's auditable.
-	log.Printf("[R4b] task=%s evaluating %d outcomes (failed=%d gap_trend=%s)",
-		taskID, len(tracker.outcomes), len(failedIDs), gapTrend)
+	log.Printf("[R4b] task=%s evaluating %d outcomes (failed=%d)",
+		taskID, len(tracker.outcomes), len(failedIDs))
 	for _, o := range tracker.outcomes {
 		criteriaJSON, _ := json.Marshal(o.SuccessCriteria)
 		log.Printf("[R4b]   subtask=%s status=%s criteria=%s", o.SubTaskID, o.Status, criteriaJSON)
@@ -176,7 +170,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 	// it cannot override a failed status by reasoning about "overall goal".
 	if len(failedIDs) > 0 {
 		log.Printf("[R4b] task=%s hard-gate REPLAN: %d failed subtask(s): %v", taskID, len(failedIDs), failedIDs)
-		m.triggerReplan(ctx, tracker, failedIDs, totalCorrections, gapTrend,
+		m.triggerReplan(ctx, tracker, failedIDs, totalCorrections,
 			fmt.Sprintf("%d subtask(s) failed: %v", len(failedIDs), failedIDs))
 		return
 	}
@@ -274,33 +268,41 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		m.mu.Unlock()
 
 	case "replan":
-		m.triggerReplan(ctx, tracker, failedIDs, totalCorrections, gapTrend, v.GapSummary)
+		m.triggerReplan(ctx, tracker, failedIDs, totalCorrections, v.GapSummary)
 	}
 }
 
 // triggerReplan handles the replan path for both the hard gate (code-enforced
 // failed subtask check) and the LLM-driven replan verdict. It writes a
-// procedural memory entry, publishes a ReplanRequest, and resets the tracker.
+// procedural memory entry, publishes a ReplanRequest to R7 (GGS), and resets
+// the tracker. In v0.7 GGS owns gradient computation; R4b delivers raw outcome data.
 //
 // Expectations:
-//   - Abandons and publishes FinalResult when replanCount >= maxReplans
+//   - Abandons and publishes FinalResult when replanCount >= maxReplans (safety net)
 //   - Writes a procedural MemoryEntry before publishing ReplanRequest
 //   - Resets tracker.outcomes so the next round starts clean
 //   - Increments replanCounts before checking the limit
-func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTracker, failedIDs []string, totalCorrections int, gapTrend, gapSummary string) {
+//   - Sends ReplanRequest to R7 (GGS), not R2 (Planner)
+//   - Includes full outcomes and elapsed_ms in ReplanRequest for GGS gradient computation
+func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTracker, failedIDs []string, totalCorrections int, gapSummary string) {
 	const maxReplans = 3
 	taskID := tracker.manifest.TaskID
 
 	m.mu.Lock()
 	m.replanCounts[taskID]++
 	replanCount := m.replanCounts[taskID]
+	start, hasStart := m.taskStart[taskID]
+	outcomes := append([]types.SubTaskOutcome(nil), tracker.outcomes...) // snapshot before reset
 	m.mu.Unlock()
 
 	tl := m.logReg.Get(taskID)
-	tl.Replan(gapSummary, gapTrend, replanCount)
+	tl.Replan(gapSummary, replanCount)
 
+	// Safety net: hard-abandon after maxReplans regardless of GGS directive.
+	// GGS should have issued abandon before this point via Ω ≥ 0.8, but this
+	// prevents infinite looping if GGS is slow or unavailable.
 	if replanCount >= maxReplans {
-		log.Printf("[R4b] task=%s ABANDONED after %d replan rounds", taskID, replanCount)
+		log.Printf("[R4b] task=%s ABANDONED (safety net) after %d replan rounds", taskID, replanCount)
 		m.logReg.Close(taskID, "abandoned")
 		summary := fmt.Sprintf("❌ Task abandoned after %d failed attempts. %s", replanCount, gapSummary)
 		m.b.Publish(types.Message{
@@ -317,7 +319,7 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 		m.mu.Lock()
 		delete(m.trackers, taskID)
 		delete(m.replanCounts, taskID)
-		delete(m.prevFailedCounts, taskID)
+		delete(m.taskStart, taskID)
 		m.mu.Unlock()
 		return
 	}
@@ -355,20 +357,28 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 		},
 	})
 
+	// Compute elapsed time for GGS Ω calculation.
+	var elapsedMs int64
+	if hasStart {
+		elapsedMs = time.Since(start).Milliseconds()
+	}
+
 	rr := types.ReplanRequest{
 		TaskID:          taskID,
 		GapSummary:      gapSummary,
 		FailedSubTasks:  failedIDs,
 		CorrectionCount: totalCorrections,
-		GapTrend:        gapTrend,
+		ElapsedMs:       elapsedMs,
+		Outcomes:        outcomes,
 		Recommendation:  "replan",
 	}
-	log.Printf("[R4b] task=%s requesting REPLAN round=%d gap=%q", taskID, replanCount, gapSummary)
+	log.Printf("[R4b] task=%s sending ReplanRequest to R7 (GGS) round=%d gap=%q elapsed=%dms",
+		taskID, replanCount, gapSummary, elapsedMs)
 	m.b.Publish(types.Message{
 		ID:        uuid.New().String(),
 		Timestamp: time.Now().UTC(),
 		From:      types.RoleMetaVal,
-		To:        types.RolePlanner,
+		To:        types.RoleGGS,
 		Type:      types.MsgReplanRequest,
 		Payload:   rr,
 	})
@@ -376,19 +386,6 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 	m.mu.Lock()
 	tracker.outcomes = nil
 	m.mu.Unlock()
-}
-
-func computeGapTrend(currentFailed, prevFailed, replanCount int) string {
-	if replanCount == 0 {
-		return "stable"
-	}
-	if currentFailed < prevFailed {
-		return "improving"
-	}
-	if currentFailed > prevFailed {
-		return "worsening"
-	}
-	return "stable"
 }
 
 func toDispatchManifest(payload any) (types.DispatchManifest, error) {

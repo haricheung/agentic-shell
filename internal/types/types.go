@@ -14,6 +14,7 @@ const (
 	RoleMetaVal   Role = "R4b"
 	RoleMemory    Role = "R5"
 	RoleAuditor   Role = "R6"
+	RoleGGS       Role = "R7"
 )
 
 // MessageType identifies the payload type of a bus message
@@ -31,8 +32,9 @@ const (
 	MsgMemoryRead       MessageType = "MemoryRead"
 	MsgMemoryResponse   MessageType = "MemoryResponse"
 	MsgFinalResult      MessageType = "FinalResult"
-	MsgAuditQuery       MessageType = "AuditQuery"  // User → R6: request an on-demand report
-	MsgAuditReport      MessageType = "AuditReport" // R6 → User: generated report
+	MsgAuditQuery       MessageType = "AuditQuery"    // User → R6: request an on-demand report
+	MsgAuditReport      MessageType = "AuditReport"   // R6 → User: generated report
+	MsgPlanDirective    MessageType = "PlanDirective" // R7 → R2: gradient-directed planning instruction
 )
 
 // Message is the envelope for all inter-role communication on the bus
@@ -102,7 +104,7 @@ type GapTrajectoryPoint struct {
 	UnmetCriteria []string `json:"unmet_criteria"`
 }
 
-// SubTaskOutcome is produced by R4a and consumed by R4b
+// SubTaskOutcome is produced by R4a and consumed by R4b and R7 (GGS)
 type SubTaskOutcome struct {
 	SubTaskID       string               `json:"subtask_id"`
 	ParentTaskID    string               `json:"parent_task_id"`
@@ -112,17 +114,40 @@ type SubTaskOutcome struct {
 	Output          any                  `json:"output"`
 	FailureReason   *string              `json:"failure_reason"`
 	GapTrajectory   []GapTrajectoryPoint `json:"gap_trajectory"`
+	ToolCalls       []string             `json:"tool_calls,omitempty"` // tool names used in final execution attempt; for GGS blocked_tools
 }
 
-// ReplanRequest is produced by R4b and consumed by R2 Planner
+// ReplanRequest is produced by R4b and consumed by R7 (GGS). GGS owns gradient computation.
 type ReplanRequest struct {
-	TaskID          string   `json:"task_id"`
-	MergedResult    any      `json:"merged_result"`
-	GapSummary      string   `json:"gap_summary"`
-	FailedSubTasks  []string `json:"failed_subtasks"`
-	CorrectionCount int      `json:"correction_count"`
-	GapTrend        string   `json:"gap_trend"` // "improving" | "stable" | "worsening"
-	Recommendation  string   `json:"recommendation"` // "replan" | "partial_replan" | "abandon"
+	TaskID          string           `json:"task_id"`
+	GapSummary      string           `json:"gap_summary"`
+	FailedSubTasks  []string         `json:"failed_subtasks"`
+	CorrectionCount int              `json:"correction_count"`
+	ElapsedMs       int64            `json:"elapsed_ms"`              // wall-clock ms since task started; for Ω computation
+	Outcomes        []SubTaskOutcome `json:"outcomes"`                // full outcome data for GGS gradient computation
+	Recommendation  string           `json:"recommendation"`          // "replan" | "abandon"
+}
+
+// LossBreakdown carries the GGS loss components for a replan round.
+type LossBreakdown struct {
+	D     float64 `json:"D"`     // intent-result distance [0,1]
+	P     float64 `json:"P"`     // process implausibility [0,1]
+	Omega float64 `json:"Omega"` // resource cost [0,1]
+	L     float64 `json:"L"`     // total weighted loss
+}
+
+// PlanDirective is produced by R7 (GGS) and consumed by R2 Planner.
+// It carries gradient-informed constraints so R2 can make a principled plan adjustment.
+type PlanDirective struct {
+	TaskID          string        `json:"task_id"`
+	Loss            LossBreakdown `json:"loss"`
+	Gradient        string        `json:"gradient"`          // "improving" | "stable" | "worsening" | "plateau"
+	Directive       string        `json:"directive"`         // "refine" | "change_path" | "change_approach" | "break_symmetry" | "abandon"
+	BlockedTools    []string      `json:"blocked_tools"`     // tools R2 must not use in next plan
+	FailedCriterion string        `json:"failed_criterion"`  // primary criterion driving D
+	FailureClass    string        `json:"failure_class"`     // "logical" | "environmental" | "mixed"
+	BudgetPressure  float64       `json:"budget_pressure"`   // Ω value for display
+	Rationale       string        `json:"rationale"`         // human-readable explanation; logged by Auditor
 }
 
 // MemoryEntry is written by R4b and read by R2

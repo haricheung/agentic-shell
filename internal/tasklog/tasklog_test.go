@@ -163,7 +163,7 @@ func TestTaskLog_NilReceiverNoops(t *testing.T) {
 	tl.ToolCall("s1", "shell", "ls", "file.go", "")
 	tl.CriterionVerdict("s1", "output contains path", true, "evidence", 1)
 	tl.Correction("s1", "wrong", "try this", 1)
-	tl.Replan("gap summary", "worsening", 1)
+	tl.Replan("gap summary", 1)
 }
 
 // --- TotalTokens ---

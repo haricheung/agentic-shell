@@ -299,14 +299,14 @@ func (tl *TaskLog) Correction(subtaskID, whatWasWrong, whatToDo string, attempt 
 }
 
 // Replan writes a replan event when R4b triggers a replanning round.
-func (tl *TaskLog) Replan(gapSummary, gapTrend string, replanRound int) {
+// gapTrend is omitted in v0.7+ (GGS owns gradient computation).
+func (tl *TaskLog) Replan(gapSummary string, replanRound int) {
 	if tl == nil {
 		return
 	}
 	tl.write(Event{
 		Kind:        KindReplan,
 		GapSummary:  gapSummary,
-		GapTrend:    gapTrend,
 		ReplanRound: replanRound,
 	})
 }

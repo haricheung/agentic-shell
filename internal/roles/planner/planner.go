@@ -65,20 +65,27 @@ Output ONLY a JSON array (no wrapper, no markdown, no prose):
 
 Generate a fresh UUID string for each subtask_id.`
 
-const replanPrompt = `You are R2 — Planner. A ReplanRequest has been received. Generate a revised decomposition that addresses the identified gaps.
+const planDirectivePrompt = `You are R2 — Planner. A PlanDirective from GGS (Goal Gradient Solver) requires a revised decomposition.
 
-ReplanRequest:
+PlanDirective:
 %s
 
 Original TaskSpec:
 %s
 
-Memory Constraints (code-derived — MUST NOT constraints are mandatory):
+Memory + GGS Constraints (code-derived — ALL constraints are mandatory):
 %s
 
+Directive semantics:
+- "refine": tighten parameters; keep the same approach. Loss is decreasing — you are on the right track.
+- "change_path": same tool sequence, different target/parameters. Environment blocked the path, not the logic.
+- "change_approach": use a clearly different tool class. The current approach is logically wrong.
+- "break_symmetry": the system is stuck in a local minimum. You MUST NOT reuse any tool in blocked_tools. Demand a novel approach unlike anything tried before.
+
 Rules:
-- Do NOT repeat the same approach that already failed (gap_summary and failed_subtasks describe what went wrong).
-- You MUST respect every MUST NOT constraint above — these record approaches that failed on prior tasks.
+- You MUST follow the directive field above — this overrides your own judgment about the best approach.
+- You MUST NOT use any tool listed in blocked_tools — this is code-enforced.
+- Do NOT repeat the failed subtask approach described in rationale.
 - Apply the same sequence, context, and decomposition rules as the initial plan.
 - Output ONLY a JSON array of SubTask objects as specified in your system prompt.`
 
@@ -94,10 +101,10 @@ func New(b *bus.Bus, llmClient *llm.Client, logReg *tasklog.Registry) *Planner {
 	return &Planner{llm: llmClient, b: b, logReg: logReg}
 }
 
-// Run listens for TaskSpec and ReplanRequest messages.
+// Run listens for TaskSpec and PlanDirective messages.
 func (p *Planner) Run(ctx context.Context) {
 	taskSpecCh := p.b.Subscribe(types.MsgTaskSpec)
-	replanCh := p.b.Subscribe(types.MsgReplanRequest)
+	directiveCh := p.b.Subscribe(types.MsgPlanDirective)
 	memoryCh := p.b.Subscribe(types.MsgMemoryResponse)
 
 	// pendingTaskSpecs holds the current TaskSpec awaiting planning
@@ -154,28 +161,24 @@ func (p *Planner) Run(ctx context.Context) {
 				log.Printf("[R2] ERROR: planning failed: %v", err)
 			}
 
-		case msg, ok := <-replanCh:
+		case msg, ok := <-directiveCh:
 			if !ok {
 				return
 			}
-			rr, err := toReplanRequest(msg.Payload)
+			pd, err := toPlanDirective(msg.Payload)
 			if err != nil {
-				log.Printf("[R2] ERROR: bad ReplanRequest payload: %v", err)
+				log.Printf("[R2] ERROR: bad PlanDirective payload: %v", err)
 				continue
 			}
-			log.Printf("[R2] received ReplanRequest task_id=%s gap_trend=%s", rr.TaskID, rr.GapTrend)
-
-			if rr.Recommendation == "abandon" {
-				log.Printf("[R2] task %s: abandoning per ReplanRequest recommendation", rr.TaskID)
-				continue
-			}
+			log.Printf("[R2] received PlanDirective task_id=%s directive=%s gradient=%s Ω=%.3f",
+				pd.TaskID, pd.Directive, pd.Gradient, pd.BudgetPressure)
 
 			if currentSpec == nil {
-				log.Printf("[R2] WARNING: ReplanRequest received but no current TaskSpec")
+				log.Printf("[R2] WARNING: PlanDirective received but no current TaskSpec")
 				continue
 			}
 
-			if err := p.replan(ctx, *currentSpec, rr, memoryEntries); err != nil {
+			if err := p.replanWithDirective(ctx, *currentSpec, pd, memoryEntries); err != nil {
 				log.Printf("[R2] ERROR: replanning failed: %v", err)
 			}
 		}
@@ -202,16 +205,32 @@ func (p *Planner) plan(ctx context.Context, spec types.TaskSpec, memory []types.
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
 }
 
-func (p *Planner) replan(ctx context.Context, spec types.TaskSpec, rr types.ReplanRequest, memory []types.MemoryEntry) error {
+// replanWithDirective is called when R2 receives a PlanDirective from GGS (v0.7+).
+// It merges GGS blocked_tools into the MUST NOT constraint set and applies the directive.
+func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, pd types.PlanDirective, memory []types.MemoryEntry) error {
 	tl := p.logReg.Get(spec.TaskID) // log already open from initial plan()
 
-	rrJSON, _ := json.MarshalIndent(rr, "", "  ")
+	pdJSON, _ := json.MarshalIndent(pd, "", "  ")
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
+
+	// Merge memory-sourced constraints with GGS blocked_tools.
 	constraints := calibrate(memory, spec.Intent)
+	if len(pd.BlockedTools) > 0 {
+		ggsBlock := "MUST NOT (GGS blocked_tools — dynamic, for this task only):\n"
+		for _, t := range pd.BlockedTools {
+			ggsBlock += "  - Do not use tool: " + t + "\n"
+		}
+		if constraints == "" {
+			constraints = ggsBlock
+		} else {
+			constraints = ggsBlock + "\n" + constraints
+		}
+	}
 	if constraints == "" {
 		constraints = "(none)"
 	}
-	userPrompt := fmt.Sprintf(replanPrompt, rrJSON, specJSON, constraints)
+
+	userPrompt := fmt.Sprintf(planDirectivePrompt, pdJSON, specJSON, constraints)
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
 }
 
@@ -403,13 +422,13 @@ func toTaskSpec(payload any) (types.TaskSpec, error) {
 	return s, json.Unmarshal(b, &s)
 }
 
-func toReplanRequest(payload any) (types.ReplanRequest, error) {
+func toPlanDirective(payload any) (types.PlanDirective, error) {
 	b, err := json.Marshal(payload)
 	if err != nil {
-		return types.ReplanRequest{}, err
+		return types.PlanDirective{}, err
 	}
-	var r types.ReplanRequest
-	return r, json.Unmarshal(b, &r)
+	var pd types.PlanDirective
+	return pd, json.Unmarshal(b, &pd)
 }
 
 func toMemoryResponse(payload any) (types.MemoryResponse, error) {

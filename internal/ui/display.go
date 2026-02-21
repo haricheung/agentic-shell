@@ -33,6 +33,7 @@ var roleEmoji = map[types.Role]string{
 	types.RoleMetaVal:   "🔮",
 	types.RoleMemory:    "💾",
 	types.RoleAuditor:   "📡",
+	types.RoleGGS:       "📈",
 	types.RoleUser:      "👤",
 }
 
@@ -44,6 +45,7 @@ var msgColor = map[types.MessageType]string{
 	types.MsgCorrectionSignal: ansiRed,
 	types.MsgSubTaskOutcome:   ansiMagenta,
 	types.MsgReplanRequest:    ansiRed,
+	types.MsgPlanDirective:    ansiYellow,
 	types.MsgMemoryWrite:      ansiDim,
 	types.MsgMemoryRead:       ansiDim,
 	types.MsgMemoryResponse:   ansiDim,
@@ -57,7 +59,8 @@ var msgStatus = map[types.MessageType]string{
 	types.MsgExecutionResult:  "🔍 evaluating result...",
 	types.MsgCorrectionSignal: "⚙️  retrying...",
 	types.MsgSubTaskOutcome:   "🔮 evaluating outcomes...",
-	types.MsgReplanRequest:    "🔮 replanning...",
+	types.MsgReplanRequest:    "📈 computing gradient...",
+	types.MsgPlanDirective:    "📐 replanning with directive...",
 	types.MsgMemoryWrite:      "💾 saving memory...",
 	types.MsgMemoryRead:       "💾 recalling...",
 	types.MsgMemoryResponse:   "📐 planning...",
@@ -359,6 +362,11 @@ func msgDetail(msg types.Message) string {
 		var r types.ReplanRequest
 		if remarshal(msg.Payload, &r) == nil && r.GapSummary != "" {
 			return clip(r.GapSummary, 45)
+		}
+	case types.MsgPlanDirective:
+		var pd types.PlanDirective
+		if remarshal(msg.Payload, &pd) == nil {
+			return fmt.Sprintf("%s | ∇L=%s Ω=%.0f%%", pd.Directive, pd.Gradient, pd.BudgetPressure*100)
 		}
 	}
 	return ""

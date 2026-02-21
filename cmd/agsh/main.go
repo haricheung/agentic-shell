@@ -23,6 +23,7 @@ import (
 	"github.com/haricheung/agentic-shell/internal/roles/agentval"
 	"github.com/haricheung/agentic-shell/internal/roles/auditor"
 	"github.com/haricheung/agentic-shell/internal/roles/executor"
+	"github.com/haricheung/agentic-shell/internal/roles/ggs"
 	"github.com/haricheung/agentic-shell/internal/roles/memory"
 	"github.com/haricheung/agentic-shell/internal/roles/metaval"
 	"github.com/haricheung/agentic-shell/internal/roles/perceiver"
@@ -80,6 +81,7 @@ func main() {
 	// Logical roles
 	plan := planner.New(b, llmClient, logReg)
 	mv := metaval.New(b, llmClient, outputFn, logReg)
+	gs := ggs.New(b, outputFn) // R7 — Goal Gradient Solver; sits between R4b and R2
 	exec := executor.New(b, llmClient)
 	av := agentval.New(b, llmClient)
 
@@ -116,6 +118,7 @@ func main() {
 	go aud.Run(ctx)
 	go plan.Run(ctx)
 	go mv.Run(ctx)
+	go gs.Run(ctx)
 	go disp.Run(ctx)
 
 	// Task abort channel: REPL sends a taskID here when Ctrl+C is pressed mid-task.

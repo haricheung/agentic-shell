@@ -167,34 +167,43 @@ func (a *Auditor) Run(ctx context.Context) {
 	}
 }
 
-// allowed sender→receiver pairs per message type (enforces "Does NOT" boundaries)
-var allowedPaths = map[types.MessageType]struct {
+// allowed sender→receiver pairs per message type (enforces "Does NOT" boundaries).
+// v0.7: ReplanRequest now goes R4b→R7 (GGS), PlanDirective goes R7→R2.
+// FinalResult can come from R4b (maxReplans safety net) or R7 (Ω-abandon).
+var allowedPaths = map[types.MessageType][]struct {
 	from types.Role
 	to   types.Role
 }{
-	types.MsgTaskSpec:         {types.RolePerceiver, types.RolePlanner},
-	types.MsgSubTask:          {types.RolePlanner, types.RoleExecutor},
-	types.MsgDispatchManifest: {types.RolePlanner, types.RoleMetaVal},
-	types.MsgExecutionResult:  {types.RoleExecutor, types.RoleAgentVal},
-	types.MsgCorrectionSignal: {types.RoleAgentVal, types.RoleExecutor},
-	types.MsgSubTaskOutcome:   {types.RoleAgentVal, types.RoleMetaVal},
-	types.MsgReplanRequest:    {types.RoleMetaVal, types.RolePlanner},
-	types.MsgMemoryWrite:      {types.RoleMetaVal, types.RoleMemory},
-	types.MsgMemoryRead:       {types.RolePlanner, types.RoleMemory},
-	types.MsgMemoryResponse:   {types.RoleMemory, types.RolePlanner},
-	types.MsgFinalResult:      {types.RoleMetaVal, types.RoleUser},
+	types.MsgTaskSpec:         {{types.RolePerceiver, types.RolePlanner}},
+	types.MsgSubTask:          {{types.RolePlanner, types.RoleExecutor}},
+	types.MsgDispatchManifest: {{types.RolePlanner, types.RoleMetaVal}},
+	types.MsgExecutionResult:  {{types.RoleExecutor, types.RoleAgentVal}},
+	types.MsgCorrectionSignal: {{types.RoleAgentVal, types.RoleExecutor}},
+	types.MsgSubTaskOutcome:   {{types.RoleAgentVal, types.RoleMetaVal}},
+	types.MsgReplanRequest:    {{types.RoleMetaVal, types.RoleGGS}},
+	types.MsgPlanDirective:    {{types.RoleGGS, types.RolePlanner}},
+	types.MsgMemoryWrite:      {{types.RoleMetaVal, types.RoleMemory}},
+	types.MsgMemoryRead:       {{types.RolePlanner, types.RoleMemory}},
+	types.MsgMemoryResponse:   {{types.RoleMemory, types.RolePlanner}},
+	types.MsgFinalResult:      {{types.RoleMetaVal, types.RoleUser}, {types.RoleGGS, types.RoleUser}},
 }
 
 func (a *Auditor) process(msg types.Message) {
 	anomaly := "none"
 	var detail *string
 
-	// 1. Boundary violation check
-	if allowed, ok := allowedPaths[msg.Type]; ok {
-		if msg.From != allowed.from || msg.To != allowed.to {
+	// 1. Boundary violation check (any allowed path for this message type matches)
+	if allowedList, ok := allowedPaths[msg.Type]; ok {
+		matched := false
+		for _, allowed := range allowedList {
+			if msg.From == allowed.from && msg.To == allowed.to {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			anomaly = "boundary_violation"
-			d := fmt.Sprintf("expected %s→%s for %s, got %s→%s",
-				allowed.from, allowed.to, msg.Type, msg.From, msg.To)
+			d := fmt.Sprintf("unexpected %s→%s for %s", msg.From, msg.To, msg.Type)
 			detail = &d
 			log.Printf("[AUDIT] BOUNDARY VIOLATION: %s", d)
 			a.mu.Lock()
@@ -211,7 +220,8 @@ func (a *Auditor) process(msg types.Message) {
 		a.mu.Unlock()
 	}
 
-	// 3. Convergence failure checks on ReplanRequest
+	// 3. Track correction counts from ReplanRequest (R4b → R7).
+	//    Gradient tracking now happens from PlanDirective (R7 → R2) in step 4.
 	if msg.Type == types.MsgReplanRequest {
 		rr, err := toReplanRequest(msg.Payload)
 		if err == nil {
@@ -219,38 +229,50 @@ func (a *Auditor) process(msg types.Message) {
 			a.replanCounts[rr.TaskID]++
 			a.correctionCounts[rr.TaskID] += rr.CorrectionCount
 			a.totalCorrections += rr.CorrectionCount
-
-			switch rr.GapTrend {
-			case "improving":
-				a.gapTrends.Improving++
-			case "worsening":
-				a.gapTrends.Worsening++
-			default:
-				a.gapTrends.Stable++
-			}
 			a.mu.Unlock()
-
-			if rr.GapTrend == "worsening" {
-				anomaly = "convergence_failure"
-				d := fmt.Sprintf("task %s gap_trend=worsening correction_count=%d replan#%d",
-					rr.TaskID, rr.CorrectionCount, a.replanCounts[rr.TaskID])
-				detail = &d
-				log.Printf("[AUDIT] CONVERGENCE FAILURE: %s", d)
-				a.mu.Lock()
-				a.anomalies = append(a.anomalies, "convergence_failure: "+d)
-				a.mu.Unlock()
-			}
 
 			const thrashThreshold = 5
 			if rr.CorrectionCount >= thrashThreshold {
 				anomaly = "drift"
-				d := fmt.Sprintf("task %s correction_count=%d (thrashing threshold=%d)",
-					rr.TaskID, rr.CorrectionCount, thrashThreshold)
+				a.mu.Lock()
+				count := a.replanCounts[rr.TaskID]
+				a.mu.Unlock()
+				d := fmt.Sprintf("task %s correction_count=%d (thrashing threshold=%d) replan#%d",
+					rr.TaskID, rr.CorrectionCount, thrashThreshold, count)
 				detail = &d
 				log.Printf("[AUDIT] THRASHING DETECTED: %s", d)
 				a.mu.Lock()
 				a.driftAlerts = append(a.driftAlerts, d)
 				a.anomalies = append(a.anomalies, "drift: "+d)
+				a.mu.Unlock()
+			}
+		}
+	}
+
+	// 4. Track gradient and detect convergence failures from PlanDirective (R7 → R2).
+	//    In v0.7 GGS owns gradient computation; the Auditor reads it from PlanDirective.
+	if msg.Type == types.MsgPlanDirective {
+		pd, err := toPlanDirective(msg.Payload)
+		if err == nil {
+			a.mu.Lock()
+			switch pd.Gradient {
+			case "improving":
+				a.gapTrends.Improving++
+			case "worsening":
+				a.gapTrends.Worsening++
+			default: // "stable", "plateau"
+				a.gapTrends.Stable++
+			}
+			a.mu.Unlock()
+
+			if pd.Gradient == "worsening" {
+				anomaly = "convergence_failure"
+				d := fmt.Sprintf("task %s gradient=worsening directive=%s L=%.3f",
+					pd.TaskID, pd.Directive, pd.Loss.L)
+				detail = &d
+				log.Printf("[AUDIT] CONVERGENCE FAILURE: %s", d)
+				a.mu.Lock()
+				a.anomalies = append(a.anomalies, "convergence_failure: "+d)
 				a.mu.Unlock()
 			}
 		}
@@ -269,7 +291,8 @@ func (a *Auditor) process(msg types.Message) {
 	a.writeEvent(event)
 
 	// Persist stats only on messages that mutate them, not on every tap message.
-	if msg.Type == types.MsgDispatchManifest || msg.Type == types.MsgReplanRequest || anomaly != "none" {
+	if msg.Type == types.MsgDispatchManifest || msg.Type == types.MsgReplanRequest ||
+		msg.Type == types.MsgPlanDirective || anomaly != "none" {
 		a.saveStats()
 	}
 }
@@ -353,4 +376,13 @@ func toReplanRequest(payload any) (types.ReplanRequest, error) {
 	}
 	var rr types.ReplanRequest
 	return rr, json.Unmarshal(b, &rr)
+}
+
+func toPlanDirective(payload any) (types.PlanDirective, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return types.PlanDirective{}, err
+	}
+	var pd types.PlanDirective
+	return pd, json.Unmarshal(b, &pd)
 }

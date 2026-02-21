@@ -5,6 +5,28 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #43 — v0.7 GGS spec not implemented
+
+**Symptom**
+Medium loop lacked a controller: R4b sent plain "retry" signals to R2 with no directional content. R2 had no way to know whether to change tools, change paths, or give up. The gradient was never computed.
+
+**Root cause**
+R7 (Goal Gradient Solver) was deferred in v0.6. The loss function (D, P, Ω, L, ∇L) was designed but not implemented. R4b computed a naive `gap_trend` from failed-subtask count deltas; R2 self-directed replanning without gradient guidance.
+
+**Fix**
+Implemented the full v0.7 GGS spec:
+- New `internal/roles/ggs/` package (R7): subscribes to `MsgReplanRequest` (from R4b), computes D/P/Ω/L/∇L, selects directive from decision table, emits `MsgPlanDirective` to R2. Handles `abandon` (Ω ≥ 0.8) directly with FinalResult.
+- New `types.PlanDirective` + `types.LossBreakdown`; `types.ReplanRequest` updated (removed `GapTrend`, added `Outcomes []SubTaskOutcome`, `ElapsedMs int64`).
+- `SubTaskOutcome` gains `ToolCalls []string` so GGS can derive `blocked_tools` for `break_symmetry`/`change_approach` directives.
+- R4b (`metaval`): tracks task start time, sends `ReplanRequest` to R7 (not R2), includes full outcomes + elapsed_ms. Removed `computeGapTrend()` and `prevFailedCounts`. `maxReplans` kept as safety net.
+- R2 (`planner`): subscribes to `MsgPlanDirective` instead of `MsgReplanRequest`. Merges GGS `blocked_tools` with memory-sourced MUST NOT constraints. New `replanWithDirective()` replaces old `replan()`.
+- Auditor: `allowedPaths` updated (R4b→R7 for ReplanRequest, R7→R2 for PlanDirective). Reads gradient from PlanDirective instead of `ReplanRequest.GapTrend`.
+- UI: R7 emoji (📈), `MsgPlanDirective` color/label/detail added.
+- `tasklog.Replan()` signature simplified (removed `gapTrend` param).
+- 36 new tests in `ggs_test.go` covering all loss/gradient computation functions.
+
+---
+
 ## Issue #1 — Executor returns wrong result: "No .go files found"
 
 **Symptom**
