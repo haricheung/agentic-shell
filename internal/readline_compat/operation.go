@@ -287,7 +287,7 @@ func (o *Operation) ioloop() {
 				break
 			}
 
-			// treat as EOF
+			// Ctrl+D on empty line → treat as EOF (standard shell behaviour).
 			if !o.GetConfig().UniqueEditLine {
 				o.buf.WriteString(o.GetConfig().EOFPrompt + "\n")
 			}
@@ -297,6 +297,19 @@ func (o *Operation) ioloop() {
 			o.errchan <- io.EOF
 			if o.GetConfig().UniqueEditLine {
 				o.buf.Clean()
+			}
+
+		// Expectations:
+		//   - Deletes the character under the cursor when buffer is non-empty
+		//   - Bells (does nothing else) when buffer is empty — never sends io.EOF
+		case CharFwdDelete:
+			if o.buf.Len() > 0 || !o.IsNormalMode() {
+				o.t.KickRead()
+				if !o.buf.Delete() {
+					o.t.Bell()
+				}
+			} else {
+				o.t.Bell()
 			}
 		case CharInterrupt:
 			if o.IsSearchMode() {

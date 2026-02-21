@@ -54,6 +54,10 @@ const (
 	MetaDelete
 	MetaBackspace
 	MetaTranspose
+	// CharFwdDelete is the forward-delete key (\033[3~).
+	// Kept separate from CharDelete (Ctrl+D = 4) so pressing DEL on an
+	// empty line only bells, never triggers EOF / shell exit.
+	CharFwdDelete
 )
 
 // WaitForResume need to call before current process got suspend.
@@ -117,7 +121,9 @@ func escapeExKey(key *escapeKeyPair) rune {
 		r = CharLineEnd
 	case '~':
 		if key.attr == "3" {
-			r = CharDelete
+			// Forward-delete key (\033[3~).  Use CharFwdDelete, NOT CharDelete,
+			// so an empty line gets a bell rather than triggering shell exit.
+			r = CharFwdDelete
 		}
 	default:
 	}

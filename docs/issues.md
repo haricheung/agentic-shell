@@ -1164,3 +1164,32 @@ bad/good examples covering the three failure modes:
 - Not falsifiable without context
 Updated the JSON schema placeholder to `"<assertion checkable against tool
 output>"`.
+
+---
+
+## Issue #39 — Holding forward-delete (DEL) key exits the shell
+
+**Symptom**
+Holding the forward-delete (DEL) key while at the REPL prompt deleted
+characters normally until the buffer became empty, then printed `exit` to
+the terminal and exited the shell.
+
+**Root cause**
+`escapeExKey()` in `utils.go` decoded the forward-delete escape sequence
+`\033[3~` to `CharDelete = 4`, which is the same constant as Ctrl+D.
+In `operation.go`, `CharDelete` on an empty buffer is intentionally treated
+as EOF (matching standard shell Ctrl+D behaviour): it writes `EOFPrompt`
+(`"exit"`) to the terminal and sends `io.EOF` to the error channel, causing
+the REPL to exit.
+
+**Fix**
+Added a new constant `CharFwdDelete` (distinct rune value, separate from
+`CharDelete = 4`) and remapped `\033[3~` → `CharFwdDelete` in
+`escapeExKey()`. Added a corresponding `case CharFwdDelete:` in
+`operation.go` that deletes forward when buffer is non-empty and only bells
+when empty — never sends `io.EOF`.
+
+Files changed in `internal/readline_compat/`:
+- `utils.go` — new `CharFwdDelete` constant; `escapeExKey` remap
+- `operation.go` — new `case CharFwdDelete:` handler with Expectations comment
+- `fwddel_test.go` — 3 tests (constants distinct, mapping correct, no CharDelete)
