@@ -5,18 +5,13 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
-## Issue #50 — R4a fails date and URL criteria on web search results due to two blind spots
+## Issue #50 — R4a has no current date in context; cannot resolve relative dates
 
-**Symptom**: R4a fails criterion "at least one source is within the last 6 months" when search results show relative dates ("13 days ago", "5 months ago"), even though the dates clearly resolve to within 6 months. It also fails "verifiable URLs" when the snippet body contains a real permalink (e.g. `antirez.com/news/157`) but the result's top-level URL is a listing page (`/latest/0`).
+**Symptom**: R4a fails criterion "at least one source is within the last 6 months" when search results show relative dates ("13 days ago", "5 months ago"), even though the dates clearly resolve to within 6 months.
 
-**Root cause**:
-1. No current date in R4a's context — it cannot resolve relative dates to absolute dates.
-2. R4a only checked the result URL field, not URLs embedded in the snippet text.
+**Root cause**: No current date in R4a's context — it cannot resolve relative dates to absolute dates. The LLM either refuses to evaluate or defaults to a stale training date.
 
-**Fix**:
-- Injected `Today's date: YYYY-MM-DD` into every R4a user prompt via `time.Now().UTC().Format(...)`.
-- Added **Relative-date rule** to system prompt: resolve relative dates using today's date before evaluating any date-based criterion ("13 days ago" from 2026-02-22 = 2026-02-09, within 6 months → pass).
-- Added **URL-in-snippet rule**: scan both the result URL field AND URLs in snippet text; a URL found in the snippet body counts as a verifiable link even if the enclosing result URL is a listing page.
+**Fix**: Injected `Today's date: YYYY-MM-DD` into every R4a user prompt via `time.Now().UTC().Format("2006-01-02")`. This is a general mechanism — R4a already has the intelligence to resolve relative dates once it knows the current date; no domain-specific rules were added to the system prompt.
 
 ---
 
