@@ -5,25 +5,39 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
-## Issue #43 — v0.7 GGS spec not implemented
+## Issue #46 — GGS timeBudgetMs too tight; tasks abandoned at 91% Ω due to LLM latency
+
+**Symptom**: Tasks that ultimately succeed are abandoned mid-run with "budget pressure=91%". The abandon was triggered by the time sub-component of Ω alone: at elapsed=211 s with one replan, `Ω = 0.6*(1/3) + 0.4*(211845/120000) = 0.906 ≥ 0.8`.
+
+**Root cause**: `timeBudgetMs = 120_000` (2 min) doesn't account for real-world LLM call latency. With kimi-k2.5 / deepseek taking 5–15 s per call, a single subtask (5–6 executor tool calls + agentval + metaval + one replan cycle) routinely takes 3–5 minutes. The gradient calculation is correct; the budget constant was calibrated for a local model.
+
+**Fix**: Raised `timeBudgetMs` from `120_000` to `300_000` (5 min) in `internal/roles/ggs/ggs.go`.
+
+---
+
+## Issue #45 — All roles shared one LLM model; reasoning roles outperformed by cheaper execution models
 
 **Symptom**
-Medium loop lacked a controller: R4b sent plain "retry" signals to R2 with no directional content. R2 had no way to know whether to change tools, change paths, or give up. The gradient was never computed.
+Reasoning roles (R1/R2/R4b) and execution roles (R3/R4a) all used a single `OPENAI_MODEL`. On tasks requiring
+current knowledge (e.g. "today's top tech news"), R2 (planner) produced outdated results because the model
+lacked the capability for time-sensitive reasoning — yet the same model was used for tool invocation where
+capability matters less than speed and cost.
 
 **Root cause**
-R7 (Goal Gradient Solver) was deferred in v0.6. The loss function (D, P, Ω, L, ∇L) was designed but not implemented. R4b computed a naive `gap_trend` from failed-subtask count deltas; R2 self-directed replanning without gradient guidance.
+`llm.New()` read a single `OPENAI_MODEL` env variable. All five LLM-backed roles received the same client
+instance. There was no mechanism to assign a smarter model to reasoning roles and a faster/cheaper model to
+execution roles.
 
 **Fix**
-Implemented the full v0.7 GGS spec:
-- New `internal/roles/ggs/` package (R7): subscribes to `MsgReplanRequest` (from R4b), computes D/P/Ω/L/∇L, selects directive from decision table, emits `MsgPlanDirective` to R2. Handles `abandon` (Ω ≥ 0.8) directly with FinalResult.
-- New `types.PlanDirective` + `types.LossBreakdown`; `types.ReplanRequest` updated (removed `GapTrend`, added `Outcomes []SubTaskOutcome`, `ElapsedMs int64`).
-- `SubTaskOutcome` gains `ToolCalls []string` so GGS can derive `blocked_tools` for `break_symmetry`/`change_approach` directives.
-- R4b (`metaval`): tracks task start time, sends `ReplanRequest` to R7 (not R2), includes full outcomes + elapsed_ms. Removed `computeGapTrend()` and `prevFailedCounts`. `maxReplans` kept as safety net.
-- R2 (`planner`): subscribes to `MsgPlanDirective` instead of `MsgReplanRequest`. Merges GGS `blocked_tools` with memory-sourced MUST NOT constraints. New `replanWithDirective()` replaces old `replan()`.
-- Auditor: `allowedPaths` updated (R4b→R7 for ReplanRequest, R7→R2 for PlanDirective). Reads gradient from PlanDirective instead of `ReplanRequest.GapTrend`.
-- UI: R7 emoji (📈), `MsgPlanDirective` color/label/detail added.
-- `tasklog.Replan()` signature simplified (removed `gapTrend` param).
-- 36 new tests in `ggs_test.go` covering all loss/gradient computation functions.
+- `llm.NewTier(prefix string)`: reads `{prefix}_API_KEY`, `{prefix}_BASE_URL`, `{prefix}_MODEL`;
+  falls back to `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` for any unset var.
+  `New()` is kept as a backward-compatible wrapper (`NewTier("")`).
+- `main.go`: replaced single `llmClient` with `brainClient = NewTier("BRAIN")` (R1/R2/R4b)
+  and `toolClient = NewTier("TOOL")` (R3/R4a).
+- `.env` two-section layout: `[brain-model]` uses `BRAIN_API_KEY` / `BRAIN_BASE_URL` / `BRAIN_MODEL`;
+  `[tool-model]` uses `TOOL_MODEL`; shared `OPENAI_*` vars as fallback.
+- `CLAUDE.md`: documented the model tier split.
+- 3 new tests in `client_test.go` covering `NewTier` expectations.
 
 ---
 
@@ -43,6 +57,28 @@ On successful task completion (all subtasks matched), GGS (R7) was completely by
 - Auditor: `MsgOutcomeSummary → {R4b, R7}` added to allowedPaths.
 - UI: `MsgOutcomeSummary` shown in pipeline flow (R4b ──[OutcomeSummary]──► R7) with green colour.
 - 4 new tests for `processAccept` in `ggs_test.go`.
+
+---
+
+## Issue #43 — v0.7 GGS spec not implemented
+
+**Symptom**
+Medium loop lacked a controller: R4b sent plain "retry" signals to R2 with no directional content. R2 had no way to know whether to change tools, change paths, or give up. The gradient was never computed.
+
+**Root cause**
+R7 (Goal Gradient Solver) was deferred in v0.6. The loss function (D, P, Ω, L, ∇L) was designed but not implemented. R4b computed a naive `gap_trend` from failed-subtask count deltas; R2 self-directed replanning without gradient guidance.
+
+**Fix**
+Implemented the full v0.7 GGS spec:
+- New `internal/roles/ggs/` package (R7): subscribes to `MsgReplanRequest` (from R4b), computes D/P/Ω/L/∇L, selects directive from decision table, emits `MsgPlanDirective` to R2. Handles `abandon` (Ω ≥ 0.8) directly with FinalResult.
+- New `types.PlanDirective` + `types.LossBreakdown`; `types.ReplanRequest` updated (removed `GapTrend`, added `Outcomes []SubTaskOutcome`, `ElapsedMs int64`).
+- `SubTaskOutcome` gains `ToolCalls []string` so GGS can derive `blocked_tools` for `break_symmetry`/`change_approach` directives.
+- R4b (`metaval`): tracks task start time, sends `ReplanRequest` to R7 (not R2), includes full outcomes + elapsed_ms. Removed `computeGapTrend()` and `prevFailedCounts`. `maxReplans` kept as safety net.
+- R2 (`planner`): subscribes to `MsgPlanDirective` instead of `MsgReplanRequest`. Merges GGS `blocked_tools` with memory-sourced MUST NOT constraints. New `replanWithDirective()` replaces old `replan()`.
+- Auditor: `allowedPaths` updated (R4b→R7 for ReplanRequest, R7→R2 for PlanDirective). Reads gradient from PlanDirective instead of `ReplanRequest.GapTrend`.
+- UI: R7 emoji (📈), `MsgPlanDirective` color/label/detail added.
+- `tasklog.Replan()` signature simplified (removed `gapTrend` param).
+- 36 new tests in `ggs_test.go` covering all loss/gradient computation functions.
 
 ---
 

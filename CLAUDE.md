@@ -29,9 +29,28 @@ Copy one of the pre-configured env files to `.env` before running:
 - `.env` — Volcengine/Ark endpoint (`ark.cn-beijing.volces.com`)
 - `.env.ds` — DeepSeek API (`api.deepseek.com`)
 
-Both use the OpenAI-compatible convention: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`.
+All use the OpenAI-compatible convention: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` as shared fallbacks.
 
-Add `LANGSEARCH_API_KEY=<your-key>` to `.env` to enable the `search` tool (LangSearch — free, no credit card, accessible from mainland China). Get a key at https://langsearch.com.
+**Model tier split** — each tier reads `{TIER}_{API_KEY,BASE_URL,MODEL}`, falling back to the shared `OPENAI_*` var for any unset key:
+
+```
+# [brain-model] R1 Perceiver / R2 Planner / R4b MetaVal — reasoning
+BRAIN_API_KEY="..."    # optional — falls back to OPENAI_API_KEY
+BRAIN_BASE_URL="..."   # optional — falls back to OPENAI_BASE_URL
+BRAIN_MODEL="deepseek-reasoner"
+
+# [tool-model] R3 Executor / R4a AgentValidator — execution
+TOOL_MODEL="kimi-k2.5" # optional — falls back to OPENAI_MODEL
+
+# Shared fallback
+OPENAI_API_KEY="..."
+OPENAI_BASE_URL="..."
+OPENAI_MODEL="..."
+```
+
+Leave both tier sections unset to use a single model for all roles.
+
+The `search` tool uses DuckDuckGo HTML search (no API key required; proxy required from mainland China).
 
 ## Architecture
 
@@ -95,7 +114,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `applescript` | `script` | Control macOS apps (Mail, Calendar, Reminders, Messages, Music…); Calendar/Reminders sync to iPhone/iPad/Watch via iCloud |
 | `shortcuts` | `name`, `input` | Run a named Apple Shortcut (iCloud-synced; can trigger iPhone/Watch automations) |
 | `shell` | `command` | General bash; counting/aggregation (`wc -l`), not file discovery |
-| `search` | `query` | LangSearch web search (`api.langsearch.com`); requires `LANGSEARCH_API_KEY` in `.env` (free, no credit card) |
+| `search` | `query` | DuckDuckGo HTML search (no API key; proxy required from mainland China) |
 
 **File search hierarchy**: `mdfind` for anything outside the project (user personal files) → `glob` for project files → `shell` only for operations neither handles.
 

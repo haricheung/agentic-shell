@@ -55,8 +55,10 @@ func main() {
 	// Build the bus — foundational, everything depends on it
 	b := bus.New()
 
-	// LLM client — shared by all LLM-backed roles
-	llmClient := llm.New()
+	// LLM clients — each tier reads {TIER}_{API_KEY,BASE_URL,MODEL},
+	// falling back to the shared OPENAI_* vars for any unset tier variable.
+	brainClient := llm.NewTier("BRAIN") // R2 Planner only — needs reasoning/thinking
+	toolClient := llm.NewTier("TOOL")   // R1 Perceiver, R3 Executor, R4a AgentVal, R4b MetaVal
 
 	// Infrastructure roles
 	mem := memory.New(b, filepath.Join(cacheDir, "memory.json"))
@@ -79,11 +81,11 @@ func main() {
 	logReg := tasklog.NewRegistry(filepath.Join(cacheDir, "tasks"))
 
 	// Logical roles
-	plan := planner.New(b, llmClient, logReg)
-	mv := metaval.New(b, llmClient, outputFn, logReg)
+	plan := planner.New(b, brainClient, logReg)
+	mv := metaval.New(b, toolClient, outputFn, logReg)
 	gs := ggs.New(b, outputFn) // R7 — Goal Gradient Solver; sits between R4b and R2
-	exec := executor.New(b, llmClient)
-	av := agentval.New(b, llmClient)
+	exec := executor.New(b, toolClient)
+	av := agentval.New(b, toolClient)
 
 	// Context — cancelled on SIGTERM or when the current mode finishes.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -142,7 +144,7 @@ func main() {
 		}()
 
 		input := strings.Join(os.Args[1:], " ")
-		if err := runTask(ctx, b, llmClient, input, resultCh); err != nil {
+		if err := runTask(ctx, b, toolClient, input, resultCh); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			cancel()
 			os.Exit(1)
@@ -154,7 +156,7 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	} else {
 		// REPL mode
-		runREPL(ctx, b, llmClient, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh)
+		runREPL(ctx, b, toolClient, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh)
 	}
 }
 

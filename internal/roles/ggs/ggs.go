@@ -25,7 +25,7 @@ const (
 	epsilon       = 0.1   // plateau detection threshold for |∇L|
 	delta         = 0.3   // minimum D to trigger break_symmetry / change directives
 	abandonOmega  = 0.8   // Ω threshold above which directive becomes abandon regardless of gradient
-	timeBudgetMs  = 120_000 // default time budget per task (2 min)
+	timeBudgetMs  = 300_000 // default time budget per task (5 min)
 	maxReplansGGS = 3     // matches R4b's maxReplans; used in Ω computation
 )
 

@@ -14,10 +14,11 @@ import (
 
 // Client is an OpenAI-compatible LLM client.
 type Client struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	httpClient *http.Client
+	baseURL        string
+	apiKey         string
+	model          string
+	enableThinking bool // sends "enable_thinking":true in the request body (Kimi thinking mode)
+	httpClient     *http.Client
 }
 
 // normalizeBaseURL strips trailing slashes and the "/chat/completions" suffix
@@ -35,22 +36,53 @@ func normalizeBaseURL(raw string) string {
 	return strings.TrimSuffix(s, "/chat/completions")
 }
 
-// New creates a Client from environment variables:
-//   OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+// New creates a Client from the shared environment variables:
+//
+//	OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
 func New() *Client {
+	return NewTier("")
+}
+
+// NewTier creates a Client for a named tier (e.g. "BRAIN", "TOOL").
+// For each config key it first tries {prefix}_{KEY}; if unset it falls back
+// to the shared OPENAI_{KEY}. An empty prefix reads only the shared vars,
+// making it equivalent to New().
+//
+// Example — prefix "BRAIN" resolves credentials as:
+//
+//	BRAIN_API_KEY        → OPENAI_API_KEY
+//	BRAIN_BASE_URL       → OPENAI_BASE_URL
+//	BRAIN_MODEL          → OPENAI_MODEL
+//	BRAIN_ENABLE_THINKING (no fallback; defaults false)
+//
+// Expectations:
+//   - Uses {prefix}_API_KEY / _BASE_URL / _MODEL when set and non-empty
+//   - Falls back to OPENAI_* vars for any unset tier-specific var
+//   - Sets enableThinking when {prefix}_ENABLE_THINKING == "true"
+//   - Empty prefix reads only OPENAI_* (identical to New())
+func NewTier(prefix string) *Client {
+	get := func(suffix, fallback string) string {
+		if prefix != "" {
+			if v := os.Getenv(prefix + "_" + suffix); v != "" {
+				return v
+			}
+		}
+		return os.Getenv(fallback)
+	}
+	enableThinking := prefix != "" && os.Getenv(prefix+"_ENABLE_THINKING") == "true"
 	return &Client{
-		baseURL: normalizeBaseURL(os.Getenv("OPENAI_BASE_URL")),
-		apiKey:  os.Getenv("OPENAI_API_KEY"),
-		model:   os.Getenv("OPENAI_MODEL"),
-		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		baseURL:        normalizeBaseURL(get("BASE_URL", "OPENAI_BASE_URL")),
+		apiKey:         get("API_KEY", "OPENAI_API_KEY"),
+		model:          get("MODEL", "OPENAI_MODEL"),
+		enableThinking: enableThinking,
+		httpClient:     &http.Client{Timeout: 120 * time.Second},
 	}
 }
 
 type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []chatMsg `json:"messages"`
+	Model          string    `json:"model"`
+	Messages       []chatMsg `json:"messages"`
+	EnableThinking bool      `json:"enable_thinking,omitempty"`
 }
 
 type chatMsg struct {
@@ -85,6 +117,7 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, 
 			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		},
+		EnableThinking: c.enableThinking,
 	}
 
 	body, err := json.Marshal(payload)

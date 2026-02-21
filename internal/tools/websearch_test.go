@@ -70,15 +70,15 @@ func TestFormatSearchResult_IncludesDateWhenPresent(t *testing.T) {
 }
 
 func TestFormatSearchResult_CapsAtMaxResults(t *testing.T) {
-	// Caps output at langSearchMax results
-	pages := make([]searchPage, langSearchMax+3)
+	// Caps output at ddgMax results
+	pages := make([]searchPage, ddgMax+3)
 	for i := range pages {
 		pages[i] = searchPage{Name: "Title", URL: "https://a.com"}
 	}
 	got := formatSearchResult("query", pages)
 	count := strings.Count(got, "https://a.com")
-	if count != langSearchMax {
-		t.Errorf("expected %d results, got %d", langSearchMax, count)
+	if count != ddgMax {
+		t.Errorf("expected %d results, got %d", ddgMax, count)
 	}
 }
 
