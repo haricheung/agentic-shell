@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -388,6 +389,20 @@ func memTokenize(s string) []string {
 	return words
 }
 
+// ccEnviron returns os.Environ() with CLAUDECODE removed so that cc can
+// launch as a subprocess even when agsh itself is running inside a Claude Code
+// session (cc refuses to start when CLAUDECODE is set in the environment).
+func ccEnviron() []string {
+	env := os.Environ()
+	out := env[:0]
+	for _, e := range env {
+		if !strings.HasPrefix(e, "CLAUDECODE=") {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // runCC invokes the local Claude Code CLI ("cc --print <prompt>") and returns
 // its trimmed stdout as a plain string. It is used by R2 to consult Claude Code
 // during planning when the task involves code or file structure analysis.
@@ -397,10 +412,15 @@ func memTokenize(s string) []string {
 //   - Returns "[cc error: <msg>]" string (not a Go error) when cc is unavailable or exits non-zero
 //   - Truncates output at 4000 chars, appending "…" when trimmed
 //   - Respects ctx cancellation; times out after 60 s regardless
+//   - Unsets CLAUDECODE env var so cc can launch inside a Claude Code session
 func runCC(ctx context.Context, prompt string) string {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "cc", "--print", prompt).Output()
+	// Use zsh -i so shell aliases (e.g. cc=…claude) are loaded.
+	// Prompt is passed via AGSH_PROMPT to avoid any shell-injection risk.
+	cmd := exec.CommandContext(ctx, "zsh", "-i", "-c", `cc --print "$AGSH_PROMPT"`)
+	cmd.Env = append(ccEnviron(), "AGSH_PROMPT="+prompt)
+	out, err := cmd.Output()
 	if err != nil {
 		return fmt.Sprintf("[cc error: %v]", err)
 	}
@@ -495,7 +515,11 @@ func (p *Planner) dispatchViaCCBrain(ctx context.Context, spec types.TaskSpec, u
 
 	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(execCtx, "cc", "--print", fullPrompt).Output()
+	// Use zsh -i so shell aliases (e.g. cc=…claude) are loaded.
+	// Prompt is passed via AGSH_PROMPT to avoid any shell-injection risk.
+	cmd := exec.CommandContext(execCtx, "zsh", "-i", "-c", `cc --print "$AGSH_PROMPT"`)
+	cmd.Env = append(ccEnviron(), "AGSH_PROMPT="+fullPrompt)
+	out, err := cmd.Output()
 	var raw string
 	if err != nil {
 		log.Printf("[R2] cc-brain error: %v", err)
