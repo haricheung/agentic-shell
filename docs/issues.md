@@ -1193,3 +1193,37 @@ Files changed in `internal/readline_compat/`:
 - `utils.go` — new `CharFwdDelete` constant; `escapeExKey` remap
 - `operation.go` — new `case CharFwdDelete:` handler with Expectations comment
 - `fwddel_test.go` — 3 tests (constants distinct, mapping correct, no CharDelete)
+
+---
+
+## Issue #40 — Spinner repeats on same line when correction signal contains CJK text
+
+**Symptom**
+When R4a issued a correction signal with a CJK `WhatToDo` string (e.g. `重新执行read_file命令读取…`),
+the spinner line in the terminal repeated itself: each 80ms tick printed a new spinner frame
+concatenated onto the previous line instead of overwriting it:
+```
+⠼ ⚙️  retry 1 — 重新执行…⠴ ⚙️  retry 1 — 重新执行…⠦ ⚙️  retry 1 — ...
+```
+
+**Root cause**
+`clip(s, n)` in `display.go` counts **runes**, not **visual columns**. CJK characters occupy
+2 terminal columns each, so `clip(c.WhatToDo, 38)` allowed 38 CJK runes = 76 visual columns.
+With the `⚙️  retry N — ` prefix (~14 cols), the total spinner status reached ~90 columns,
+wrapping the line on an 80-column terminal.
+
+When a line wraps, `\r` (carriage return) only moves the cursor to the beginning of the
+**last** wrapped terminal line, not the first. `\033[K` (erase to end of line) then cleared
+only that partial line. The previous wrapped lines stayed on screen, and each tick appended
+another frame, creating the repeated concatenation effect.
+
+**Fix**
+Added `runeWidth(r rune) int` (returns 2 for CJK/wide Unicode blocks, 1 for others) and
+`clipCols(s string, cols int) string` (column-aware truncation) to `display.go`.
+Changed `dynamicStatus()` CorrectionSignal case to use `clipCols(c.WhatToDo, 38)` instead
+of `clip(c.WhatToDo, 38)`. With column-aware clipping, 38 CJK runes → capped at 19 runes
+(38 cols), keeping the total spinner line within 54 visual columns regardless of script.
+
+Files changed:
+- `internal/ui/display.go` — added `runeWidth`, `clipCols`; updated `dynamicStatus`
+- `internal/ui/display_test.go` — 8 new tests covering `runeWidth`, `clipCols`, and `dynamicStatus` CJK case

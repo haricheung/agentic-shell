@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mattn/go-runewidth"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
@@ -69,9 +70,12 @@ func dynamicStatus(msg types.Message) string {
 	case types.MsgCorrectionSignal:
 		var c types.CorrectionSignal
 		if remarshal(msg.Payload, &c) == nil && c.WhatToDo != "" {
-			// Clip to 38 chars: "⚙️  retry N — " prefix is ~14 cols, total ≤ 54 visible
-			// cols — safely fits without wrapping even in narrow terminals.
-			return fmt.Sprintf("⚙️  retry %d — %s", c.AttemptNumber, clip(c.WhatToDo, 38))
+			// clipCols(38): "⚙️  retry N — " prefix is ~14 visual cols; 38 more cols
+			// keeps total ≤ 54 cols — fits without wrapping even on narrow terminals.
+			// clipCols (not clip) is required: CJK chars are 2 cols each, so a
+			// rune-count clip would allow ~76 visual cols and trigger line-wrap,
+			// breaking the \r\033[K overwrite.
+			return fmt.Sprintf("⚙️  retry %d — %s", c.AttemptNumber, clipCols(c.WhatToDo, 38))
 		}
 	case types.MsgSubTaskOutcome:
 		var o types.SubTaskOutcome
@@ -360,13 +364,49 @@ func msgDetail(msg types.Message) string {
 	return ""
 }
 
-// clip truncates s to at most n characters, appending "…" if trimmed.
+// clip truncates s to at most n runes, appending "…" if trimmed.
+// Use clipCols when the string will appear on a terminal line that must not wrap.
 func clip(s string, n int) string {
 	runes := []rune(s)
 	if len(runes) <= n {
 		return s
 	}
 	return string(runes[:n]) + "…"
+}
+
+// runeWidth returns the number of terminal columns consumed by rune r.
+// Delegates to github.com/mattn/go-runewidth which implements the Unicode
+// East Asian Width property per UAX #11.
+//
+// Expectations:
+//   - ASCII runes (< 0x1100) always return 1
+//   - CJK Unified Ideographs (0x4E00–0x9FFF) return 2
+//   - Hangul Syllables (0xAC00–0xD7A3) return 2
+//   - Full-width Latin forms (0xFF01–0xFF60) return 2
+func runeWidth(r rune) int {
+	return runewidth.RuneWidth(r)
+}
+
+// clipCols truncates s so its visual column width does not exceed cols,
+// appending "…" if trimmed. CJK and other wide characters count as 2 columns.
+// Use this instead of clip() for strings that appear on a spinner line where
+// terminal wrapping would break the \r\033[K overwrite mechanism.
+//
+// Expectations:
+//   - Returns s unchanged when its column width is already ≤ cols
+//   - Stops at the rune boundary where adding the next rune would exceed cols
+//   - Appends "…" (1 column) only when truncation occurs
+//   - All-CJK input is truncated at cols/2 runes
+func clipCols(s string, cols int) string {
+	used := 0
+	for i, r := range s {
+		w := runewidth.RuneWidth(r)
+		if used+w > cols {
+			return s[:i] + "…"
+		}
+		used += w
+	}
+	return s
 }
 
 func remarshal(src, dst any) error {
