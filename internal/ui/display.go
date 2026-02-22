@@ -34,7 +34,6 @@ var roleEmoji = map[types.Role]string{
 	types.RoleMemory:    "💾",
 	types.RoleAuditor:   "📡",
 	types.RoleGGS:       "📈",
-	types.RoleCC:        "🤖",
 	types.RoleUser:      "👤",
 }
 
@@ -52,8 +51,6 @@ var msgColor = map[types.MessageType]string{
 	types.MsgMemoryRead:       ansiDim,
 	types.MsgMemoryResponse:   ansiDim,
 	types.MsgFinalResult:      ansiGreen,
-	types.MsgCCCall:           ansiCyan,
-	types.MsgCCResponse:       ansiCyan,
 }
 
 var msgStatus = map[types.MessageType]string{
@@ -69,8 +66,6 @@ var msgStatus = map[types.MessageType]string{
 	types.MsgMemoryWrite:      "💾 saving memory...",
 	types.MsgMemoryRead:       "💾 recalling...",
 	types.MsgMemoryResponse:   "📐 planning...",
-	types.MsgCCCall:           "🤖 consulting cc...",
-	types.MsgCCResponse:       "📐 planning with cc insight...",
 }
 
 // dynamicStatus returns a spinner label for msg, enriched with payload detail
@@ -360,18 +355,10 @@ func msgDetail(msg types.Message) string {
 		var m types.DispatchManifest
 		if remarshal(msg.Payload, &m) == nil {
 			n := len(m.SubTaskIDs)
-			subtaskStr := "1 subtask"
-			if n != 1 {
-				subtaskStr = fmt.Sprintf("%d subtasks", n)
+			if n == 1 {
+				return "1 subtask"
 			}
-			switch {
-			case m.PlannerBrain == "cc":
-				return subtaskStr + " | via cc (brain)"
-			case m.CCCalls > 0:
-				return fmt.Sprintf("%s | via brain + cc (%d)", subtaskStr, m.CCCalls)
-			default:
-				return subtaskStr + " | via brain"
-			}
+			return fmt.Sprintf("%d subtasks", n)
 		}
 	case types.MsgReplanRequest:
 		var r types.ReplanRequest
@@ -399,16 +386,6 @@ func msgDetail(msg types.Message) string {
 		var os types.OutcomeSummary
 		if remarshal(msg.Payload, &os) == nil && os.Summary != "" {
 			return clip(os.Summary, 50)
-		}
-	case types.MsgCCCall:
-		var c types.CCCall
-		if remarshal(msg.Payload, &c) == nil && c.Prompt != "" {
-			return fmt.Sprintf("call %d/%d: %s", c.CallN, c.MaxN, clip(c.Prompt, 40))
-		}
-	case types.MsgCCResponse:
-		var c types.CCResponse
-		if remarshal(msg.Payload, &c) == nil {
-			return fmt.Sprintf("%d chars: %s", c.Chars, clip(c.Response, 40))
 		}
 	}
 	return ""

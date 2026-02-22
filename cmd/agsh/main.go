@@ -81,12 +81,7 @@ func main() {
 	logReg := tasklog.NewRegistry(filepath.Join(cacheDir, "tasks"))
 
 	// Logical roles
-	// R2_BRAIN env var selects the planning engine: "cc" (default) or "llm" (faster, lower quality).
-	brainMode := os.Getenv("R2_BRAIN")
-	if brainMode == "" {
-		brainMode = "cc"
-	}
-	plan := planner.New(b, brainClient, logReg, brainMode)
+	plan := planner.New(b, brainClient, logReg)
 	mv := metaval.New(b, toolClient, outputFn, logReg)
 	gs := ggs.New(b, outputFn) // R7 — Goal Gradient Solver; sits between R4b and R2
 	exec := executor.New(b, toolClient)
@@ -161,7 +156,7 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	} else {
 		// REPL mode
-		runREPL(ctx, b, toolClient, plan, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh)
+		runREPL(ctx, b, toolClient, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh)
 	}
 }
 
@@ -409,7 +404,7 @@ type sessionEntry struct {
 	Summary string
 }
 
-func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, plan *planner.Planner, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string) {
+func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string) {
 	fmt.Println("\033[1m\033[36m⚡ agsh\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.cache/agsh/debug.log)\033[0m")
 
 	rl, err := readline.NewEx(&readline.Config{
@@ -493,21 +488,6 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, plan *plann
 		if input == "exit" || input == "quit" {
 			cancel()
 			break
-		}
-
-		// /brain [cc|llm] — show or switch R2's planning engine.
-		if input == "/brain" || strings.HasPrefix(input, "/brain ") {
-			args := strings.TrimPrefix(input, "/brain")
-			args = strings.TrimSpace(args)
-			if args == "" {
-				fmt.Printf("R2 brain: \033[1m%s\033[0m\n", plan.BrainMode())
-			} else if args == "cc" || args == "llm" {
-				plan.SetBrainMode(args)
-				fmt.Printf("R2 brain switched to \033[1m%s\033[0m\n", args)
-			} else {
-				fmt.Println("usage: /brain [cc|llm]")
-			}
-			continue
 		}
 
 		// /audit — request an on-demand audit report directly from R6, bypassing the pipeline.

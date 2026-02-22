@@ -5,11 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"os/exec"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,10 +16,7 @@ import (
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
-const (
-	maxMemoryEntries = 10
-	maxCCCalls       = 2 // max times R2 may call cc per planning session
-)
+const maxMemoryEntries = 10
 
 const systemPrompt = `You are R2 — Planner. Decompose a TaskSpec into the minimum necessary SubTask objects.
 
@@ -61,18 +55,6 @@ Task criteria rules (critical):
 Memory constraint rules (when a MEMORY CONSTRAINTS block is present):
 - Every "MUST NOT" line records an approach that failed before for a similar task. You MUST NOT use that approach regardless of how promising it seems.
 - Every "SHOULD PREFER" line records an approach that worked before. Prefer it over untested alternatives.
-
-OPTIONAL TOOL — cc (Claude Code):
-Before finalising the SubTask array you may consult the local Claude Code assistant when:
-- The task involves project code/files and you need to understand structure or APIs.
-- You are genuinely uncertain how to decompose a step correctly.
-- You want to verify that a proposed tool or command will work in this codebase.
-
-To call cc, output EXACTLY this JSON object (nothing else on the turn):
-{"action":"call_cc","prompt":"<your specific question>"}
-
-You will receive cc's response and may call it again (limit: 2 times total).
-Only call cc when it materially improves planning — skip it for simple tasks.
 
 When ready to finalise, output ONLY this JSON object (no markdown, no prose):
 {
@@ -118,37 +100,14 @@ Rules:
 
 // Planner is R2. It decomposes TaskSpec into SubTasks and handles replanning.
 type Planner struct {
-	llm       *llm.Client
-	b         *bus.Bus
-	logReg    *tasklog.Registry
-	mu        sync.RWMutex
-	brainMode string // "llm" (default) or "cc"
+	llm    *llm.Client
+	b      *bus.Bus
+	logReg *tasklog.Registry
 }
 
-// New creates a Planner. brainMode is "llm" or "cc"; empty defaults to "llm".
-func New(b *bus.Bus, llmClient *llm.Client, logReg *tasklog.Registry, brainMode string) *Planner {
-	if brainMode != "cc" {
-		brainMode = "llm"
-	}
-	return &Planner{llm: llmClient, b: b, logReg: logReg, brainMode: brainMode}
-}
-
-// SetBrainMode switches R2's planning engine at runtime. Accepted values: "llm", "cc".
-func (p *Planner) SetBrainMode(mode string) {
-	if mode != "cc" {
-		mode = "llm"
-	}
-	p.mu.Lock()
-	p.brainMode = mode
-	p.mu.Unlock()
-	log.Printf("[R2] brain mode switched to %q", mode)
-}
-
-// BrainMode returns the current planning engine ("llm" or "cc").
-func (p *Planner) BrainMode() string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.brainMode
+// New creates a Planner.
+func New(b *bus.Bus, llmClient *llm.Client, logReg *tasklog.Registry) *Planner {
+	return &Planner{llm: llmClient, b: b, logReg: logReg}
 }
 
 // Run listens for TaskSpec and PlanDirective messages.
@@ -400,154 +359,24 @@ func memTokenize(s string) []string {
 	return words
 }
 
-// ccEnviron returns os.Environ() with CLAUDECODE removed so that cc can
-// launch as a subprocess even when agsh itself is running inside a Claude Code
-// session (cc refuses to start when CLAUDECODE is set in the environment).
-func ccEnviron() []string {
-	env := os.Environ()
-	out := env[:0]
-	for _, e := range env {
-		if !strings.HasPrefix(e, "CLAUDECODE=") {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// runCC invokes the local Claude Code CLI ("cc --print <prompt>") and returns
-// its trimmed stdout as a plain string. It is used by R2 to consult Claude Code
-// during planning when the task involves code or file structure analysis.
+// dispatch drives the LLM planning loop.
 //
 // Expectations:
-//   - Returns trimmed stdout when cc exits successfully (exit code 0)
-//   - Returns "[cc error: <msg>]" string (not a Go error) when cc is unavailable or exits non-zero
-//   - Truncates output at 4000 chars, appending "…" when trimmed
-//   - Respects ctx cancellation; times out after 60 s regardless
-//   - Unsets CLAUDECODE env var so cc can launch inside a Claude Code session
-func runCC(ctx context.Context, prompt string) string {
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	// Use zsh -i so shell aliases (e.g. cc=…claude) are loaded.
-	// Prompt is passed via AGSH_PROMPT to avoid any shell-injection risk.
-	cmd := exec.CommandContext(ctx, "zsh", "-i", "-c", `cc --print "$AGSH_PROMPT"`)
-	cmd.Env = append(ccEnviron(), "AGSH_PROMPT="+prompt)
-	out, err := cmd.Output()
-	if err != nil {
-		return fmt.Sprintf("[cc error: %v]", err)
-	}
-	result := strings.TrimSpace(string(out))
-	if len(result) > 4000 {
-		result = result[:4000] + "…"
-	}
-	return result
-}
-
-// dispatch runs the brain LLM with an optional cc tool loop.
-// dispatch routes to the active brain: LLM (default) or cc.
+//   - Calls p.llm.Chat and parses the response as a SubTask plan
+//   - Retries are handled externally (replanning); this function runs once per plan attempt
 func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string, tl *tasklog.TaskLog) error {
-	p.mu.RLock()
-	brain := p.brainMode
-	p.mu.RUnlock()
-	if brain == "cc" {
-		return p.dispatchViaCCBrain(ctx, spec, userPrompt, sysPrompt)
-	}
-	return p.dispatchViaLLM(ctx, spec, userPrompt, sysPrompt, tl)
-}
-
-// dispatchViaLLM drives the LLM planning loop. The LLM may call cc up to
-// maxCCCalls times before producing the final SubTask array.
-//
-// Expectations:
-//   - Parses and emits SubTask array directly when LLM skips the cc tool
-//   - Calls runCC and feeds result back when LLM outputs {"action":"call_cc","prompt":"..."}
-//   - Hard-stops after maxCCCalls cc calls and requests final plan
-//   - Falls back to SubTask JSON parse when output does not match the cc action shape
-func (p *Planner) dispatchViaLLM(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string, tl *tasklog.TaskLog) error {
-	currentUser := userPrompt
-	var ccHistory strings.Builder
-	ccCalls := 0
-
-	for {
-		raw, usage, err := p.llm.Chat(ctx, sysPrompt, currentUser)
-		tl.LLMCall("planner", sysPrompt, currentUser, raw, usage.PromptTokens, usage.CompletionTokens, 0)
-		if err != nil {
-			return fmt.Errorf("llm: %w", err)
-		}
-		raw = llm.StripFences(raw)
-
-		// Attempt to detect a cc tool call before treating output as final plan.
-		trimmed := strings.TrimSpace(raw)
-		if !strings.HasPrefix(trimmed, "[") && ccCalls < maxCCCalls {
-			var act struct {
-				Action string `json:"action"`
-				Prompt string `json:"prompt"`
-			}
-			if json.Unmarshal([]byte(trimmed), &act) == nil && act.Action == "call_cc" && act.Prompt != "" {
-				ccCalls++
-				log.Printf("[R2] cc consultation %d/%d: %q", ccCalls, maxCCCalls, act.Prompt)
-				p.b.Publish(types.Message{
-					ID:        uuid.New().String(),
-					Timestamp: time.Now().UTC(),
-					From:      types.RolePlanner,
-					To:        types.RoleCC,
-					Type:      types.MsgCCCall,
-					Payload:   types.CCCall{TaskID: spec.TaskID, CallN: ccCalls, MaxN: maxCCCalls, Prompt: act.Prompt},
-				})
-				ccOut := runCC(ctx, act.Prompt)
-				log.Printf("[R2] cc response (%d chars): %.300s", len(ccOut), ccOut)
-				preview := ccOut
-				if len([]rune(preview)) > 300 {
-					preview = string([]rune(preview)[:300]) + "…"
-				}
-				p.b.Publish(types.Message{
-					ID:        uuid.New().String(),
-					Timestamp: time.Now().UTC(),
-					From:      types.RoleCC,
-					To:        types.RolePlanner,
-					Type:      types.MsgCCResponse,
-					Payload:   types.CCResponse{TaskID: spec.TaskID, CallN: ccCalls, Chars: len(ccOut), Response: preview},
-				})
-				ccHistory.WriteString(fmt.Sprintf("\n\n[cc call %d]\nQ: %s\nA: %s", ccCalls, act.Prompt, ccOut))
-				currentUser = userPrompt + ccHistory.String() + "\n\nNow output the final JSON wrapper object (task_criteria + subtasks):"
-				continue
-			}
-		}
-
-		// Final plan — parse and emit.
-		return p.emitSubTasks(spec, raw, ccCalls, "llm")
-	}
-}
-
-// dispatchViaCCBrain uses cc as the primary planning engine. The full system +
-// user prompt is passed to cc --print; the response is expected to be a SubTask JSON array.
-func (p *Planner) dispatchViaCCBrain(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string) error {
-	fullPrompt := sysPrompt + "\n\n" + userPrompt
-	log.Printf("[R2] cc-brain planning task=%s", spec.TaskID)
-	log.Printf("[R2] ── CC-BRAIN PROMPT ────────────────────────────\n%s\n── END CC-BRAIN PROMPT ─────────────────────────", fullPrompt)
-
-	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
-	// Use zsh -i so shell aliases (e.g. cc=…claude) are loaded.
-	// Prompt is passed via AGSH_PROMPT to avoid any shell-injection risk.
-	cmd := exec.CommandContext(execCtx, "zsh", "-i", "-c", `cc --print "$AGSH_PROMPT"`)
-	cmd.Env = append(ccEnviron(), "AGSH_PROMPT="+fullPrompt)
-	out, err := cmd.Output()
-	var raw string
+	raw, usage, err := p.llm.Chat(ctx, sysPrompt, userPrompt)
+	tl.LLMCall("planner", sysPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
 	if err != nil {
-		log.Printf("[R2] cc-brain error: %v", err)
-		raw = fmt.Sprintf("[cc error: %v]", err)
-	} else {
-		raw = strings.TrimSpace(string(out))
+		return fmt.Errorf("llm: %w", err)
 	}
-	raw = llm.StripFences(raw)
-	log.Printf("[R2] ── CC-BRAIN RESPONSE (%d chars) ─────────────────\n%s\n── END CC-BRAIN RESPONSE ───────────────────────", len(raw), raw)
-	return p.emitSubTasks(spec, raw, 0, "cc")
+	return p.emitSubTasks(spec, llm.StripFences(raw))
 }
 
-// emitSubTasks parses a raw SubTask plan (wrapper or array) and fans it out on the bus.
-// It first attempts to parse the new wrapper format {"task_criteria":[...],"subtasks":[...]};
-// if that fails it falls back to the legacy raw JSON array for backward compatibility.
-func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string, ccCalls int, plannerBrain string) error {
+// emitSubTasks parses a raw SubTask plan (wrapper or bare array) and fans it out on the bus.
+// It first attempts the wrapper format {"task_criteria":[...],"subtasks":[...]};
+// if that fails it falls back to a bare JSON array for backward compatibility.
+func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string) error {
 	var subTasks []types.SubTask
 	var taskCriteria []string
 
@@ -588,8 +417,6 @@ func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string, ccCalls int, pla
 		SubTaskIDs:   subtaskIDs,
 		TaskSpec:     &spec,
 		DispatchedAt: time.Now().UTC().Format(time.RFC3339),
-		PlannerBrain: plannerBrain,
-		CCCalls:      ccCalls,
 		TaskCriteria: taskCriteria,
 	}
 	p.b.Publish(types.Message{

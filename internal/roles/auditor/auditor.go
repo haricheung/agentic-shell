@@ -188,8 +188,6 @@ var allowedPaths = map[types.MessageType][]struct {
 	types.MsgMemoryRead:       {{types.RolePlanner, types.RoleMemory}},
 	types.MsgMemoryResponse:   {{types.RoleMemory, types.RolePlanner}},
 	types.MsgFinalResult:      {{types.RoleMetaVal, types.RoleUser}, {types.RoleGGS, types.RoleUser}},
-	types.MsgCCCall:           {{types.RolePlanner, types.RoleCC}},
-	types.MsgCCResponse:       {{types.RoleCC, types.RolePlanner}},
 }
 
 func (a *Auditor) process(msg types.Message) {

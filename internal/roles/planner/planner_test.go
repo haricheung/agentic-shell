@@ -1,8 +1,6 @@
 package planner
 
 import (
-	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -133,87 +131,6 @@ func TestEntrySummary_NoTagsNoPrefx(t *testing.T) {
 	got := entrySummary(e)
 	if strings.HasPrefix(got, "[tags:") {
 		t.Errorf("unexpected tag prefix for entry with no tags, got %q", got)
-	}
-}
-
-// --- runCC ---
-
-func TestRunCC_UnavailableReturnsErrorString(t *testing.T) {
-	// Returns "[cc error: <msg>]" string (not a Go error) when cc is unavailable or exits non-zero
-	got := runCC(context.Background(), "what is 2+2")
-	// cc binary absent in CI — should return an error string, not panic
-	if !strings.HasPrefix(got, "[cc error:") && len(got) == 0 {
-		t.Errorf("expected non-empty result, got %q", got)
-	}
-	// Must not panic and must return a string (either real output or error prefix)
-}
-
-func TestRunCC_TruncatesLongOutput(t *testing.T) {
-	// Truncates output at 4000 chars, appending "…" when trimmed
-	// Simulate by calling a command that produces long output; if cc absent, skip.
-	// We unit-test the truncation logic directly via the constant.
-	if maxCCCalls < 1 {
-		t.Fatal("maxCCCalls must be >= 1")
-	}
-	// Verify the constant is sane
-	if maxCCCalls > 10 {
-		t.Errorf("maxCCCalls=%d seems too high, expected <= 10", maxCCCalls)
-	}
-}
-
-// --- dispatch (cc tool loop) ---
-
-func TestDispatch_CCCallDetectedByActionField(t *testing.T) {
-	// Correctly identifies {"action":"call_cc","prompt":"..."} as a cc tool call
-	raw := `{"action":"call_cc","prompt":"what tools does this project use?"}`
-	trimmed := strings.TrimSpace(raw)
-	var act struct {
-		Action string `json:"action"`
-		Prompt string `json:"prompt"`
-	}
-	if err := json.Unmarshal([]byte(trimmed), &act); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-	if act.Action != "call_cc" {
-		t.Errorf("expected action=call_cc, got %q", act.Action)
-	}
-	if act.Prompt == "" {
-		t.Errorf("expected non-empty prompt")
-	}
-}
-
-func TestDispatch_ArrayOutputSkipsCCToolCall(t *testing.T) {
-	// A response starting with "[" is treated as final SubTask array, not a cc call
-	raw := `[{"subtask_id":"abc","intent":"do thing","sequence":1}]`
-	trimmed := strings.TrimSpace(raw)
-	if !strings.HasPrefix(trimmed, "[") {
-		t.Fatal("test setup error: raw should start with [")
-	}
-	// Verify that the detection logic (HasPrefix "[") routes correctly
-	isFinalPlan := strings.HasPrefix(trimmed, "[")
-	if !isFinalPlan {
-		t.Error("expected array output to be treated as final plan")
-	}
-}
-
-func TestDispatch_NonCCObjectFallsThroughToParse(t *testing.T) {
-	// A JSON object without action=call_cc falls through to SubTask parse
-	raw := `{"something":"else"}`
-	trimmed := strings.TrimSpace(raw)
-	var act struct {
-		Action string `json:"action"`
-		Prompt string `json:"prompt"`
-	}
-	_ = json.Unmarshal([]byte(trimmed), &act)
-	if act.Action == "call_cc" {
-		t.Error("non-cc object should not be treated as cc call")
-	}
-}
-
-func TestDispatch_MaxCCCallsConstantIsPositive(t *testing.T) {
-	// maxCCCalls must be >= 1 so R2 can call cc at least once
-	if maxCCCalls < 1 {
-		t.Errorf("maxCCCalls=%d must be >= 1", maxCCCalls)
 	}
 }
 

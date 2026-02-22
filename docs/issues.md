@@ -5,6 +5,16 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #55 — cc-as-brain removed; LLM restored as sole R2 brain
+
+**Symptom**: cc-brain mode (`R2_BRAIN=cc`) failed in two ways: (1) `cc --print` rejected inside Claude Code sessions due to the `CLAUDECODE` env var; (2) even after stripping that var, cc prepended reasoning prose before the JSON, defeating the `StripFences`-then-parse pipeline.
+
+**Root cause**: cc is a conversational assistant that cannot reliably be constrained to pure JSON output when called as a subprocess. The `cc` alias also cannot be invoked via `exec.Command` (it is a shell alias, not a binary).
+
+**Fix**: Removed all cc-related code entirely — `ccEnviron`, `runCC`, `dispatchViaCCBrain`, `SetBrainMode`, `BrainMode`, `brainMode` field, `mu` mutex, `maxCCCalls` constant, `MsgCCCall`/`MsgCCResponse` message types, `CCCall`/`CCResponse` payload structs, `RoleCC`, `PlannerBrain`/`CCCalls` manifest fields, `/brain` REPL command, cc sections in `display.go` and `auditor.go`. `dispatch()` is a single plain LLM call again.
+
+---
+
 ## Issue #54 — R4a spuriously retries correct search results because ToolCalls snippet misses leading content
 
 **Symptom**: R4a returns `retry` for a correct, detailed search result (e.g. Trump China visit dates from Reuters/Al Jazeera). All criteria marked `met:false` with evidence "no extractable content about confirmed dates".
