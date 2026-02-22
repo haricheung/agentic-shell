@@ -84,22 +84,32 @@ permitted — every message must be routable.
 
 ## R1 — Perceiver
 
-*(Unchanged from v0.6. Reproduced for completeness.)*
+**Mission**: Receive the user's signal and carry it into the system with full fidelity.
+R1 is a receiver, not a resolver. Its responsibility is to preserve the user's intent —
+including fuzziness — in structured form. Resolving ambiguity into a precise plan is R2's
+domain. R1 must not over-specify, elaborate, or pre-interpret what the user said.
 
-**Mission**: Faithfully translate raw user input into a structured intent specification.
-R1 is a transducer — it carries the user's signal into the system without interpretation
-or elaboration.
+**Clarification policy**: Ask the user a clarifying question ONLY when the input is so
+underspecified that no reasonable interpretation is possible (e.g. a single word with no
+context). Any fuzziness that R2 can reasonably resolve from planning-domain knowledge
+must pass through untouched. Over-asking erodes user trust and moves accountability for
+interpretation from R2 (where it belongs) to R1 (where it does not).
 
-**Does NOT**: Derive success criteria (R2). Access memory (R5). Elaborate the goal.
+**Reference signal**: `raw_input` preserves the user's original words verbatim. It is the
+independent reference signal for the entire task lifecycle — R2's interpretation
+(expressed as `task_criteria`) can always be compared against it to detect translation
+drift. R1 must not clean up, rephrase, or summarise `raw_input`.
+
+**Does NOT**: Resolve ambiguity (R2). Derive criteria (R2). Access memory (R5). Interpret intent.
 
 **Contract**: Receives free-text → produces `TaskSpec` JSON.
 
 ```json
 TaskSpec {
   "task_id":    "string",
-  "intent":     "string",
+  "intent":     "string",   // one-sentence faithful restatement; may still be fuzzy
   "constraints": { "scope": "string | null", "deadline": "ISO8601 | null" },
-  "raw_input":  "string"
+  "raw_input":  "string"    // verbatim — never summarised or rephrased
 }
 ```
 
@@ -107,10 +117,27 @@ TaskSpec {
 
 ## R2 — Planner
 
-**Mission**: Own the path from task specification to final result. If the overall goal is
-not achieved despite Executors performing correctly — because decomposition was wrong,
-sequencing was wrong, or prior failures and GGS directives were ignored — this role is
-accountable.
+**Mission**: Interpret the user's intent and own the path to its realisation. R2 is the
+"wise translator" — the first step is not to decompose but to understand. It reads the
+(possibly fuzzy) intent from `TaskSpec`, draws on memory of prior tasks, and produces a
+precise operational interpretation in the form of `task_criteria`. Decomposition follows
+from that interpretation. If the goal is not achieved — because interpretation was wrong,
+decomposition was wrong, sequencing was wrong, or GGS directives were ignored — this
+role is accountable.
+
+**Two-step operation**:
+1. **Interpret**: translate `TaskSpec.intent` into concrete, falsifiable `task_criteria`.
+   This is where fuzziness is resolved. The criteria are R2's commitment to what success
+   means — and the primary surface on which R4b will hold R2 accountable.
+2. **Decompose**: break the interpreted goal into the minimum set of `SubTask` objects
+   that, when executed and combined, satisfy the `task_criteria`.
+
+**Graceful failure (on GGS `abandon` directive)**: R2 must not produce a bare failure
+message. It must instead synthesise:
+- A partial result: what was actually accomplished across completed subtasks.
+- Next-move suggestions: 2–3 concrete actions the user could take to make progress,
+  given what failed and why.
+This turns the worst-case path from a dead end into a collaborative handoff.
 
 **Loop position**: Actuator of the medium loop. In v0.7 R2 no longer absorbs the
 controller role — that belongs to GGS. R2 receives a `PlanDirective` and executes it.
@@ -120,6 +147,7 @@ controller role — that belongs to GGS. R2 receives a `PlanDirective` and execu
 - `PlanDirective.blocked_tools` extends the MUST NOT set dynamically — same code-enforced plan validator applies
 - `PlanDirective.directive` field constrains what kind of change R2 must make (refine / change_approach / break_symmetry / abandon)
 - R2 may not override a `break_symmetry` directive by generating a near-identical plan
+- Graceful failure on `abandon`: partial result + next-move suggestions (deferred to v0.8 implementation)
 
 **Memory Calibration Protocol**: Unchanged from v0.6. Runs before every plan and replan.
 MUST NOT set = memory-sourced constraints ∪ GGS-sourced `blocked_tools`.
@@ -234,9 +262,28 @@ SubTaskOutcome {
 ## R4b — Meta-Validator
 
 **Mission**: Collect all `SubTaskOutcome` objects for a task, gate on all passing, merge
-passing outputs into a unified result, and verify the merged result against the original
-task criteria. If a partial or wrong result is accepted, or a task is silently abandoned,
-this role is accountable.
+passing outputs into a unified result, and verify the merged result against the task
+criteria written by R2. If a partial or wrong result is accepted, or a task is silently
+abandoned, this role is accountable.
+
+**Intelligence constraint**: R4b's reasoning capability must be **≥ R2's**. This is a
+structural requirement, not a preference.
+
+The reason: R4b is the independent check on R2's interpretation. R2 writes both the plan
+and the `task_criteria` — a less capable R4b can be outmaneuvered, accepting results that
+satisfy the letter of R2's criteria but not the spirit of the user's intent. The
+independence of the validation is only meaningful if the validator is at least as capable
+as the planner it is checking.
+
+**Bias asymmetry**: R2 must be optimistic and action-oriented to commit to a plan. R4b
+must be conservative and skeptical to protect result quality. The asymmetric cost makes
+this correct: a false-accept delivers a wrong result to the user (unrecoverable without
+user intervention); a false-replan wastes one round but the system corrects itself. When
+in doubt, R4b should reject.
+
+**Implication for model selection**: when assigning models to roles, R4b's model tier
+must be ≥ R2's. Deploying a cheaper model at R4b to save cost undermines the validation
+contract.
 
 **Loop position**: Sensor of the medium loop. Delivers raw outcome data to GGS on failure.
 
@@ -481,6 +528,8 @@ User
 | SubTask IDs are UUIDs assigned by Go runtime, never by LLM | Dispatcher |
 | TaskSpec carries no success_criteria — R2 derives all criteria | R1 prompt (field removed); R2 planner prompt |
 | task_criteria live in DispatchManifest as plain strings; R4b reads them from there | R2 wrapper output; R4b code |
+| R4b reasoning capability must be ≥ R2's — validator cannot be weaker than the planner it checks | Model selection policy |
+| R4b defaults to reject when evidence is ambiguous — false-replan is recoverable; false-accept is not | R4b LLM prompt |
 | R4b LLM is not invoked when any SubTaskOutcome.status == "failed" | R4b code gate |
 | R4b sends ReplanRequest to R7, never directly to R2 | R4b code |
 | R4a verdict is aggregation of per-criterion booleans; one false = failed | R4a scoring loop |
@@ -529,12 +578,14 @@ The Auditor's gap_trend data across sessions provides the signal for tuning.
 
 | Failure | Accountable Role |
 |---|---|
-| System acts on wrong or ambiguously specified intent | R1 Perceiver |
-| Success criteria wrong, vague, or not independently falsifiable | R2 Planner |
+| User's original intent not preserved faithfully; raw_input modified or clarification over-asked | R1 Perceiver |
+| Fuzzy intent mis-interpreted; task_criteria do not reflect what the user actually wanted | R2 Planner |
 | Goal not achieved despite correct execution; prior failures or GGS directives ignored | R2 Planner |
+| On abandon: bare failure message with no partial result or next-move suggestions | R2 Planner |
 | Feasible sub-task not correctly executed | R3 Executor |
 | Gap between sub-task output and goal goes unresolved or unreported | R4a Agent-Validator |
 | Failed subtask accepted as success; merged result fails task_criteria | R4b Meta-Validator |
+| task_criteria technically satisfied but user's intent (raw_input) not actually met | R4b Meta-Validator |
 | Replanning direction wrong; local minimum not escaped; budget misjudged | R7 GGS |
 | Data lost, corrupted, or wrongly retrieved | R5 Shared Memory |
 | Systematic failures go undetected and unreported to human operator | R6 Auditor |
