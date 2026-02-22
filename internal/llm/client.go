@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -17,7 +18,8 @@ type Client struct {
 	baseURL        string
 	apiKey         string
 	model          string
-	enableThinking bool // sends "enable_thinking":true in the request body (Kimi thinking mode)
+	label          string // tier name used in debug log lines (e.g. "R1", "BRAIN", "TOOL")
+	enableThinking bool   // sends "enable_thinking":true in the request body (Kimi thinking mode)
 	httpClient     *http.Client
 }
 
@@ -70,10 +72,15 @@ func NewTier(prefix string) *Client {
 		return os.Getenv(fallback)
 	}
 	enableThinking := prefix != "" && os.Getenv(prefix+"_ENABLE_THINKING") == "true"
+	label := prefix
+	if label == "" {
+		label = "LLM"
+	}
 	return &Client{
 		baseURL:        normalizeBaseURL(get("BASE_URL", "OPENAI_BASE_URL")),
 		apiKey:         get("API_KEY", "OPENAI_API_KEY"),
 		model:          get("MODEL", "OPENAI_MODEL"),
+		label:          label,
 		enableThinking: enableThinking,
 		httpClient:     &http.Client{Timeout: 120 * time.Second},
 	}
@@ -111,6 +118,9 @@ type chatResponse struct {
 
 // Chat sends a system + user prompt and returns the assistant's text response and token usage.
 func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, error) {
+	log.Printf("[%s] ── SYSTEM PROMPT ──────────────────────────────\n%s\n── END SYSTEM ──────────────────────────────────", c.label, system)
+	log.Printf("[%s] ── USER PROMPT ─────────────────────────────────\n%s\n── END USER ────────────────────────────────────", c.label, user)
+
 	payload := chatRequest{
 		Model: c.model,
 		Messages: []chatMsg{
@@ -161,7 +171,10 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, 
 		return "", Usage{}, fmt.Errorf("llm: no choices in response")
 	}
 
-	return chatResp.Choices[0].Message.Content, chatResp.Usage, nil
+	content := chatResp.Choices[0].Message.Content
+	log.Printf("[%s] ── RESPONSE (tokens: prompt=%d completion=%d) ──\n%s\n── END RESPONSE ────────────────────────────────",
+		c.label, chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, content)
+	return content, chatResp.Usage, nil
 }
 
 // StripFences removes markdown code fences (```json ... ```) from LLM output
