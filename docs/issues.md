@@ -1563,3 +1563,19 @@ Added loop detection in `executor.go` `Run()` method. Before executing each tool
 
 Files changed:
 - `internal/roles/executor/executor.go` — consecutive duplicate call detection and blocking
+
+---
+
+## Issue #59 — DDG search routed through CC internal proxy (port 26560), connection fails
+
+**Symptom**
+`search` tool always errors: `websearch: http request: Post "https://html.duckduckgo.com/html/": read tcp ...:55573->...:26560: connection reset by peer`. Port 26560 is Claude Code's internal proxy.
+
+**Root cause**
+`websearch.go` used `http.DefaultClient`, which inherits `HTTPS_PROXY` from the process environment. When `agsh` runs inside a Claude Code session, CC injects its own proxy into the environment. DDG must be reached directly; CC's proxy does not forward external traffic.
+
+**Fix**
+Replace `http.DefaultClient` with a package-level `ddgClient` that sets `Transport.Proxy` to a no-op function (`func(*http.Request) (*url.URL, error) { return nil, nil }`). This bypasses all proxy env vars for DDG requests only; the LLM client (which legitimately needs the proxy to reach the API) is unaffected.
+
+Files changed:
+- `internal/tools/websearch.go` — dedicated `ddgClient` with proxy disabled

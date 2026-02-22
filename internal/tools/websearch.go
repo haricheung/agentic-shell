@@ -16,6 +16,16 @@ const (
 	ddgMax       = 5
 )
 
+// ddgClient bypasses any HTTP_PROXY / HTTPS_PROXY env vars that may be set by
+// parent processes (e.g. Claude Code's internal proxy on port 26560).
+// DDG must be reached directly; routing it through the CC proxy fails.
+var ddgClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+	},
+}
+
 // Search queries DuckDuckGo HTML search. No API key required.
 //
 // Expectations:
@@ -24,9 +34,6 @@ const (
 //   - Caps output at ddgMax results
 //   - Decodes real destination URL from DDG redirect href when display URL is absent
 func Search(ctx context.Context, query string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
 	body := "q=" + url.QueryEscape(query) + "&kl=us-en"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ddgSearchURL, strings.NewReader(body))
 	if err != nil {
@@ -35,7 +42,7 @@ func Search(ctx context.Context, query string) (string, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; agsh/1.0)")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ddgClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("websearch: http request: %w", err)
 	}
