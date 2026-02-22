@@ -177,10 +177,37 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, 
 	return content, chatResp.Usage, nil
 }
 
-// StripFences removes markdown code fences (```json ... ```) from LLM output
-// so that JSON can be parsed directly.
+// StripThinkBlocks removes all <think>...</think> blocks from s.
+// Reasoning models (e.g. deepseek-r1) emit these before or between JSON
+// objects. The blocks are not part of structured output and must be stripped
+// before JSON parsing.
+//
+// Expectations:
+//   - Removes a single <think>...</think> block
+//   - Removes multiple <think>...</think> blocks
+//   - Strips an unclosed <think> block from its start to end of string
+//   - Returns s unchanged when no <think> tag is present
+func StripThinkBlocks(s string) string {
+	for {
+		start := strings.Index(s, "<think>")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(s[start:], "</think>")
+		if end == -1 {
+			// Unclosed block — strip from opening tag to end of string.
+			s = s[:start]
+			break
+		}
+		s = s[:start] + s[start+end+len("</think>"):]
+	}
+	return strings.TrimSpace(s)
+}
+
+// StripFences removes markdown code fences (```json ... ```) from LLM output,
+// and also strips <think>...</think> reasoning blocks emitted by reasoning models.
 func StripFences(s string) string {
-	s = strings.TrimSpace(s)
+	s = StripThinkBlocks(strings.TrimSpace(s))
 	if strings.HasPrefix(s, "```") {
 		// Remove opening fence line
 		idx := strings.Index(s, "\n")

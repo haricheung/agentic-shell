@@ -5,6 +5,16 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #61 — Reasoning model `<think>` blocks cause JSON parse failure in Executor
+
+**Symptom**: Task abandoned with "Infrastructure/executor error: LLM output contained malformed JSON with stray `</think>` token between tool calls." R4a classifies this as an infrastructure error and marks the subtask failed immediately — no retry is attempted.
+
+**Root cause**: Reasoning models (e.g. `deepseek-reasoner`) emit `<think>...</think>` blocks in raw response content before (or occasionally between) JSON objects. `StripFences` only removes ` ``` ` code fences; `<think>` tags passed through to `json.Unmarshal`, which fails with `invalid character '<'`. The error propagated from `execute()` → `RunSubTask()` → R4a as a synthetic failed `ExecutionResult` whose output is the raw error string.
+
+**Fix**: Added `StripThinkBlocks(s string) string` to `internal/llm/client.go`. Iteratively removes all `<think>...</think>` blocks; truncates at an unclosed `<think>` tag. `StripFences` now calls `StripThinkBlocks` as its first step, so all callers (executor, planner, perceiver, agentval) are protected automatically. 4 new tests in `client_test.go`.
+
+---
+
 ## Issue #60 — cc-as-brain removed; LLM restored as sole R2 brain
 
 **Symptom**: cc-brain mode (`R2_BRAIN=cc`) failed in two ways: (1) `cc --print` rejected inside Claude Code sessions due to the `CLAUDECODE` env var; (2) even after stripping that var, cc prepended reasoning prose before the JSON, defeating the `StripFences`-then-parse pipeline.

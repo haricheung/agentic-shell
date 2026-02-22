@@ -1,8 +1,9 @@
 package llm
 
 import (
-	"testing"
 	"os"
+	"strings"
+	"testing"
 )
 
 func TestNormalizeBaseURL_StripsChatCompletionsSuffix(t *testing.T) {
@@ -104,5 +105,42 @@ func TestNewTier_EmptyPrefixReadsOnlySharedVars(t *testing.T) {
 	}
 	if c.model != "shared-model" {
 		t.Errorf("model: got %q, want shared-model", c.model)
+	}
+}
+
+// --- StripThinkBlocks ---
+
+func TestStripThinkBlocks_RemovesSingleBlock(t *testing.T) {
+	// Removes a single <think>...</think> block
+	got := StripThinkBlocks("<think>let me reason</think>\n{\"tool\": \"search\"}")
+	want := "{\"tool\": \"search\"}"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestStripThinkBlocks_RemovesMultipleBlocks(t *testing.T) {
+	// Removes multiple <think>...</think> blocks
+	got := StripThinkBlocks("<think>first</think>{\"a\":1}<think>second</think>{\"b\":2}")
+	if strings.Contains(got, "<think>") || strings.Contains(got, "</think>") {
+		t.Errorf("expected all think blocks removed, got %q", got)
+	}
+}
+
+func TestStripThinkBlocks_UnclosedBlockStrippedToEnd(t *testing.T) {
+	// Strips an unclosed <think> block from its start to end of string
+	got := StripThinkBlocks("{\"tool\": \"search\"}<think>orphaned reasoning")
+	want := "{\"tool\": \"search\"}"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestStripThinkBlocks_NoTagReturnedUnchanged(t *testing.T) {
+	// Returns s unchanged when no <think> tag is present
+	input := "{\"tool\": \"shell\", \"command\": \"ls\"}"
+	got := StripThinkBlocks(input)
+	if got != input {
+		t.Errorf("expected unchanged, got %q", got)
 	}
 }
