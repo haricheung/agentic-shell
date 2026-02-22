@@ -244,7 +244,20 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		}
 
 		detail := tc.Command + tc.Path + tc.Query + tc.Pattern + tc.Name + firstN(tc.Script, 40)
-		toolCallHistory = append(toolCallHistory, tc.Tool+":"+firstN(detail, 60))
+		currentSig := tc.Tool + ":" + firstN(detail, 60)
+
+		// Loop detection: identical consecutive call produces identical output — skip
+		// execution and inject a hard stop so the LLM must either output a final result
+		// or try a genuinely different tool/query.
+		if len(toolCallHistory) > 0 && currentSig == toolCallHistory[len(toolCallHistory)-1] {
+			log.Printf("[R3] loop detected: identical call blocked (tool=%s iter=%d)", tc.Tool, i+1)
+			toolResultsCtx.WriteString(fmt.Sprintf(
+				"\n⚠️ DUPLICATE CALL BLOCKED: [%s] was already called with identical parameters — repeated calls return identical results and waste budget. You MUST now either:\n1. Output the final result using what you already have (even if partial), OR\n2. Use a COMPLETELY DIFFERENT query, tool, or approach.\nDo NOT repeat this call.\n",
+				tc.Tool))
+			continue
+		}
+
+		toolCallHistory = append(toolCallHistory, currentSig)
 
 		// Log tool invocation with the most relevant param per tool type.
 		switch tc.Tool {

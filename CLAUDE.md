@@ -29,6 +29,8 @@ Copy one of the pre-configured env files to `.env` before running:
 - `.env` — Volcengine/Ark endpoint (`ark.cn-beijing.volces.com`)
 - `.env.ds` — DeepSeek API (`api.deepseek.com`)
 
+`R2_BRAIN` env var overrides the R2 planning engine: `cc` (default) or `llm` (faster, lower quality). Use `R2_BRAIN=llm` to opt out of cc brain.
+
 All use the OpenAI-compatible convention: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` as shared fallbacks.
 
 **Model tier split** — each tier reads `{TIER}_{API_KEY,BASE_URL,MODEL}`, falling back to the shared `OPENAI_*` var for any unset key:

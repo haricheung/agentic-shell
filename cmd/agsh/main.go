@@ -81,8 +81,12 @@ func main() {
 	logReg := tasklog.NewRegistry(filepath.Join(cacheDir, "tasks"))
 
 	// Logical roles
-	// R2_BRAIN env var selects the planning engine: "cc" or "llm" (default).
-	plan := planner.New(b, brainClient, logReg, os.Getenv("R2_BRAIN"))
+	// R2_BRAIN env var selects the planning engine: "cc" (default) or "llm" (faster, lower quality).
+	brainMode := os.Getenv("R2_BRAIN")
+	if brainMode == "" {
+		brainMode = "cc"
+	}
+	plan := planner.New(b, brainClient, logReg, brainMode)
 	mv := metaval.New(b, toolClient, outputFn, logReg)
 	gs := ggs.New(b, outputFn) // R7 — Goal Gradient Solver; sits between R4b and R2
 	exec := executor.New(b, toolClient)

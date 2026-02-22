@@ -1547,3 +1547,19 @@ Two-part fix that respects the R1/R2 role boundary:
 Files changed:
 - `internal/roles/perceiver/perceiver.go` — temporal reference rule added to system prompt; date injection removed
 - `internal/roles/planner/planner.go` — `Today's date` prepended in `plan()` and `replanWithDirective()`
+
+---
+
+## Issue #58 — R3 LLM brain loops on identical tool call when DuckDuckGo returns no results
+
+**Symptom**
+R3 called `search("Google Spring Festival 2026 announcement")` 10 times in a row with identical parameters, producing identical empty/error results each iteration. Budget was exhausted without progress; task abandoned with D=1.000, Ω=0.864.
+
+**Root cause**
+When a tool call returns no usable results (DDG connection reset, empty response), the LLM re-plans with the same call because nothing in its context indicates the call was already tried. There is no guard against consecutive identical calls.
+
+**Fix**
+Added loop detection in `executor.go` `Run()` method. Before executing each tool call, compute `currentSig = tool + ":" + firstN(params, 60)`. If `currentSig` matches the immediately preceding call signature, block execution and inject a `⚠️ DUPLICATE CALL BLOCKED` warning into `toolResultsCtx`. The warning explicitly instructs the LLM to either emit a final result from existing data or try a completely different approach. The blocked call is not appended to `ToolCalls` (no evidence fabricated).
+
+Files changed:
+- `internal/roles/executor/executor.go` — consecutive duplicate call detection and blocking
