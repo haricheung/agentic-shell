@@ -31,6 +31,8 @@ Copy one of the pre-configured env files to `.env` before running:
 
 `R2_BRAIN` env var overrides the R2 planning engine: `cc` (default) or `llm` (faster, lower quality). Use `R2_BRAIN=llm` to opt out of cc brain.
 
+`LANGSEARCH_API_KEY` enables the `search` tool (LangSearch web search API). When unset the tool is absent from R3's prompt entirely. Optional `LANGSEARCH_BASE_URL` overrides the endpoint (default: `https://api.langsearch.com/v1/web-search`).
+
 All use the OpenAI-compatible convention: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` as shared fallbacks.
 
 **Model tier split** — each tier reads `{TIER}_{API_KEY,BASE_URL,MODEL}`, falling back to the shared `OPENAI_*` var for any unset key:
@@ -52,7 +54,7 @@ OPENAI_MODEL="..."
 
 Leave both tier sections unset to use a single model for all roles.
 
-The `search` tool uses DuckDuckGo HTML search (no API key required; proxy required from mainland China).
+The `search` tool uses LangSearch web search API (requires `LANGSEARCH_API_KEY`; tool is absent from R3's prompt when key is unset).
 
 ## Architecture
 
@@ -116,7 +118,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `applescript` | `script` | Control macOS apps (Mail, Calendar, Reminders, Messages, Music…); Calendar/Reminders sync to iPhone/iPad/Watch via iCloud |
 | `shortcuts` | `name`, `input` | Run a named Apple Shortcut (iCloud-synced; can trigger iPhone/Watch automations) |
 | `shell` | `command` | General bash; counting/aggregation (`wc -l`), not file discovery |
-| `search` | `query` | DuckDuckGo HTML search (no API key; proxy required from mainland China) |
+| `search` | `query` | LangSearch web search API (opt-in: requires `LANGSEARCH_API_KEY`; absent from prompt when unset) |
 
 **File search hierarchy**: `mdfind` for anything outside the project (user personal files) → `glob` for project files → `shell` only for operations neither handles.
 

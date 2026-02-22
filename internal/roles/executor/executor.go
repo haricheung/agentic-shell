@@ -18,7 +18,7 @@ import (
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
-const systemPrompt = `You are R3 — Executor. Execute exactly one assigned sub-task and return a concrete, verifiable result.
+const systemPromptBase = `You are R3 — Executor. Execute exactly one assigned sub-task and return a concrete, verifiable result.
 
 Tool selection — use the FIRST tool that fits; do not skip down the list:
 1. mdfind  — personal file search (Spotlight index, <1 s). Use for ANY file outside the project.
@@ -36,9 +36,11 @@ Tool selection — use the FIRST tool that fits; do not skip down the list:
 7. shell — bash command for everything else (counting, aggregation, system info, file ops).
    Input: {"action":"tool","tool":"shell","command":"..."}
    NEVER use "find" to locate personal files — use mdfind (tool #1) instead.
-   Never include ~/Music/Music or ~/Library in shell paths.
-8. search — DuckDuckGo web search. Input: {"action":"tool","tool":"search","query":"..."}
+   Never include ~/Music/Music or ~/Library in shell paths.`
 
+const systemPromptSearch = `8. search — web search. Input: {"action":"tool","tool":"search","query":"..."}`
+
+const systemPromptTail = `
 Execution rules:
 - Read intent, success_criteria, and context before acting. Context may contain prior-step outputs — use them directly.
 - One tool call per turn; wait for the result before the next.
@@ -51,6 +53,15 @@ Execution rules:
 Output format:
 Tool call:    {"action":"tool","tool":"<name>","<param>":"<value>",...}
 Final result: {"action":"result","subtask_id":"...","status":"completed|uncertain|failed","output":"<result text>","uncertainty":null,"tool_calls":["<tool: input → output summary>",...]}`
+
+// buildSystemPrompt returns the executor system prompt. Item #8 (search) is
+// included only when LANGSEARCH_API_KEY is set in the environment.
+func buildSystemPrompt() string {
+	if tools.SearchAvailable() {
+		return systemPromptBase + "\n" + systemPromptSearch + "\n" + systemPromptTail
+	}
+	return systemPromptBase + "\n" + systemPromptTail
+}
 
 const correctionPrompt = `You are R3 — Executor. A correction has been received from R4a. Re-execute the subtask using a DIFFERENT approach.
 
@@ -214,8 +225,9 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			prompt += "\nYou have the tool output above. Output the final ExecutionResult JSON now (status=completed). Only make another tool call if the output above is genuinely insufficient."
 		}
 
-		raw, usage, err := e.llm.Chat(ctx, systemPrompt, prompt)
-		tlog.LLMCall("executor", systemPrompt, prompt, raw, usage.PromptTokens, usage.CompletionTokens, i+1)
+		sysPrompt := buildSystemPrompt()
+		raw, usage, err := e.llm.Chat(ctx, sysPrompt, prompt)
+		tlog.LLMCall("executor", sysPrompt, prompt, raw, usage.PromptTokens, usage.CompletionTokens, i+1)
 		if err != nil {
 			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("llm: %w", err)
 		}

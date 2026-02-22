@@ -1,147 +1,125 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"regexp"
+	"os"
 	"strings"
 	"time"
 )
 
 const (
-	ddgSearchURL = "https://html.duckduckgo.com/html/"
-	ddgMax       = 5
+	defaultLangSearchURL = "https://api.langsearch.com/v1/web-search"
+	langSearchMax        = 5
 )
 
-// ddgClient bypasses any HTTP_PROXY / HTTPS_PROXY env vars that may be set by
-// parent processes (e.g. Claude Code's internal proxy on port 26560).
-// DDG must be reached directly; routing it through the CC proxy fails.
-var ddgClient = &http.Client{
+// langSearchClient bypasses any HTTP_PROXY / HTTPS_PROXY env vars that may be
+// set by parent processes (e.g. Claude Code's internal proxy on port 26560).
+var langSearchClient = &http.Client{
 	Timeout: 15 * time.Second,
-	Transport: &http.Transport{
-		Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
-	},
 }
 
-// Search queries DuckDuckGo HTML search. No API key required.
+// SearchAvailable reports whether the search tool is usable.
+// Returns true only when LANGSEARCH_API_KEY is set.
 //
 // Expectations:
-//   - Returns formatted results when DDG responds with results
-//   - Returns a "(no results)" message when no result anchors are found
-//   - Caps output at ddgMax results
-//   - Decodes real destination URL from DDG redirect href when display URL is absent
-func Search(ctx context.Context, query string) (string, error) {
-	body := "q=" + url.QueryEscape(query) + "&kl=us-en"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ddgSearchURL, strings.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("websearch: create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; agsh/1.0)")
+//   - Returns false when LANGSEARCH_API_KEY is unset or empty
+//   - Returns true when LANGSEARCH_API_KEY is non-empty
+func SearchAvailable() bool {
+	return os.Getenv("LANGSEARCH_API_KEY") != ""
+}
 
-	resp, err := ddgClient.Do(req)
+// Search queries the LangSearch web search API.
+// Returns an error if LANGSEARCH_API_KEY is not set.
+//
+// Expectations:
+//   - Returns error when LANGSEARCH_API_KEY is unset
+//   - Returns formatted results when API responds with results
+//   - Returns a "(no results)" message when value array is empty
+//   - Caps output at langSearchMax results
+//   - Includes datePublished prefix on URL line when non-empty
+func Search(ctx context.Context, query string) (string, error) {
+	apiKey := os.Getenv("LANGSEARCH_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("search: LANGSEARCH_API_KEY not set")
+	}
+	baseURL := os.Getenv("LANGSEARCH_BASE_URL")
+	if baseURL == "" {
+		baseURL = defaultLangSearchURL
+	}
+
+	reqBody, err := json.Marshal(map[string]any{
+		"query":   query,
+		"summary": true,
+		"count":   langSearchMax,
+	})
 	if err != nil {
-		return "", fmt.Errorf("websearch: http request: %w", err)
+		return "", fmt.Errorf("search: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("search: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := langSearchClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("search: http request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("websearch: read response: %w", err)
+		return "", fmt.Errorf("search: read response: %w", err)
 	}
 
-	pages := parseDDGHTML(string(raw))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("search: HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var result langSearchResponse
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", fmt.Errorf("search: parse response: %w", err)
+	}
+
+	pages := result.Data.WebPages.Value
 	return formatSearchResult(query, pages), nil
 }
 
-// Compiled once at package init — safe for concurrent use.
-var (
-	reTitleHref = regexp.MustCompile(`(?s)<a[^>]+class="result__a"[^>]+href="([^"]*)"[^>]*>(.*?)</a>`)
-	reSnippet   = regexp.MustCompile(`(?s)class="result__snippet"[^>]*>(.*?)</a>`)
-	reDispURL   = regexp.MustCompile(`(?s)class="result__url"[^>]*>\s*(.*?)\s*</a>`)
-)
-
-func parseDDGHTML(html string) []searchPage {
-	matches := reTitleHref.FindAllStringSubmatchIndex(html, -1)
-	pages := make([]searchPage, 0, len(matches))
-	for i, m := range matches {
-		if i >= ddgMax {
-			break
-		}
-		href := html[m[2]:m[3]]
-		title := stripTags(html[m[4]:m[5]])
-
-		// Chunk: from this result's title to the start of the next (or end of doc)
-		end := len(html)
-		if i+1 < len(matches) {
-			end = matches[i+1][0]
-		}
-		chunk := html[m[0]:end]
-
-		var snippet, dispURL string
-		if sm := reSnippet.FindStringSubmatch(chunk); len(sm) > 1 {
-			snippet = stripTags(sm[1])
-		}
-		if um := reDispURL.FindStringSubmatch(chunk); len(um) > 1 {
-			dispURL = stripTags(um[1])
-		}
-		if dispURL == "" {
-			dispURL = decodeUDDG(href)
-		}
-
-		pages = append(pages, searchPage{Name: title, URL: dispURL, Snippet: snippet})
-	}
-	return pages
-}
-
-// decodeUDDG extracts the real destination URL from a DDG redirect href
-// of the form /l/?uddg=<url-encoded-url>&rut=...
-func decodeUDDG(href string) string {
-	if idx := strings.Index(href, "uddg="); idx >= 0 {
-		encoded := href[idx+5:]
-		if amp := strings.IndexByte(encoded, '&'); amp >= 0 {
-			encoded = encoded[:amp]
-		}
-		if u, err := url.QueryUnescape(encoded); err == nil {
-			return u
-		}
-	}
-	return href
-}
-
-var reTag = regexp.MustCompile(`<[^>]+>`)
-
-func stripTags(s string) string {
-	s = reTag.ReplaceAllString(s, "")
-	s = strings.ReplaceAll(s, "&amp;", "&")
-	s = strings.ReplaceAll(s, "&lt;", "<")
-	s = strings.ReplaceAll(s, "&gt;", ">")
-	s = strings.ReplaceAll(s, "&quot;", `"`)
-	s = strings.ReplaceAll(s, "&#39;", "'")
-	return strings.TrimSpace(s)
+type langSearchResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		WebPages struct {
+			Value []searchPage `json:"value"`
+		} `json:"webPages"`
+	} `json:"data"`
 }
 
 type searchPage struct {
-	Name          string
-	URL           string
-	Snippet       string
-	Summary       string
-	DatePublished string
+	Name          string `json:"name"`
+	URL           string `json:"url"`
+	Snippet       string `json:"snippet"`
+	Summary       string `json:"summary"`
+	DatePublished string `json:"datePublished"`
 }
 
 // formatSearchResult converts a list of search pages into a readable text block.
 //
 // Expectations:
 //   - Returns "(no results)" message when pages slice is empty
-//   - Includes title, snippet, and URL for each result
+//   - Includes title, snippet/summary, and URL for each result
 //   - Prefers summary over snippet when summary is non-empty
 //   - Includes YYYY-MM-DD date prefix on URL line when datePublished is non-empty
 //   - Omits date when datePublished is empty
 //   - Separates results with a blank line
-//   - Caps output at ddgMax results
+//   - Caps output at langSearchMax results
 func formatSearchResult(query string, pages []searchPage) string {
 	if len(pages) == 0 {
 		return fmt.Sprintf("No results found for: %q", query)
@@ -149,7 +127,7 @@ func formatSearchResult(query string, pages []searchPage) string {
 
 	var sb strings.Builder
 	for i, p := range pages {
-		if i >= ddgMax {
+		if i >= langSearchMax {
 			break
 		}
 		if i > 0 {

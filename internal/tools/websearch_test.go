@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestSearchAvailable_FalseWhenKeyUnset(t *testing.T) {
+	// Returns false when LANGSEARCH_API_KEY is unset or empty
+	t.Setenv("LANGSEARCH_API_KEY", "")
+	if SearchAvailable() {
+		t.Error("expected SearchAvailable()=false when LANGSEARCH_API_KEY is empty")
+	}
+}
+
+func TestSearchAvailable_TrueWhenKeySet(t *testing.T) {
+	// Returns true when LANGSEARCH_API_KEY is non-empty
+	t.Setenv("LANGSEARCH_API_KEY", "test-key")
+	if !SearchAvailable() {
+		t.Error("expected SearchAvailable()=true when LANGSEARCH_API_KEY is set")
+	}
+}
+
 func TestFormatSearchResult_EmptyPagesReturnsNoResults(t *testing.T) {
 	// Returns "(no results)" message when pages slice is empty
 	got := formatSearchResult("test query", nil)
@@ -70,15 +86,15 @@ func TestFormatSearchResult_IncludesDateWhenPresent(t *testing.T) {
 }
 
 func TestFormatSearchResult_CapsAtMaxResults(t *testing.T) {
-	// Caps output at ddgMax results
-	pages := make([]searchPage, ddgMax+3)
+	// Caps output at langSearchMax results
+	pages := make([]searchPage, langSearchMax+3)
 	for i := range pages {
 		pages[i] = searchPage{Name: "Title", URL: "https://a.com"}
 	}
 	got := formatSearchResult("query", pages)
 	count := strings.Count(got, "https://a.com")
-	if count != ddgMax {
-		t.Errorf("expected %d results, got %d", ddgMax, count)
+	if count != langSearchMax {
+		t.Errorf("expected %d results, got %d", langSearchMax, count)
 	}
 }
 
