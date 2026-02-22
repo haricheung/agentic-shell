@@ -5,13 +5,113 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
-## Issue #55 — cc-as-brain removed; LLM restored as sole R2 brain
+## Issue #60 — cc-as-brain removed; LLM restored as sole R2 brain
 
 **Symptom**: cc-brain mode (`R2_BRAIN=cc`) failed in two ways: (1) `cc --print` rejected inside Claude Code sessions due to the `CLAUDECODE` env var; (2) even after stripping that var, cc prepended reasoning prose before the JSON, defeating the `StripFences`-then-parse pipeline.
 
 **Root cause**: cc is a conversational assistant that cannot reliably be constrained to pure JSON output when called as a subprocess. The `cc` alias also cannot be invoked via `exec.Command` (it is a shell alias, not a binary).
 
 **Fix**: Removed all cc-related code entirely — `ccEnviron`, `runCC`, `dispatchViaCCBrain`, `SetBrainMode`, `BrainMode`, `brainMode` field, `mu` mutex, `maxCCCalls` constant, `MsgCCCall`/`MsgCCResponse` message types, `CCCall`/`CCResponse` payload structs, `RoleCC`, `PlannerBrain`/`CCCalls` manifest fields, `/brain` REPL command, cc sections in `display.go` and `auditor.go`. `dispatch()` is a single plain LLM call again.
+
+---
+
+## Issue #59 — DDG search routed through CC internal proxy (port 26560), connection fails
+
+**Symptom**
+`search` tool always errors: `websearch: http request: Post "https://html.duckduckgo.com/html/": read tcp ...:55573->...:26560: connection reset by peer`. Port 26560 is Claude Code's internal proxy.
+
+**Root cause**
+`websearch.go` used `http.DefaultClient`, which inherits `HTTPS_PROXY` from the process environment. When `agsh` runs inside a Claude Code session, CC injects its own proxy into the environment. DDG must be reached directly; CC's proxy does not forward external traffic.
+
+**Fix**
+Replace `http.DefaultClient` with a package-level `ddgClient` that sets `Transport.Proxy` to a no-op function (`func(*http.Request) (*url.URL, error) { return nil, nil }`). This bypasses all proxy env vars for DDG requests only; the LLM client (which legitimately needs the proxy to reach the API) is unaffected.
+
+Files changed:
+- `internal/tools/websearch.go` — dedicated `ddgClient` with proxy disabled
+
+---
+
+## Issue #58 — R3 LLM brain loops on identical tool call when DuckDuckGo returns no results
+
+**Symptom**
+R3 called `search("Google Spring Festival 2026 announcement")` 10 times in a row with identical parameters, producing identical empty/error results each iteration. Budget was exhausted without progress; task abandoned with D=1.000, Ω=0.864.
+
+**Root cause**
+When a tool call returns no usable results (DDG connection reset, empty response), the LLM re-plans with the same call because nothing in its context indicates the call was already tried. There is no guard against consecutive identical calls.
+
+**Fix**
+Added loop detection in `executor.go` `Run()` method. Before executing each tool call, compute `currentSig = tool + ":" + firstN(params, 60)`. If `currentSig` matches the immediately preceding call signature, block execution and inject a `⚠️ DUPLICATE CALL BLOCKED` warning into `toolResultsCtx`. The warning explicitly instructs the LLM to either emit a final result from existing data or try a completely different approach. The blocked call is not appended to `ToolCalls` (no evidence fabricated).
+
+Files changed:
+- `internal/roles/executor/executor.go` — consecutive duplicate call detection and blocking
+
+---
+
+## Issue #57 — R1 and R2 resolve relative dates incorrectly without knowing current date
+
+**Symptom**
+Input: `今年春节期间重要的科技新闻` ("important tech news during this year's Spring Festival").
+Today is 2026-02-22. R1 resolved "今年春节" as "2025年春节期间（1月28日-2月4日）" — wrong year (2025 vs 2026), same root cause as issue #50 but in R1 instead of R4a.
+
+**Root cause**
+R1 and R2 had no `Today's date` injection. Without knowing the current date, temporal references like "今年" (this year), "最近" (recently), "上周" (last week) are resolved from training data, which may lag by months or years.
+
+**Fix**
+Two-part fix that respects the R1/R2 role boundary:
+
+- **R1**: add a "temporal reference rule" to the system prompt — R1 must NOT resolve relative time words (今年/this year, 最近/recently, 上周/last week, etc.) into specific dates. Preserve them verbatim in `intent`. This is architecturally correct: R1 is a receiver, not a resolver; R2 owns temporal interpretation.
+
+- **R2**: inject `Today's date: YYYY-MM-DD` into the user prompt in `plan()` and `replanWithDirective()`. R2 needs the concrete date to write falsifiable `task_criteria` (e.g. "output contains news from Spring Festival 2026, Jan 28–Feb 4"). This is the same mechanism as R4a (issue #50) and is general, not badcase-specific.
+
+Files changed:
+- `internal/roles/perceiver/perceiver.go` — temporal reference rule added to system prompt; date injection removed
+- `internal/roles/planner/planner.go` — `Today's date` prepended in `plan()` and `replanWithDirective()`
+
+---
+
+## Issue #56 — Gradient direction invisible in pipeline display
+
+**Symptom**
+The `PlanDirective` pipeline line showed `directive | ∇L=gradient Ω=N%` — the gradient label was present but the direction was not visually distinct from surrounding text. Users familiar with the GGS design could not see at a glance whether the solver was converging.
+
+**Root cause**
+`msgDetail` for `MsgPlanDirective` used a plain string with no directional symbol or color differentiation.
+
+**Fix**
+Updated `msgDetail` in `display.go` to prepend a colored directional arrow before the gradient label:
+- `↑` green — improving (loss decreasing)
+- `↓` red — worsening (loss increasing)
+- `⊥` yellow — plateau (stuck in local minimum)
+- `→` no color — stable
+
+After the colored arrow, `ansiReset + ansiYellow` restores the message-type color so the rest of the label renders correctly within the bracket.
+
+Files changed:
+- `internal/ui/display.go` — `MsgPlanDirective` case in `msgDetail`
+
+---
+
+## Issue #55 — R1 owned success_criteria; mixed perception with planning
+
+**Symptom**
+R1 (Perceiver) wrote `success_criteria` in the `TaskSpec`. R2 (Planner) then wrote subtask-level criteria. This means the same semantic boundary ("what counts as success") was split across two roles with different vantage points — R1 doesn't know how R2 will decompose the task, so its criteria were often intent echoes rather than testable assertions against concrete tool output.
+
+**Root cause**
+Architectural: R1's mission is perception (translate raw input into structured intent). Criteria specification requires knowledge of the execution plan, which belongs to R2.
+
+**Fix**
+- R1 no longer outputs `success_criteria`. Its output format is reduced to `{task_id, intent, constraints, raw_input}`.
+- R2 now outputs a JSON wrapper `{"task_criteria":[...],"subtasks":[...]}` instead of a raw subtask array. `task_criteria` are assertions about the COMBINED output of ALL subtasks — same quality bar as subtask-level criteria (concrete, falsifiable).
+- `DispatchManifest` gains `TaskCriteria []string`; R2 sets it in `emitSubTasks` by parsing the wrapper.
+- `emitSubTasks` tries wrapper parse first; falls back to raw array for backward compatibility.
+- R4b's `evaluate()` now passes `manifest.TaskCriteria` to the LLM instead of `TaskSpec.SuccessCriteria`.
+- R4b system prompt updated: it evaluates `task_criteria` from R2, not subtask criteria from R4a.
+
+Files changed:
+- `internal/roles/perceiver/perceiver.go` — remove `success_criteria` from prompt + output format
+- `internal/roles/planner/planner.go` — wrapper output format; `emitSubTasks` parses wrapper; `TaskCriteria` set in manifest
+- `internal/roles/metaval/metaval.go` — system prompt + `evaluate()` user prompt use `task_criteria`
+- `internal/types/types.go` — `DispatchManifest.TaskCriteria []string` field added
 
 ---
 
@@ -1489,103 +1589,3 @@ Files changed:
 - `internal/tools/websearch.go` — full rewrite (Bocha API)
 - `internal/tools/websearch_test.go` (new, 7 tests for `formatBochaResult`)
 - `CLAUDE.md` — updated tool table and env config section
-
----
-
-## Issue #55 — R1 owned success_criteria; mixed perception with planning
-
-**Symptom**
-R1 (Perceiver) wrote `success_criteria` in the `TaskSpec`. R2 (Planner) then wrote subtask-level criteria. This means the same semantic boundary ("what counts as success") was split across two roles with different vantage points — R1 doesn't know how R2 will decompose the task, so its criteria were often intent echoes rather than testable assertions against concrete tool output.
-
-**Root cause**
-Architectural: R1's mission is perception (translate raw input into structured intent). Criteria specification requires knowledge of the execution plan, which belongs to R2.
-
-**Fix**
-- R1 no longer outputs `success_criteria`. Its output format is reduced to `{task_id, intent, constraints, raw_input}`.
-- R2 now outputs a JSON wrapper `{"task_criteria":[...],"subtasks":[...]}` instead of a raw subtask array. `task_criteria` are assertions about the COMBINED output of ALL subtasks — same quality bar as subtask-level criteria (concrete, falsifiable).
-- `DispatchManifest` gains `TaskCriteria []string`; R2 sets it in `emitSubTasks` by parsing the wrapper.
-- `emitSubTasks` tries wrapper parse first; falls back to raw array for backward compatibility (cc brain may return either format).
-- R4b's `evaluate()` now passes `manifest.TaskCriteria` to the LLM instead of `TaskSpec.SuccessCriteria`.
-- R4b system prompt updated: it evaluates `task_criteria` from R2, not subtask criteria from R4a.
-
-Files changed:
-- `internal/roles/perceiver/perceiver.go` — remove `success_criteria` from prompt + output format
-- `internal/roles/planner/planner.go` — wrapper output format; `emitSubTasks` parses wrapper; `TaskCriteria` set in manifest
-- `internal/roles/metaval/metaval.go` — system prompt + `evaluate()` user prompt use `task_criteria`
-- `internal/types/types.go` — `DispatchManifest.TaskCriteria []string` field added
-
----
-
-## Issue #56 — Gradient direction invisible in pipeline display
-
-**Symptom**
-The `PlanDirective` pipeline line showed `directive | ∇L=gradient Ω=N%` — the gradient label was present but the direction was not visually distinct from surrounding text. Users familiar with the GGS design could not see at a glance whether the solver was converging.
-
-**Root cause**
-`msgDetail` for `MsgPlanDirective` used a plain string with no directional symbol or color differentiation.
-
-**Fix**
-Updated `msgDetail` in `display.go` to prepend a colored directional arrow before the gradient label:
-- `↑` green — improving (loss decreasing)
-- `↓` red — worsening (loss increasing)
-- `⊥` yellow — plateau (stuck in local minimum)
-- `→` no color — stable
-
-After the colored arrow, `ansiReset + ansiYellow` restores the message-type color so the rest of the label renders correctly within the bracket.
-
-Files changed:
-- `internal/ui/display.go` — `MsgPlanDirective` case in `msgDetail`
-
----
-
-## Issue #57 — R1 and R2 resolve relative dates incorrectly without knowing current date
-
-**Symptom**
-Input: `今年春节期间重要的科技新闻` ("important tech news during this year's Spring Festival").
-Today is 2026-02-22. R1 resolved "今年春节" as "2025年春节期间（1月28日-2月4日）" — wrong year (2025 vs 2026), same root cause as issue #50 but in R1 instead of R4a.
-
-**Root cause**
-R1 and R2 had no `Today's date` injection. Without knowing the current date, temporal references like "今年" (this year), "最近" (recently), "上周" (last week) are resolved from training data, which may lag by months or years.
-
-**Fix**
-Two-part fix that respects the R1/R2 role boundary:
-
-- **R1**: add a "temporal reference rule" to the system prompt — R1 must NOT resolve relative time words (今年/this year, 最近/recently, 上周/last week, etc.) into specific dates. Preserve them verbatim in `intent`. This is architecturally correct: R1 is a receiver, not a resolver; R2 owns temporal interpretation. Injecting today's date into R1 would be badcase-overfitting (patching R1's behaviour for one failing case instead of fixing the role boundary).
-
-- **R2**: inject `Today's date: YYYY-MM-DD` into the user prompt in `plan()` and `replanWithDirective()`. R2 needs the concrete date to write falsifiable `task_criteria` (e.g. "output contains news from Spring Festival 2026, Jan 28–Feb 4"). This is the same mechanism as R4a (issue #50) and is general, not badcase-specific.
-
-Files changed:
-- `internal/roles/perceiver/perceiver.go` — temporal reference rule added to system prompt; date injection removed
-- `internal/roles/planner/planner.go` — `Today's date` prepended in `plan()` and `replanWithDirective()`
-
----
-
-## Issue #58 — R3 LLM brain loops on identical tool call when DuckDuckGo returns no results
-
-**Symptom**
-R3 called `search("Google Spring Festival 2026 announcement")` 10 times in a row with identical parameters, producing identical empty/error results each iteration. Budget was exhausted without progress; task abandoned with D=1.000, Ω=0.864.
-
-**Root cause**
-When a tool call returns no usable results (DDG connection reset, empty response), the LLM re-plans with the same call because nothing in its context indicates the call was already tried. There is no guard against consecutive identical calls.
-
-**Fix**
-Added loop detection in `executor.go` `Run()` method. Before executing each tool call, compute `currentSig = tool + ":" + firstN(params, 60)`. If `currentSig` matches the immediately preceding call signature, block execution and inject a `⚠️ DUPLICATE CALL BLOCKED` warning into `toolResultsCtx`. The warning explicitly instructs the LLM to either emit a final result from existing data or try a completely different approach. The blocked call is not appended to `ToolCalls` (no evidence fabricated).
-
-Files changed:
-- `internal/roles/executor/executor.go` — consecutive duplicate call detection and blocking
-
----
-
-## Issue #59 — DDG search routed through CC internal proxy (port 26560), connection fails
-
-**Symptom**
-`search` tool always errors: `websearch: http request: Post "https://html.duckduckgo.com/html/": read tcp ...:55573->...:26560: connection reset by peer`. Port 26560 is Claude Code's internal proxy.
-
-**Root cause**
-`websearch.go` used `http.DefaultClient`, which inherits `HTTPS_PROXY` from the process environment. When `agsh` runs inside a Claude Code session, CC injects its own proxy into the environment. DDG must be reached directly; CC's proxy does not forward external traffic.
-
-**Fix**
-Replace `http.DefaultClient` with a package-level `ddgClient` that sets `Transport.Proxy` to a no-op function (`func(*http.Request) (*url.URL, error) { return nil, nil }`). This bypasses all proxy env vars for DDG requests only; the LLM client (which legitimately needs the proxy to reach the API) is unaffected.
-
-Files changed:
-- `internal/tools/websearch.go` — dedicated `ddgClient` with proxy disabled
