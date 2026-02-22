@@ -94,6 +94,53 @@ func TestMsgDetail_SubTaskOutcome_FailedNoTrajectory(t *testing.T) {
 	}
 }
 
+// --- msgDetail: MsgPlanDirective ---
+
+func TestMsgDetail_PlanDirective_ContainsAllMetrics(t *testing.T) {
+	// MsgPlanDirective: returns detail containing D, P, ∆L, and Ω
+	pd := types.PlanDirective{
+		Gradient:       "plateau",
+		Directive:      "change_path",
+		Loss:           types.LossBreakdown{D: 0.8, P: 0.2, Omega: 0.28, L: 0.54},
+		GradL:          0.0,
+		BudgetPressure: 0.28,
+	}
+	got := msgDetail(makeMsg(types.MsgPlanDirective, pd))
+	for _, want := range []string{"D=", "P=", "∆L=", "Ω="} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in PlanDirective detail, got %q", want, got)
+		}
+	}
+}
+
+// --- dynamicStatus: MsgPlanDirective ---
+
+func TestDynamicStatus_PlanDirective_ShowsRationale(t *testing.T) {
+	// MsgPlanDirective with non-empty Rationale: returns "📐 replanning — <rationale clipped>"
+	pd := types.PlanDirective{
+		Gradient:  "plateau",
+		Directive: "change_path",
+		Rationale: "Plateau detected — try a different search path",
+	}
+	got := dynamicStatus(makeMsg(types.MsgPlanDirective, pd))
+	if !strings.Contains(got, "replanning") {
+		t.Errorf("expected 'replanning' prefix, got %q", got)
+	}
+	if !strings.Contains(got, "Plateau detected") {
+		t.Errorf("expected rationale text in dynamicStatus, got %q", got)
+	}
+}
+
+func TestDynamicStatus_PlanDirective_EmptyRationaleUsesStaticLabel(t *testing.T) {
+	// MsgPlanDirective with empty Rationale: falls through to static msgStatus label
+	pd := types.PlanDirective{Gradient: "improving", Directive: "refine"}
+	got := dynamicStatus(makeMsg(types.MsgPlanDirective, pd))
+	// should fall through to the static "📐 replanning with directive..." label
+	if !strings.Contains(got, "replanning") {
+		t.Errorf("expected static replanning label for empty rationale, got %q", got)
+	}
+}
+
 // --- msgDetail: unknown type ---
 
 func TestMsgDetail_UnknownType(t *testing.T) {

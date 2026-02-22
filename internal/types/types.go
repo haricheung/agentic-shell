@@ -149,6 +149,7 @@ type PlanDirective struct {
 	FailedCriterion string        `json:"failed_criterion"`  // primary criterion driving D
 	FailureClass    string        `json:"failure_class"`     // "logical" | "environmental" | "mixed"
 	BudgetPressure  float64       `json:"budget_pressure"`   // Ω value for display
+	GradL           float64       `json:"grad_l"`            // ∇L = L_t − L_{t-1}; 0 on first round
 	Rationale       string        `json:"rationale"`         // human-readable explanation; logged by Auditor
 }
 

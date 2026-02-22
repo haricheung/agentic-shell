@@ -70,8 +70,17 @@ var msgStatus = map[types.MessageType]string{
 
 // dynamicStatus returns a spinner label for msg, enriched with payload detail
 // for message types where the static label alone is not informative enough.
+//
+// Expectations:
+//   - MsgPlanDirective with non-empty Rationale: returns "📐 replanning — <rationale clipped>"
+//   - MsgPlanDirective with empty Rationale: falls through to static msgStatus label
 func dynamicStatus(msg types.Message) string {
 	switch msg.Type {
+	case types.MsgPlanDirective:
+		var pd types.PlanDirective
+		if remarshal(msg.Payload, &pd) == nil && pd.Rationale != "" {
+			return "📐 replanning — " + clipCols(pd.Rationale, 42)
+		}
 	case types.MsgCorrectionSignal:
 		var c types.CorrectionSignal
 		if remarshal(msg.Payload, &c) == nil && c.WhatToDo != "" {
@@ -310,6 +319,7 @@ func roleLabel(r types.Role) string {
 //   - MsgSubTaskOutcome failed with trajectory: returns "failed | unmet: <first unmet criterion>"
 //   - MsgSubTaskOutcome matched or failed with no trajectory: returns status string only
 //   - MsgCorrectionSignal: returns "attempt N — what_was_wrong" clipped to 40 chars
+//   - MsgPlanDirective: returns "<arrow> <gradient> | <directive>  D=X P=X ∆L=±X Ω=X%" with all four metrics
 //   - Returns "" for unknown or unparseable message types
 func msgDetail(msg types.Message) string {
 	switch msg.Type {
@@ -380,7 +390,9 @@ func msgDetail(msg types.Message) string {
 			case "plateau":
 				arrowFmt = ansiYellow + "⊥"
 			}
-			return fmt.Sprintf("%s %s | %s  Ω=%.0f%%", arrowFmt, pd.Gradient, pd.Directive, pd.BudgetPressure*100)
+			return fmt.Sprintf("%s %s | %s  D=%.2f P=%.2f ∆L=%+.2f Ω=%.0f%%",
+				arrowFmt, pd.Gradient, pd.Directive,
+				pd.Loss.D, pd.Loss.P, pd.GradL, pd.BudgetPressure*100)
 		}
 	case types.MsgOutcomeSummary:
 		var os types.OutcomeSummary

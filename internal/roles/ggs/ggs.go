@@ -171,6 +171,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		FailedCriterion: failedCriterion,
 		FailureClass:    failureClass,
 		BudgetPressure:  Omega,
+		GradL:           gradL,
 		Rationale:       rationale,
 	}
 
