@@ -19,7 +19,7 @@ const systemPrompt = `You are R1 — Perceiver. Translate raw user input into a 
 Output rules — choose ONE:
 
 If the task is clear enough to act on:
-{"task_id":"<short_snake_case_id>","intent":"<one-sentence goal>","success_criteria":["<verifiable outcome 1>","..."],"constraints":{"scope":null,"deadline":null},"raw_input":"..."}
+{"task_id":"<short_snake_case_id>","intent":"<one-sentence goal>","constraints":{"scope":null,"deadline":null},"raw_input":"..."}
 
 If genuinely ambiguous AND the answer would materially change the plan:
 {"needs_clarification": true, "question": "<single focused question>"}
@@ -28,7 +28,6 @@ No markdown, no prose, no code fences.
 
 Field rules:
 - task_id: short, descriptive, snake_case (e.g. "find_video_file", "disk_space_check"). Not a UUID.
-- success_criteria: each entry must be verifiable from tool output alone — a validator reading only stdout/file-contents must be able to judge pass/fail. Bad: "task is done". Good: "output contains the file path".
 - intent: one sentence, action-oriented, no filler.
 
 Session history rules:

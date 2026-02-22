@@ -16,14 +16,14 @@ import (
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
-const systemPrompt = `You are R4b — Meta-Validator. Merge SubTaskOutcome results and decide whether the task is complete or needs replanning.
+const systemPrompt = `You are R4b — Meta-Validator. Merge SubTaskOutcome results and verify the combined output satisfies the task criteria.
 
-Each SubTaskOutcome carries the subtask's intent and success_criteria that R4a was checking.
-Your job: verify that every criterion across all subtasks is satisfied by the combined outputs.
+You receive task_criteria (written by R2 to define what the COMBINED output must achieve) and all SubTaskOutcome results. Every subtask has already passed its own individual check.
+Your job: verify that the MERGED output satisfies every task criterion.
 
 Assessment rules:
-- "accept" ONLY when the combined outputs POSITIVELY demonstrate every success_criterion listed in every SubTaskOutcome.
-- "replan" if any criterion is unmet or a subtask failed and its output is needed. State exactly which criterion failed and why.
+- "accept" ONLY when the combined outputs POSITIVELY demonstrate every task criterion.
+- "replan" if any task criterion is unmet. State exactly which criterion failed and why.
 - Do NOT accept on vague grounds. Absence of failure is not the same as presence of evidence.
 
 merged_output rules:
@@ -190,13 +190,12 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		return
 	}
 
-	// All subtasks matched — call LLM only to merge outputs and produce the
-	// user-facing summary. It can no longer influence accept/replan decision.
+	// All subtasks matched — call LLM to merge outputs and verify task_criteria.
 	outcomesJSON, _ := json.MarshalIndent(tracker.outcomes, "", "  ")
-	specJSON, _ := json.MarshalIndent(tracker.spec, "", "  ")
+	criteriaJSON, _ := json.MarshalIndent(tracker.manifest.TaskCriteria, "", "  ")
 	userPrompt := fmt.Sprintf(
-		"TaskSpec (intent and constraints):\n%s\n\nSubTaskOutcomes (each carries its own success_criteria):\n%s\n\nAll subtasks matched. Merge their outputs into a single user-facing result.",
-		specJSON, outcomesJSON)
+		"Task intent: %s\n\nTask criteria (written by R2 — ALL must be satisfied by the combined output):\n%s\n\nSubTaskOutcomes:\n%s\n\nMerge the subtask outputs and verify all task criteria are met.",
+		tracker.spec.Intent, criteriaJSON, outcomesJSON)
 
 	raw, usage, err := m.llm.Chat(ctx, systemPrompt, userPrompt)
 	tl := m.logReg.Get(taskID)

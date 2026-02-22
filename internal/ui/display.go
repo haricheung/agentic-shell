@@ -381,7 +381,19 @@ func msgDetail(msg types.Message) string {
 	case types.MsgPlanDirective:
 		var pd types.PlanDirective
 		if remarshal(msg.Payload, &pd) == nil {
-			return fmt.Sprintf("%s | ∇L=%s Ω=%.0f%%", pd.Directive, pd.Gradient, pd.BudgetPressure*100)
+			// Arrow symbol and color encode the gradient direction at a glance.
+			// After the colored arrow, ansiYellow restores the MsgPlanDirective message color.
+			arrow := "→"
+			arrowFmt := arrow // no extra color for stable
+			switch pd.Gradient {
+			case "improving":
+				arrowFmt = ansiGreen + "↑" + ansiReset + ansiYellow
+			case "worsening":
+				arrowFmt = ansiRed + "↓" + ansiReset + ansiYellow
+			case "plateau":
+				arrowFmt = ansiYellow + "⊥"
+			}
+			return fmt.Sprintf("%s %s | %s  Ω=%.0f%%", arrowFmt, pd.Gradient, pd.Directive, pd.BudgetPressure*100)
 		}
 	case types.MsgOutcomeSummary:
 		var os types.OutcomeSummary

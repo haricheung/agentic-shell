@@ -82,8 +82,9 @@ type DispatchManifest struct {
 	SubTaskIDs   []string  `json:"subtask_ids"`
 	TaskSpec     *TaskSpec `json:"task_spec,omitempty"`
 	DispatchedAt string    `json:"dispatched_at"`
-	PlannerBrain string    `json:"planner_brain"` // "llm" or "cc"
-	CCCalls      int       `json:"cc_calls"`      // consultations: 0 = none; >0 = cc consulted N times (only meaningful when PlannerBrain="llm")
+	PlannerBrain string    `json:"planner_brain"`  // "llm" or "cc"
+	CCCalls      int       `json:"cc_calls"`       // consultations: 0 = none; >0 = cc consulted N times (only meaningful when PlannerBrain="llm")
+	TaskCriteria []string  `json:"task_criteria"`  // task-level success criteria written by R2; R4b validates the merged output against these
 }
 
 // ExecutionResult is produced by R3 Executor and consumed by R4a Agent-Validator

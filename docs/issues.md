@@ -1479,3 +1479,49 @@ Files changed:
 - `internal/tools/websearch.go` — full rewrite (Bocha API)
 - `internal/tools/websearch_test.go` (new, 7 tests for `formatBochaResult`)
 - `CLAUDE.md` — updated tool table and env config section
+
+---
+
+## Issue #55 — R1 owned success_criteria; mixed perception with planning
+
+**Symptom**
+R1 (Perceiver) wrote `success_criteria` in the `TaskSpec`. R2 (Planner) then wrote subtask-level criteria. This means the same semantic boundary ("what counts as success") was split across two roles with different vantage points — R1 doesn't know how R2 will decompose the task, so its criteria were often intent echoes rather than testable assertions against concrete tool output.
+
+**Root cause**
+Architectural: R1's mission is perception (translate raw input into structured intent). Criteria specification requires knowledge of the execution plan, which belongs to R2.
+
+**Fix**
+- R1 no longer outputs `success_criteria`. Its output format is reduced to `{task_id, intent, constraints, raw_input}`.
+- R2 now outputs a JSON wrapper `{"task_criteria":[...],"subtasks":[...]}` instead of a raw subtask array. `task_criteria` are assertions about the COMBINED output of ALL subtasks — same quality bar as subtask-level criteria (concrete, falsifiable).
+- `DispatchManifest` gains `TaskCriteria []string`; R2 sets it in `emitSubTasks` by parsing the wrapper.
+- `emitSubTasks` tries wrapper parse first; falls back to raw array for backward compatibility (cc brain may return either format).
+- R4b's `evaluate()` now passes `manifest.TaskCriteria` to the LLM instead of `TaskSpec.SuccessCriteria`.
+- R4b system prompt updated: it evaluates `task_criteria` from R2, not subtask criteria from R4a.
+
+Files changed:
+- `internal/roles/perceiver/perceiver.go` — remove `success_criteria` from prompt + output format
+- `internal/roles/planner/planner.go` — wrapper output format; `emitSubTasks` parses wrapper; `TaskCriteria` set in manifest
+- `internal/roles/metaval/metaval.go` — system prompt + `evaluate()` user prompt use `task_criteria`
+- `internal/types/types.go` — `DispatchManifest.TaskCriteria []string` field added
+
+---
+
+## Issue #56 — Gradient direction invisible in pipeline display
+
+**Symptom**
+The `PlanDirective` pipeline line showed `directive | ∇L=gradient Ω=N%` — the gradient label was present but the direction was not visually distinct from surrounding text. Users familiar with the GGS design could not see at a glance whether the solver was converging.
+
+**Root cause**
+`msgDetail` for `MsgPlanDirective` used a plain string with no directional symbol or color differentiation.
+
+**Fix**
+Updated `msgDetail` in `display.go` to prepend a colored directional arrow before the gradient label:
+- `↑` green — improving (loss decreasing)
+- `↓` red — worsening (loss increasing)
+- `⊥` yellow — plateau (stuck in local minimum)
+- `→` no color — stable
+
+After the colored arrow, `ansiReset + ansiYellow` restores the message-type color so the rest of the label renders correctly within the bracket.
+
+Files changed:
+- `internal/ui/display.go` — `MsgPlanDirective` case in `msgDetail`

@@ -52,6 +52,12 @@ Success criteria rules (critical):
 - Good (assertion):   "output contains a numeric PM2.5 value"
 - Criteria must be falsifiable: a validator reading only the tool output must be able to say pass or fail.
 
+Task criteria rules (critical):
+- task_criteria apply to the MERGED output of ALL subtasks — not to individual steps.
+- Same quality bar as subtask success_criteria: concrete, falsifiable assertions.
+- Bad: "all subtasks completed successfully"
+- Good: "merged output contains a valid absolute file path ending in .mp3 or .m4a"
+
 Memory constraint rules (when a MEMORY CONSTRAINTS block is present):
 - Every "MUST NOT" line records an approach that failed before for a similar task. You MUST NOT use that approach regardless of how promising it seems.
 - Every "SHOULD PREFER" line records an approach that worked before. Prefer it over untested alternatives.
@@ -68,18 +74,21 @@ To call cc, output EXACTLY this JSON object (nothing else on the turn):
 You will receive cc's response and may call it again (limit: 2 times total).
 Only call cc when it materially improves planning — skip it for simple tasks.
 
-When ready to finalise, output ONLY a JSON array (no wrapper, no markdown, no prose):
-[
-  {
-    "subtask_id": "<uuid>",
-    "parent_task_id": "...",
-    "intent": "<one-sentence action>",
-    "success_criteria": ["<assertion checkable against tool output>"],
-    "context": "<relevant background, constraints, known paths>",
-    "deadline": null,
-    "sequence": 1
-  }
-]
+When ready to finalise, output ONLY this JSON object (no markdown, no prose):
+{
+  "task_criteria": ["<assertion about the COMBINED output of ALL subtasks>"],
+  "subtasks": [
+    {
+      "subtask_id": "<uuid>",
+      "parent_task_id": "...",
+      "intent": "<one-sentence action>",
+      "success_criteria": ["<assertion checkable against tool output>"],
+      "context": "<relevant background, constraints, known paths>",
+      "deadline": null,
+      "sequence": 1
+    }
+  ]
+}
 
 Generate a fresh UUID string for each subtask_id.`
 
@@ -105,7 +114,7 @@ Rules:
 - You MUST NOT use any tool listed in blocked_tools — this is code-enforced.
 - Do NOT repeat the failed subtask approach described in rationale.
 - Apply the same sequence, context, and decomposition rules as the initial plan.
-- Output ONLY a JSON array of SubTask objects as specified in your system prompt.`
+- Output ONLY the JSON wrapper object (task_criteria + subtasks) as specified in your system prompt.`
 
 // Planner is R2. It decomposes TaskSpec into SubTasks and handles replanning.
 type Planner struct {
@@ -497,7 +506,7 @@ func (p *Planner) dispatchViaLLM(ctx context.Context, spec types.TaskSpec, userP
 					Payload:   types.CCResponse{TaskID: spec.TaskID, CallN: ccCalls, Chars: len(ccOut), Response: preview},
 				})
 				ccHistory.WriteString(fmt.Sprintf("\n\n[cc call %d]\nQ: %s\nA: %s", ccCalls, act.Prompt, ccOut))
-				currentUser = userPrompt + ccHistory.String() + "\n\nNow output the final SubTask JSON array:"
+				currentUser = userPrompt + ccHistory.String() + "\n\nNow output the final JSON wrapper object (task_criteria + subtasks):"
 				continue
 			}
 		}
@@ -532,11 +541,28 @@ func (p *Planner) dispatchViaCCBrain(ctx context.Context, spec types.TaskSpec, u
 	return p.emitSubTasks(spec, raw, 0, "cc")
 }
 
-// emitSubTasks parses a raw SubTask JSON array and fans it out on the bus.
+// emitSubTasks parses a raw SubTask plan (wrapper or array) and fans it out on the bus.
+// It first attempts to parse the new wrapper format {"task_criteria":[...],"subtasks":[...]};
+// if that fails it falls back to the legacy raw JSON array for backward compatibility.
 func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string, ccCalls int, plannerBrain string) error {
 	var subTasks []types.SubTask
-	if err := json.Unmarshal([]byte(raw), &subTasks); err != nil {
-		return fmt.Errorf("parse SubTasks: %w (raw: %s)", err, raw)
+	var taskCriteria []string
+
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "{") {
+		var wrapper struct {
+			TaskCriteria []string        `json:"task_criteria"`
+			Subtasks     []types.SubTask `json:"subtasks"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &wrapper); err == nil && len(wrapper.Subtasks) > 0 {
+			subTasks = wrapper.Subtasks
+			taskCriteria = wrapper.TaskCriteria
+		}
+	}
+	if subTasks == nil {
+		if err := json.Unmarshal([]byte(raw), &subTasks); err != nil {
+			return fmt.Errorf("parse SubTasks: %w (raw: %s)", err, raw)
+		}
 	}
 
 	if len(subTasks) == 0 {
@@ -561,6 +587,7 @@ func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string, ccCalls int, pla
 		DispatchedAt: time.Now().UTC().Format(time.RFC3339),
 		PlannerBrain: plannerBrain,
 		CCCalls:      ccCalls,
+		TaskCriteria: taskCriteria,
 	}
 	p.b.Publish(types.Message{
 		ID:        uuid.New().String(),
