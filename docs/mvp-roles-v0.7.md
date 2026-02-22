@@ -20,6 +20,8 @@ Dreamer deferred to v0.8.
 | R4b no longer computes gap_trend — GGS owns gradient computation | Separates observation (R4b) from control (GGS). R4b's job is fan-in and raw data delivery; gradient is control-theoretic work |
 | R2 now receives PlanDirective (from GGS) instead of ReplanRequest (from R4b) | PlanDirective carries: loss breakdown, gradient signal, blocked_tools, directive type (refine / change_approach / break_symmetry / abandon), and rationale. R2 can now make a principled plan adjustment |
 | Dynamic MUST NOT injection: GGS appends blocked_tools to R2's MUST NOT set | Memory-sourced MUST NOTs are static (recorded from prior tasks). GGS-sourced MUST NOTs are dynamic (derived from the current task's failure trajectory). Both feed R2's plan validator |
+| v0.6 criteria ownership design implemented in code | R1 no longer outputs success_criteria (it was still doing so in code despite the v0.6 spec). R2 now outputs `{"task_criteria":[...],"subtasks":[...]}` wrapper. task_criteria are plain strings in `DispatchManifest`; R4b reads them from there. |
+| Gradient direction now visible in pipeline UI | The terminal pipeline display renders the PlanDirective gradient as a colored arrow: ↑ green (improving), ↓ red (worsening), ⊥ yellow (plateau), → stable. The medium loop's convergence trajectory is now observable without reading logs. |
 
 ---
 
@@ -135,25 +137,27 @@ MUST NOT set = memory-sourced constraints ∪ GGS-sourced `blocked_tools`.
 
 ```json
 SubTask {
+  "subtask_id":       "string",         // UUID assigned by runtime, never by LLM
   "parent_task_id":   "string",
   "intent":           "string",
-  "success_criteria": [
-    { "criterion": "string", "mode": "verifiable | plausible" }
-  ],
-  "context":  "string",
-  "deadline": "ISO8601 | null",
-  "sequence": "integer"
+  "success_criteria": ["string"],        // plain string assertions; {criterion, mode} deferred to v0.8
+  "context":          "string",
+  "deadline":         "ISO8601 | null",
+  "sequence":         "integer"
 }
 
 DispatchManifest {
   "task_id":       "string",
   "subtask_ids":   ["string"],
-  "task_criteria": [
-    { "criterion": "string", "mode": "verifiable | plausible" }
-  ],
-  "dispatched_at": "ISO8601"
+  "task_spec":     "TaskSpec | null",    // embedded for R4b context
+  "dispatched_at": "ISO8601",
+  "planner_brain": "llm | cc",           // which engine R2 used
+  "cc_calls":      "integer",            // number of cc consultations (0 = none)
+  "task_criteria": ["string"]            // plain string assertions about COMBINED output; R4b validates against these
 }
 ```
+
+**Note on criteria format**: v0.6 spec proposed `{criterion, mode}` objects to distinguish `verifiable` from `plausible` criteria. This was simplified to plain strings in the current implementation; `failure_class` in `SubTaskOutcome` partially captures the same signal. Structured mode is deferred to v0.8.
 
 **Does NOT**: Execute actions (R3). Evaluate output (R4a, R4b). Compute gradient or loss (R7). Override a `break_symmetry` directive with a near-identical plan.
 
@@ -475,8 +479,8 @@ User
 | Invariant | Enforced by |
 |---|---|
 | SubTask IDs are UUIDs assigned by Go runtime, never by LLM | Dispatcher |
-| TaskSpec carries no success_criteria — R2 derives all criteria | R2 planner prompt |
-| task_criteria live in DispatchManifest; R4b reads them from there | R4b code |
+| TaskSpec carries no success_criteria — R2 derives all criteria | R1 prompt (field removed); R2 planner prompt |
+| task_criteria live in DispatchManifest as plain strings; R4b reads them from there | R2 wrapper output; R4b code |
 | R4b LLM is not invoked when any SubTaskOutcome.status == "failed" | R4b code gate |
 | R4b sends ReplanRequest to R7, never directly to R2 | R4b code |
 | R4a verdict is aggregation of per-criterion booleans; one false = failed | R4a scoring loop |
