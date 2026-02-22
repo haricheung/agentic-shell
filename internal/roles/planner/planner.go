@@ -523,6 +523,7 @@ func (p *Planner) dispatchViaLLM(ctx context.Context, spec types.TaskSpec, userP
 func (p *Planner) dispatchViaCCBrain(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string) error {
 	fullPrompt := sysPrompt + "\n\n" + userPrompt
 	log.Printf("[R2] cc-brain planning task=%s", spec.TaskID)
+	log.Printf("[R2] ── CC-BRAIN PROMPT ────────────────────────────\n%s\n── END CC-BRAIN PROMPT ─────────────────────────", fullPrompt)
 
 	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
@@ -539,7 +540,7 @@ func (p *Planner) dispatchViaCCBrain(ctx context.Context, spec types.TaskSpec, u
 		raw = strings.TrimSpace(string(out))
 	}
 	raw = llm.StripFences(raw)
-	log.Printf("[R2] cc-brain response (%d chars): %.300s", len(raw), raw)
+	log.Printf("[R2] ── CC-BRAIN RESPONSE (%d chars) ─────────────────\n%s\n── END CC-BRAIN RESPONSE ───────────────────────", len(raw), raw)
 	return p.emitSubTasks(spec, raw, 0, "cc")
 }
 
