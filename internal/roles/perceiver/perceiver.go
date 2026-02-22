@@ -104,9 +104,12 @@ func (p *Perceiver) publish(spec types.TaskSpec) (string, error) {
 }
 
 func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) (types.TaskSpec, bool, string, error) {
-	userPrompt := input
+	today := time.Now().UTC().Format("2006-01-02")
+	userPrompt := "Today's date: " + today + "\n\n"
 	if sessionContext != "" {
-		userPrompt = "Recent session history:\n" + sessionContext + "\n\nNew input: " + input
+		userPrompt += "Recent session history:\n" + sessionContext + "\n\nNew input: " + input
+	} else {
+		userPrompt += input
 	}
 	raw, _, err := p.llm.Chat(ctx, systemPrompt, userPrompt)
 	if err != nil {

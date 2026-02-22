@@ -1525,3 +1525,26 @@ After the colored arrow, `ansiReset + ansiYellow` restores the message-type colo
 
 Files changed:
 - `internal/ui/display.go` — `MsgPlanDirective` case in `msgDetail`
+
+---
+
+## Issue #57 — R1 and R2 resolve relative dates incorrectly without knowing current date
+
+**Symptom**
+Input: `今年春节期间重要的科技新闻` ("important tech news during this year's Spring Festival").
+Today is 2026-02-22. R1 resolved "今年春节" as "2025年春节期间（1月28日-2月4日）" — wrong year (2025 vs 2026), same root cause as issue #50 but in R1 instead of R4a.
+
+**Root cause**
+R1 and R2 had no `Today's date` injection. Without knowing the current date, temporal references like "今年" (this year), "最近" (recently), "上周" (last week) are resolved from training data, which may lag by months or years.
+
+**Fix**
+Inject `Today's date: YYYY-MM-DD` at the top of the user prompt in:
+- R1 `perceive()` — so R1 correctly resolves relative time references when structuring the `TaskSpec`
+- R2 `plan()` — so R2 writes concrete date-specific `task_criteria`
+- R2 `replanWithDirective()` — so replanning also has current date context
+
+Same pattern already used in R4a's `score()` (issue #50).
+
+Files changed:
+- `internal/roles/perceiver/perceiver.go` — date prepended to user prompt in `perceive()`
+- `internal/roles/planner/planner.go` — date prepended in `plan()` and `replanWithDirective()`

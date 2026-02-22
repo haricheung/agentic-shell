@@ -242,15 +242,16 @@ func (p *Planner) plan(ctx context.Context, spec types.TaskSpec, memory []types.
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
 	constraints := calibrate(memory, spec.Intent)
 
+	today := time.Now().UTC().Format("2006-01-02")
 	var userPrompt string
 	if constraints != "" {
 		log.Printf("[R2] calibration: injecting constraints from %d memory entries", len(memory))
 		userPrompt = fmt.Sprintf(
-			"TaskSpec:\n%s\n\n--- MEMORY CONSTRAINTS (code-derived) ---\n%s--- END CONSTRAINTS ---",
-			specJSON, constraints)
+			"Today's date: %s\n\nTaskSpec:\n%s\n\n--- MEMORY CONSTRAINTS (code-derived) ---\n%s--- END CONSTRAINTS ---",
+			today, specJSON, constraints)
 	} else {
 		log.Printf("[R2] calibration: no relevant memory entries")
-		userPrompt = fmt.Sprintf("TaskSpec:\n%s", specJSON)
+		userPrompt = fmt.Sprintf("Today's date: %s\n\nTaskSpec:\n%s", today, specJSON)
 	}
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
 }
@@ -280,7 +281,8 @@ func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, 
 		constraints = "(none)"
 	}
 
-	userPrompt := fmt.Sprintf(planDirectivePrompt, pdJSON, specJSON, constraints)
+	today := time.Now().UTC().Format("2006-01-02")
+	userPrompt := "Today's date: " + today + "\n\n" + fmt.Sprintf(planDirectivePrompt, pdJSON, specJSON, constraints)
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
 }
 
