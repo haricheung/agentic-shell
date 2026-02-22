@@ -21,7 +21,8 @@ Dreamer deferred to v0.8.
 | R2 now receives PlanDirective (from GGS) instead of ReplanRequest (from R4b) | PlanDirective carries: loss breakdown, gradient signal, blocked_tools, directive type (refine / change_approach / break_symmetry / abandon), and rationale. R2 can now make a principled plan adjustment |
 | Dynamic MUST NOT injection: GGS appends blocked_tools to R2's MUST NOT set | Memory-sourced MUST NOTs are static (recorded from prior tasks). GGS-sourced MUST NOTs are dynamic (derived from the current task's failure trajectory). Both feed R2's plan validator |
 | v0.6 criteria ownership design implemented in code | R1 no longer outputs success_criteria (it was still doing so in code despite the v0.6 spec). R2 now outputs `{"task_criteria":[...],"subtasks":[...]}` wrapper. task_criteria are plain strings in `DispatchManifest`; R4b reads them from there. |
-| Gradient direction now visible in pipeline UI | The terminal pipeline display renders the PlanDirective gradient as a colored arrow: ↑ green (improving), ↓ red (worsening), ⊥ yellow (plateau), → stable. The medium loop's convergence trajectory is now observable without reading logs. |
+| PlanDirective pipeline line shows D, P, ∇L, Ω; spinner shows rationale | All four GGS metrics are now visible in the terminal pipeline display. The gradient arrow (↑ ↓ ⊥ →) encodes direction; D, P, ∆L, Ω are shown numerically. While R2 replans, the spinner shows the human-readable rationale explaining why the directive was chosen. |
+| `<think>` blocks stripped from all LLM output before JSON parsing | Reasoning models (e.g. deepseek-r1) emit `<think>...</think>` blocks in raw completions. These caused `json.Unmarshal` to fail with `invalid character '<'`, which R4a classified as infrastructure errors and marked subtasks failed without retry. `StripThinkBlocks()` is now called as the first step of `StripFences()` for all roles. |
 
 ---
 
@@ -179,8 +180,6 @@ DispatchManifest {
   "subtask_ids":   ["string"],
   "task_spec":     "TaskSpec | null",    // embedded for R4b context
   "dispatched_at": "ISO8601",
-  "planner_brain": "llm | cc",           // which engine R2 used
-  "cc_calls":      "integer",            // number of cc consultations (0 = none)
   "task_criteria": ["string"]            // plain string assertions about COMBINED output; R4b validates against these
 }
 ```
@@ -403,14 +402,57 @@ directive is triggered.
 
 ### Directive Decision Table
 
-| ∇L | D | P | Ω | Directive |
-|---|---|---|---|---|
-| < 0 (improving) | any | any | < 0.8 | `refine` — on the right track; tighten parameters |
-| ≈ 0 (plateau) | > δ | high (logical) | < 0.8 | `break_symmetry` — block all tried tools; demand novel approach |
-| ≈ 0 (plateau) | > δ | low (environmental) | < 0.8 | `change_path` — same tool sequence, different target/parameters |
-| > 0 (worsening) | > δ | high (logical) | < 0.8 | `change_approach` — escalate; explicitly different tool class |
-| > 0 (worsening) | > δ | low (environmental) | < 0.8 | `refine` with path hint — environment is the issue |
-| any | any | any | ≥ 0.8 | `abandon` — budget pressure overrides gradient direction |
+Ω ≥ 0.8 (`abandon`) always wins regardless of gradient. Otherwise:
+
+| ∇L | D | P | Directive |
+|---|---|---|---|
+| < 0 (improving) | any | any | `refine` |
+| ≈ 0 (plateau) | > δ | ≤ 0.5 (environmental) | `change_path` |
+| ≈ 0 (plateau) | > δ | > 0.5 (logical) | `break_symmetry` |
+| > 0 (worsening) | > δ | ≤ 0.5 (environmental) | `refine` (with path hint) |
+| > 0 (worsening) | > δ | > 0.5 (logical) | `change_approach` |
+
+**The P = 0.5 pivot**: P measures whether failures are logical (same approach keeps failing — the
+logic is wrong) or environmental (approach is sound but the specific target/path is blocked).
+First replan → P is typically low (one failure could be bad luck). Repeated failure with the same
+approach → P rises above 0.5 → logical origin → escalate.
+
+### Directive Semantics
+
+**`refine`** — Triggered by improving gradient (loss decreasing) or worsening with environmental
+origin. The approach is correct or at worst mis-aimed. R2 keeps the same tool sequence and
+tightens parameters: narrower query, more precise path, different search terms.
+- `blocked_tools`: none (tools are working, just not perfectly)
+- Rationale shows: `"Loss decreasing (∇L=X) — on the right track"` or `"Environmental issue (P≤0.5) — adjust path"`
+
+**`change_path`** — Triggered by plateau with environmental origin (P ≤ 0.5). The approach is
+sound but something about the specific path is wrong (file moved, search returned nothing, API
+returned empty). Same tool class, different target or parameters.
+- `blocked_tools`: none
+- Rationale shows: `"Plateau (|∇L|<ε, D>δ). Environmental origin (P=X). Same approach, different target/parameters."`
+
+**`break_symmetry`** — Triggered by plateau with logical origin (P > 0.5). The approach itself is
+fundamentally wrong — the same tools keep being called with the same logic and keep failing.
+Must escape the local minimum by switching to a completely different tool class.
+- `blocked_tools`: **all tools used in failing subtasks** (populated by GGS, enforced by R2's plan validator)
+- Rationale shows: `"Local minimum (|∇L|<ε, D>δ, P=X). Block all tried tools; demand novel approach."`
+
+**`change_approach`** — Triggered by worsening gradient with logical origin (P > 0.5). Loss is
+actively increasing — not just stuck, but getting worse — and the failures are logical.
+Must escalate to an explicitly different tool class.
+- `blocked_tools`: tools from failing subtasks
+- Rationale shows: `"Loss worsening (∇L=X) with logical failures (P>0.5). Use explicitly different tool class."`
+
+**`abandon`** — Triggered when Ω ≥ 0.8 regardless of gradient. Budget pressure overrides all
+other signals. GGS delivers `FinalResult` with failure summary directly; R2 is not invoked.
+
+### First-Round Behaviour (Q1 resolved)
+
+On the first replan round, `L_prev` is undefined so `∇L = 0`. This is treated as a plateau
+condition: if D > δ, the directive selection proceeds with `∇L ≈ 0`. In practice the first round
+is almost always `change_path` or `break_symmetry` depending on P, since D is typically high
+on the first failure. This is the correct behaviour — the system should not `refine` on the very
+first failure signal without any prior loss baseline.
 
 ### Dynamic MUST NOT Injection
 
@@ -451,8 +493,9 @@ PlanDirective {
   "blocked_tools":     ["string"],        // tools R2 must not use in next plan
   "failed_criterion":  "string",          // primary criterion driving D
   "failure_class":     "logical | environmental | mixed",
-  "budget_pressure":   "float",           // Ω value for display
-  "rationale":         "string"           // human-readable explanation; logged by Auditor
+  "budget_pressure":   "float",           // Ω for display (same as loss.Omega)
+  "grad_l":            "float",           // ∇L = L_t − L_{t-1}; 0 on first replan round
+  "rationale":         "string"           // human-readable explanation; logged by Auditor; shown in UI spinner
 }
 ```
 
@@ -554,7 +597,7 @@ User
 | ε | 0.1 | Plateau detection threshold for \|∇L\| |
 | δ | 0.3 | Minimum D to trigger break_symmetry (below this, consider it converged) |
 | abandon_Ω | 0.8 | Ω threshold above which directive becomes `abandon` regardless of gradient |
-| time_budget_ms | 120000 | Default time budget per task (2 min); configurable |
+| time_budget_ms | 300000 | Default time budget per task (5 min); raised from 120 s after issue #46 (real-world LLM latency exceeds 2 min budget) |
 
 These are initial values. They should be tuned empirically once GGS is deployed.
 The Auditor's gap_trend data across sessions provides the signal for tuning.
@@ -565,7 +608,7 @@ The Auditor's gap_trend data across sessions provides the signal for tuning.
 
 | # | Question | Blocks |
 |---|---|---|
-| Q1 | How does GGS handle the first replan round when L_prev is undefined? Use D as a proxy for L (∇L = 0, treat as stable/plateau if D is high) | R7 |
+| Q1 | ~~How does GGS handle the first replan round when L_prev is undefined?~~ **Resolved**: set ∇L = 0 for the first round; if D > δ, this triggers `change_path` or `break_symmetry` depending on P. Implemented in code. | R7 ✓ |
 | Q2 | Should GGS persist L_prev across sessions (in R5) or only within a single task's lifetime? Cross-session persistence enables better gradient estimation for recurring task types | R7, R5 |
 | Q3 | How should `change_path` directive communicate the *new* path hint to R2 — as free text in rationale, or as a structured `suggested_alternatives` field? | R7, R2 |
 | Q4 | When multiple subtasks fail with different failure_classes, how does GGS pick the dominant class for the directive? Proposed: majority vote; tie → "mixed" class → `change_approach` | R7 |
