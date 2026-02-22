@@ -30,6 +30,12 @@ Field rules:
 - task_id: short, descriptive, snake_case (e.g. "find_video_file", "disk_space_check"). Not a UUID.
 - intent: one sentence, action-oriented, no filler.
 
+Temporal reference rules:
+- Do NOT resolve relative time words (今年/this year, 最近/recently, 上周/last week, 昨天/yesterday, etc.) into specific dates or years.
+- Preserve them verbatim in intent. R2 owns temporal interpretation with knowledge of the current date.
+- Bad: intent = "find news from Spring Festival 2025 (Jan 28–Feb 4)"
+- Good: intent = "find tech news from this year's Spring Festival"
+
 Session history rules:
 - Use provided history to resolve ambiguous pronouns ("it", "that", "those files") and reactions ("wrong", "again", "bullshit") — always infer intent, never ask about these.
 - A negative reaction ("wrong", "no", "that's not right") means restate the previous intent with stricter success criteria or a different approach.
@@ -104,12 +110,9 @@ func (p *Perceiver) publish(spec types.TaskSpec) (string, error) {
 }
 
 func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) (types.TaskSpec, bool, string, error) {
-	today := time.Now().UTC().Format("2006-01-02")
-	userPrompt := "Today's date: " + today + "\n\n"
+	userPrompt := input
 	if sessionContext != "" {
-		userPrompt += "Recent session history:\n" + sessionContext + "\n\nNew input: " + input
-	} else {
-		userPrompt += input
+		userPrompt = "Recent session history:\n" + sessionContext + "\n\nNew input: " + input
 	}
 	raw, _, err := p.llm.Chat(ctx, systemPrompt, userPrompt)
 	if err != nil {

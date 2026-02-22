@@ -1538,13 +1538,12 @@ Today is 2026-02-22. R1 resolved "今年春节" as "2025年春节期间（1月28
 R1 and R2 had no `Today's date` injection. Without knowing the current date, temporal references like "今年" (this year), "最近" (recently), "上周" (last week) are resolved from training data, which may lag by months or years.
 
 **Fix**
-Inject `Today's date: YYYY-MM-DD` at the top of the user prompt in:
-- R1 `perceive()` — so R1 correctly resolves relative time references when structuring the `TaskSpec`
-- R2 `plan()` — so R2 writes concrete date-specific `task_criteria`
-- R2 `replanWithDirective()` — so replanning also has current date context
+Two-part fix that respects the R1/R2 role boundary:
 
-Same pattern already used in R4a's `score()` (issue #50).
+- **R1**: add a "temporal reference rule" to the system prompt — R1 must NOT resolve relative time words (今年/this year, 最近/recently, 上周/last week, etc.) into specific dates. Preserve them verbatim in `intent`. This is architecturally correct: R1 is a receiver, not a resolver; R2 owns temporal interpretation. Injecting today's date into R1 would be badcase-overfitting (patching R1's behaviour for one failing case instead of fixing the role boundary).
+
+- **R2**: inject `Today's date: YYYY-MM-DD` into the user prompt in `plan()` and `replanWithDirective()`. R2 needs the concrete date to write falsifiable `task_criteria` (e.g. "output contains news from Spring Festival 2026, Jan 28–Feb 4"). This is the same mechanism as R4a (issue #50) and is general, not badcase-specific.
 
 Files changed:
-- `internal/roles/perceiver/perceiver.go` — date prepended to user prompt in `perceive()`
-- `internal/roles/planner/planner.go` — date prepended in `plan()` and `replanWithDirective()`
+- `internal/roles/perceiver/perceiver.go` — temporal reference rule added to system prompt; date injection removed
+- `internal/roles/planner/planner.go` — `Today's date` prepended in `plan()` and `replanWithDirective()`
