@@ -5,6 +5,25 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #67 — Safety-net abandon emits FinalResult with D=0.0; UI shows green (false success)
+
+**Symptom**: After the Law 1 gate forced the agent to exhaust its replan budget, the
+pipeline display rendered the final FinalResult line in green (`D=0.00`) instead of red,
+because the `endTask(success=false)` rule triggers on `FinalResult.Loss.D > 0`.
+
+**Root cause**: The metaval safety-net abandon path (triggered after `maxReplans=3` rounds
+in `triggerReplan`) published `FinalResult` with a zero-value `Loss` struct, leaving
+`Loss.D = 0.0`. GGS is bypassed on this path so it never computed D from the outcomes.
+
+**Fix**: Added `safetyNetLoss(outcomes []types.SubTaskOutcome) types.LossBreakdown` helper
+that computes D as `failed / total`; falls back to D=1.0 when outcomes is empty or all
+matched (the invariant is that if the safety net fired, the task failed). The safety-net
+`FinalResult` now carries `Loss: safetyNetLoss(outcomes)` and `Replans: replanCount` so the
+UI abort-detection rule (`D > 0`) fires correctly and the replan count appears in the flow
+line. Five tests added for `safetyNetLoss`.
+
+---
+
 ## Issue #66 — Law 1 bypass: `rm` embedded in for-loop body not detected
 
 **Symptom**: Second manual test of "delete all .log files in /tmp" showed that after both `rm -v` and `find -delete` were blocked (correct), the planner replanned and the model issued `for file in ...; do if [ -f "$file" ]; then rm "$file"; fi; done` — a for-loop with `rm` in the `then` branch. The loop body starts with `if`, not `rm`, so `isIrreversibleShell` did not detect it.

@@ -106,3 +106,60 @@ func TestAggregateFailureClassFromOutcomes_NoClassifiedCriteriaReturnsEmpty(t *t
 		t.Errorf("expected empty string when no criteria are classified, got %q", got)
 	}
 }
+
+// ── safetyNetLoss ──────────────────────────────────────────────────────────────
+
+func TestSafetyNetLoss_DEqualsOneWhenEmpty(t *testing.T) {
+	// Returns D = 1.0 when outcomes slice is empty (failure is the invariant)
+	loss := safetyNetLoss(nil)
+	if loss.D != 1.0 {
+		t.Errorf("expected D=1.0 for nil outcomes, got %v", loss.D)
+	}
+}
+
+func TestSafetyNetLoss_DGreaterThanZeroWhenOneFailed(t *testing.T) {
+	// Returns D > 0 when at least one outcome is failed
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched"},
+		{Status: "failed"},
+	}
+	loss := safetyNetLoss(outcomes)
+	if loss.D <= 0 {
+		t.Errorf("expected D > 0 with one failed outcome, got %v", loss.D)
+	}
+}
+
+func TestSafetyNetLoss_DEqualsHalfWhenHalfFailed(t *testing.T) {
+	// Returns D = 0.5 when exactly half the outcomes are failed
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched"},
+		{Status: "failed"},
+	}
+	loss := safetyNetLoss(outcomes)
+	if loss.D != 0.5 {
+		t.Errorf("expected D=0.5, got %v", loss.D)
+	}
+}
+
+func TestSafetyNetLoss_DEqualsOneWhenAllFailed(t *testing.T) {
+	// Returns D = 1.0 when all outcomes are failed
+	outcomes := []types.SubTaskOutcome{
+		{Status: "failed"},
+		{Status: "failed"},
+	}
+	loss := safetyNetLoss(outcomes)
+	if loss.D != 1.0 {
+		t.Errorf("expected D=1.0, got %v", loss.D)
+	}
+}
+
+func TestSafetyNetLoss_DEqualsOneFallbackWhenAllMatched(t *testing.T) {
+	// Returns D = 1.0 (fallback) when all outcomes are matched but we still abandoned
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched"},
+	}
+	loss := safetyNetLoss(outcomes)
+	if loss.D != 1.0 {
+		t.Errorf("expected D=1.0 fallback when no failed outcomes, got %v", loss.D)
+	}
+}

@@ -334,6 +334,34 @@ func aggregateFailureClassFromOutcomes(outcomes []types.SubTaskOutcome) string {
 	}
 }
 
+// safetyNetLoss computes a LossBreakdown for the safety-net abandon path.
+// GGS is bypassed on this path, so D must be computed locally so the UI's
+// endTask rule (D > 0 → failure) fires correctly.
+//
+// Expectations:
+//   - Returns D = 1.0 when outcomes slice is empty (failure is the invariant)
+//   - Returns D > 0 when at least one outcome is failed
+//   - Returns D = 1.0 when all outcomes are failed
+//   - Returns D = 0.5 when exactly half the outcomes are failed
+//   - Returns D = 1.0 (fallback) when all outcomes are matched but we still abandoned
+func safetyNetLoss(outcomes []types.SubTaskOutcome) types.LossBreakdown {
+	if len(outcomes) == 0 {
+		return types.LossBreakdown{D: 1.0}
+	}
+	failed := 0
+	for _, o := range outcomes {
+		if o.Status == "failed" {
+			failed++
+		}
+	}
+	d := float64(failed) / float64(len(outcomes))
+	if d == 0.0 {
+		// Safety net always represents failure; ensure D > 0 for UI detection.
+		d = 1.0
+	}
+	return types.LossBreakdown{D: d}
+}
+
 // triggerReplan handles the replan path for both the hard gate (code-enforced
 // failed subtask check) and the LLM-driven replan verdict. It writes a
 // procedural memory entry, publishes a ReplanRequest to R7 (GGS), and resets
@@ -385,7 +413,12 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 			From:      types.RoleMetaVal,
 			To:        types.RoleUser,
 			Type:      types.MsgFinalResult,
-			Payload:   types.FinalResult{TaskID: taskID, Summary: summary},
+			Payload: types.FinalResult{
+				TaskID:  taskID,
+				Summary: summary,
+				Loss:    safetyNetLoss(outcomes),
+				Replans: replanCount,
+			},
 		})
 		if m.outputFn != nil {
 			m.outputFn(taskID, summary, nil)
