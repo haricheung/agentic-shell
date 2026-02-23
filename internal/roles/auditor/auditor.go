@@ -43,6 +43,10 @@ type Auditor struct {
 	correctionCounts map[string]int
 	replanCounts     map[string]int
 
+	// GGS thrashing detection
+	breakSymCount map[string]int     // consecutive break_symmetry count per task_id
+	lastBreakSymD map[string]float64 // D from previous break_symmetry per task_id
+
 	// window stats — reset after each report
 	windowStart        time.Time
 	tasksObserved      int
@@ -65,6 +69,8 @@ func New(b *bus.Bus, tap <-chan types.Message, logPath string, statsPath string,
 		interval:         interval,
 		correctionCounts: make(map[string]int),
 		replanCounts:     make(map[string]int),
+		breakSymCount:    make(map[string]int),
+		lastBreakSymD:    make(map[string]float64),
 		windowStart:      time.Now().UTC(),
 	}
 	a.loadStats()
@@ -275,6 +281,37 @@ func (a *Auditor) process(msg types.Message) {
 				log.Printf("[AUDIT] CONVERGENCE FAILURE: %s", d)
 				a.mu.Lock()
 				a.anomalies = append(a.anomalies, "convergence_failure: "+d)
+				a.mu.Unlock()
+			}
+
+			// GGS thrashing: consecutive break_symmetry without D decreasing.
+			const breakSymThrashThreshold = 2
+			if pd.Directive == "break_symmetry" {
+				a.mu.Lock()
+				prevD, hasPrev := a.lastBreakSymD[pd.TaskID]
+				a.lastBreakSymD[pd.TaskID] = pd.Loss.D
+				if hasPrev && pd.Loss.D >= prevD-1e-9 {
+					a.breakSymCount[pd.TaskID]++
+				} else {
+					a.breakSymCount[pd.TaskID] = 1
+				}
+				count := a.breakSymCount[pd.TaskID]
+				a.mu.Unlock()
+
+				if count >= breakSymThrashThreshold {
+					anomaly = "ggs_thrashing"
+					d := fmt.Sprintf("task %s: %d consecutive break_symmetry without D decreasing (D=%.3f)",
+						pd.TaskID, count, pd.Loss.D)
+					detail = &d
+					log.Printf("[AUDIT] GGS THRASHING: %s", d)
+					a.mu.Lock()
+					a.anomalies = append(a.anomalies, "ggs_thrashing: "+d)
+					a.mu.Unlock()
+				}
+			} else {
+				a.mu.Lock()
+				delete(a.breakSymCount, pd.TaskID)
+				delete(a.lastBreakSymD, pd.TaskID)
 				a.mu.Unlock()
 			}
 		}

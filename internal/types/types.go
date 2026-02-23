@@ -93,30 +93,43 @@ type ExecutionResult struct {
 
 // CorrectionSignal is produced by R4a Agent-Validator and consumed by R3 Executor
 type CorrectionSignal struct {
-	SubTaskID     string `json:"subtask_id"`
-	AttemptNumber int    `json:"attempt_number"`
-	WhatWasWrong  string `json:"what_was_wrong"`
-	WhatToDo      string `json:"what_to_do"`
+	SubTaskID       string `json:"subtask_id"`
+	AttemptNumber   int    `json:"attempt_number"`
+	FailedCriterion string `json:"failed_criterion,omitempty"`
+	FailureClass    string `json:"failure_class,omitempty"` // "logical" | "environmental"
+	WhatWasWrong    string `json:"what_was_wrong"`
+	WhatToDo        string `json:"what_to_do"`
+}
+
+// CriteriaVerdict is one per-criterion verdict produced by R4a.
+// Carried in SubTaskOutcome so GGS can compute criterion-level D and P.
+type CriteriaVerdict struct {
+	Criterion    string `json:"criterion"`
+	Verdict      string `json:"verdict"`                 // "pass" | "fail"
+	FailureClass string `json:"failure_class,omitempty"` // "logical" | "environmental"
+	Evidence     string `json:"evidence,omitempty"`
 }
 
 // GapTrajectoryPoint records one attempt in the fast loop
 type GapTrajectoryPoint struct {
-	Attempt      int      `json:"attempt"`
-	Score        float64  `json:"score"`
+	Attempt       int      `json:"attempt"`
+	Score         float64  `json:"score"`
 	UnmetCriteria []string `json:"unmet_criteria"`
+	FailureClass  string   `json:"failure_class,omitempty"` // aggregate for this attempt
 }
 
 // SubTaskOutcome is produced by R4a and consumed by R4b and R7 (GGS)
 type SubTaskOutcome struct {
-	SubTaskID       string               `json:"subtask_id"`
-	ParentTaskID    string               `json:"parent_task_id"`
-	Intent          string               `json:"intent"`
-	SuccessCriteria []string             `json:"success_criteria"` // copied from SubTask so R4b can check them
-	Status          string               `json:"status"`           // "matched" | "failed"
-	Output          any                  `json:"output"`
-	FailureReason   *string              `json:"failure_reason"`
-	GapTrajectory   []GapTrajectoryPoint `json:"gap_trajectory"`
-	ToolCalls       []string             `json:"tool_calls,omitempty"` // tool names used in final execution attempt; for GGS blocked_tools
+	SubTaskID        string               `json:"subtask_id"`
+	ParentTaskID     string               `json:"parent_task_id"`
+	Intent           string               `json:"intent"`
+	SuccessCriteria  []string             `json:"success_criteria"`          // copied from SubTask so R4b can check them
+	Status           string               `json:"status"`                    // "matched" | "failed"
+	Output           any                  `json:"output"`
+	FailureReason    *string              `json:"failure_reason"`
+	GapTrajectory    []GapTrajectoryPoint `json:"gap_trajectory"`
+	CriteriaVerdicts []CriteriaVerdict    `json:"criteria_verdicts,omitempty"` // per-criterion verdicts from final attempt
+	ToolCalls        []string             `json:"tool_calls,omitempty"`        // tool names used in final execution attempt; for GGS blocked_tools
 }
 
 // ReplanRequest is produced by R4b and consumed by R7 (GGS). GGS owns gradient computation.

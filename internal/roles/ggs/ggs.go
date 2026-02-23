@@ -133,8 +133,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 	// Budget exceeded — GGS handles abandonment directly without routing to R2.
 	if directive == "abandon" {
 		log.Printf("[R7] task=%s ABANDON (Ω=%.3f ≥ %.1f)", taskID, Omega, abandonOmega)
-		summary := fmt.Sprintf("❌ Task abandoned by GGS after %d replan rounds (budget pressure=%.0f%%). %s",
-			replanCount, Omega*100, rr.GapSummary)
+		summary := buildAbandonSummary(rr)
 
 		// Publish FinalResult on bus for auditor + REPL subscription.
 		// Loss/GradL/Replans populated for trajectory checkpoint display.
@@ -259,33 +258,43 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 	}
 }
 
-// computeD computes intent-result distance D ∈ [0, 1].
-// D = (number of failed subtasks) / (total subtasks).
+// computeD computes intent-result distance D ∈ [0, 1] at criterion granularity.
+// When CriteriaVerdicts are present, D = failed_criteria / total_criteria.
+// Falls back to subtask-level (1 synthetic criterion per outcome) when CriteriaVerdicts absent.
 // Returns 1.0 when outcomes is empty (complete failure).
 //
 // Expectations:
 //   - Returns 1.0 when outcomes is empty (no data = total failure)
-//   - Returns 0.0 when all outcomes are "matched"
-//   - Returns 1.0 when all outcomes are "failed"
-//   - Returns 0.5 when half the outcomes are "failed"
+//   - Returns 0.0 when all outcomes are matched (with or without CriteriaVerdicts)
+//   - Uses CriteriaVerdicts when available: D = failed_criteria / total_criteria
+//   - For outcomes without CriteriaVerdicts: counts each as 1 synthetic criterion
+//   - Criterion-level result differs from subtask-level when subtasks have unequal criterion counts
 func computeD(outcomes []types.SubTaskOutcome) float64 {
 	if len(outcomes) == 0 {
 		return 1.0
 	}
-	failed := 0
+	total, failed := 0, 0
 	for _, o := range outcomes {
-		if o.Status == "failed" {
-			failed++
+		if len(o.CriteriaVerdicts) > 0 {
+			for _, cv := range o.CriteriaVerdicts {
+				total++
+				if cv.Verdict == "fail" {
+					failed++
+				}
+			}
+		} else {
+			// Synthetic: 1 criterion per outcome (subtask-level fallback)
+			total++
+			if o.Status == "failed" {
+				failed++
+			}
 		}
 	}
-	return float64(failed) / float64(len(outcomes))
+	return float64(failed) / float64(total)
 }
 
-// computeP computes process implausibility P ∈ [0, 1].
-// P measures whether the approach itself is wrong (logical) vs blocked by environment.
-// Without failure_class data in the current implementation, P defaults to 0.5 (neutral).
-// When FailureReason contains "logical" keywords, P is pushed toward 1.0;
-// "environmental" keywords push toward 0.0.
+// computePKeyword computes process implausibility P ∈ [0, 1] via keyword heuristics.
+// Used as fallback when no structured failure_class data is available.
 //
 // Expectations:
 //   - Returns 0.5 when outcomes is empty (neutral default)
@@ -293,7 +302,7 @@ func computeD(outcomes []types.SubTaskOutcome) float64 {
 //   - Returns value > 0.5 when failure reasons suggest logical errors
 //   - Returns value < 0.5 when failure reasons suggest environmental errors
 //   - Returns value in [0, 1]
-func computeP(outcomes []types.SubTaskOutcome) float64 {
+func computePKeyword(outcomes []types.SubTaskOutcome) float64 {
 	logicalKW := []string{"logic", "wrong approach", "incorrect", "invalid", "cannot", "not possible",
 		"permission denied", "operation not permitted"}
 	envKW := []string{"network", "timeout", "context deadline", "connection", "unavailable",
@@ -340,6 +349,39 @@ func computeP(outcomes []types.SubTaskOutcome) float64 {
 		return 0.5
 	}
 	return float64(logical) / float64(total)
+}
+
+// computeP computes process implausibility P ∈ [0, 1].
+// Uses CriteriaVerdicts.FailureClass when available; falls back to keyword heuristics.
+//
+// Expectations:
+//   - Returns 0.5 when outcomes is empty (neutral)
+//   - Uses CriteriaVerdicts.FailureClass when at least one classified fail present
+//   - Returns P = logical / (logical+environmental) from structured data
+//   - Falls back to computePKeyword when no structured failure_class is classified
+//   - Returns 0.5 (via fallback) when CriteriaVerdicts present but all FailureClass fields empty
+func computeP(outcomes []types.SubTaskOutcome) float64 {
+	logical, env := 0, 0
+	for _, o := range outcomes {
+		if o.Status != "failed" {
+			continue
+		}
+		for _, cv := range o.CriteriaVerdicts {
+			if cv.Verdict != "fail" {
+				continue
+			}
+			switch cv.FailureClass {
+			case "logical":
+				logical++
+			case "environmental":
+				env++
+			}
+		}
+	}
+	if logical+env > 0 {
+		return float64(logical) / float64(logical+env)
+	}
+	return computePKeyword(outcomes)
 }
 
 // computeOmega computes resource cost Ω ∈ [0, 1].
@@ -506,6 +548,38 @@ func computeFailureClass(outcomes []types.SubTaskOutcome) string {
 		return "environmental"
 	}
 	return "mixed"
+}
+
+// buildAbandonSummary generates a structured summary from SubTaskOutcome data.
+// No LLM call; R2 graceful failure (LLM-backed) is deferred to v0.8.
+//
+// Expectations:
+//   - Lists completed subtask intents when any matched
+//   - Lists failed subtask intents when any failed
+//   - Includes gap_summary when non-empty
+//   - Always ends with generic next-step suggestions
+func buildAbandonSummary(rr types.ReplanRequest) string {
+	var matched, failed []string
+	for _, o := range rr.Outcomes {
+		if o.Status == "matched" {
+			matched = append(matched, o.Intent)
+		} else {
+			failed = append(failed, o.Intent)
+		}
+	}
+
+	parts := []string{"❌ Task abandoned after budget exhausted."}
+	if len(matched) > 0 {
+		parts = append(parts, fmt.Sprintf("Completed: %s.", strings.Join(matched, "; ")))
+	}
+	if len(failed) > 0 {
+		parts = append(parts, fmt.Sprintf("Failed: %s.", strings.Join(failed, "; ")))
+	}
+	if rr.GapSummary != "" {
+		parts = append(parts, rr.GapSummary)
+	}
+	parts = append(parts, "Consider breaking the task into smaller steps or retrying with more specific instructions.")
+	return strings.Join(parts, " ")
 }
 
 // buildRationale produces a human-readable explanation of the directive.

@@ -52,6 +52,43 @@ func TestComputeD_HalfFailedReturnsHalf(t *testing.T) {
 	}
 }
 
+func TestComputeD_CriterionLevelHigherThanSubtaskLevel(t *testing.T) {
+	// st1: 3 criteria all fail; st2: 1 criterion passes
+	// CriteriaVerdicts: D=3/4=0.75; subtask fallback would give D=1/2=0.5
+	outcomes := []types.SubTaskOutcome{
+		{
+			Status: "failed",
+			CriteriaVerdicts: []types.CriteriaVerdict{
+				{Criterion: "a", Verdict: "fail"},
+				{Criterion: "b", Verdict: "fail"},
+				{Criterion: "c", Verdict: "fail"},
+			},
+		},
+		{
+			Status: "failed",
+			CriteriaVerdicts: []types.CriteriaVerdict{
+				{Criterion: "d", Verdict: "pass"},
+			},
+		},
+	}
+	got := computeD(outcomes)
+	if math.Abs(got-0.75) > 1e-9 {
+		t.Errorf("expected criterion-level D=0.75, got %f", got)
+	}
+}
+
+func TestComputeD_FallsBackToSubtaskLevelWhenNoCriteriaVerdicts(t *testing.T) {
+	// outcomes with no CriteriaVerdicts → same result as old computeD (subtask-level)
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched"},
+		{Status: "failed"},
+	}
+	got := computeD(outcomes)
+	if math.Abs(got-0.5) > 1e-9 {
+		t.Errorf("expected subtask-level D=0.5, got %f", got)
+	}
+}
+
 // ── computeP ────────────────────────────────────────────────────────────────
 
 func TestComputeP_EmptyOutcomesReturnsNeutral(t *testing.T) {
@@ -102,6 +139,56 @@ func TestComputeP_InRangeZeroToOne(t *testing.T) {
 	got := computeP(outcomes)
 	if got < 0.0 || got > 1.0 {
 		t.Errorf("P out of range [0,1]: %f", got)
+	}
+}
+
+func TestComputeP_AllLogicalCriteriaReturnsOne(t *testing.T) {
+	// CriteriaVerdicts with all FailureClass="logical" → P=1.0
+	outcomes := []types.SubTaskOutcome{
+		{
+			Status: "failed",
+			CriteriaVerdicts: []types.CriteriaVerdict{
+				{Criterion: "a", Verdict: "fail", FailureClass: "logical"},
+				{Criterion: "b", Verdict: "fail", FailureClass: "logical"},
+			},
+		},
+	}
+	got := computeP(outcomes)
+	if math.Abs(got-1.0) > 1e-9 {
+		t.Errorf("expected P=1.0 for all logical failures, got %f", got)
+	}
+}
+
+func TestComputeP_AllEnvironmentalCriteriaReturnsZero(t *testing.T) {
+	// CriteriaVerdicts with all FailureClass="environmental" → P=0.0
+	outcomes := []types.SubTaskOutcome{
+		{
+			Status: "failed",
+			CriteriaVerdicts: []types.CriteriaVerdict{
+				{Criterion: "a", Verdict: "fail", FailureClass: "environmental"},
+			},
+		},
+	}
+	got := computeP(outcomes)
+	if math.Abs(got-0.0) > 1e-9 {
+		t.Errorf("expected P=0.0 for all environmental failures, got %f", got)
+	}
+}
+
+func TestComputeP_FallsBackToKeywordWhenNoStructuredClass(t *testing.T) {
+	// CriteriaVerdicts present but FailureClass="" on all → falls back to keyword → neutral (0.5)
+	outcomes := []types.SubTaskOutcome{
+		{
+			Status: "failed",
+			CriteriaVerdicts: []types.CriteriaVerdict{
+				{Criterion: "a", Verdict: "fail", FailureClass: ""},
+			},
+		},
+	}
+	got := computeP(outcomes)
+	// No keywords in empty failure reasons → neutral 0.5
+	if math.Abs(got-0.5) > 1e-9 {
+		t.Errorf("expected P=0.5 fallback when no structured class, got %f", got)
 	}
 }
 

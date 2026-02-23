@@ -34,6 +34,7 @@ Empty-result rule:
 - If task is to find/list items AND tool_calls show a real search ran AND result is empty → "matched". Absence is a valid answer.
 - Send "retry" for empty results ONLY if tool_calls is empty or the search target was clearly wrong (wrong directory, wrong pattern).
 
+For each failed criterion, set failure_class to "logical" (wrong approach, incorrect logic) or "environmental" (network error, timeout, file not found, permission denied).
 
 Output — choose ONE. Always include criteria_results with one entry per success criterion.
 
@@ -41,10 +42,10 @@ Gap closed:
 {"verdict":"matched","score":1.0,"criteria_results":[{"criterion":"<exact criterion text>","met":true,"evidence":"<one-line tool output snippet>"}],"unmet_criteria":[]}
 
 Gap non-zero, retries remain:
-{"verdict":"retry","score":0.5,"criteria_results":[{"criterion":"<exact criterion text>","met":false,"evidence":"<why it failed>"}],"unmet_criteria":["..."],"what_was_wrong":"<specific observation>","what_to_do":"<concrete alternative action>"}
+{"verdict":"retry","score":0.5,"criteria_results":[{"criterion":"<exact criterion text>","met":false,"failure_class":"logical","evidence":"<why it failed>"}],"unmet_criteria":["..."],"what_was_wrong":"<specific observation>","what_to_do":"<concrete alternative action>"}
 
 Failed or infrastructure error:
-{"verdict":"failed","score":0.0,"criteria_results":[{"criterion":"<exact criterion text>","met":false,"evidence":"<why it failed>"}],"unmet_criteria":["..."],"failure_reason":"..."}
+{"verdict":"failed","score":0.0,"criteria_results":[{"criterion":"<exact criterion text>","met":false,"failure_class":"environmental","evidence":"<why it failed>"}],"unmet_criteria":["..."],"failure_reason":"..."}
 
 No markdown, no prose, no code fences.`
 
@@ -62,9 +63,10 @@ func New(b *bus.Bus, llmClient *llm.Client) *AgentValidator {
 }
 
 type criterionResult struct {
-	Criterion string `json:"criterion"`
-	Met       bool   `json:"met"`
-	Evidence  string `json:"evidence,omitempty"`
+	Criterion    string `json:"criterion"`
+	Met          bool   `json:"met"`
+	Evidence     string `json:"evidence,omitempty"`
+	FailureClass string `json:"failure_class,omitempty"` // when Met=false: "logical" | "environmental"
 }
 
 type verdict struct {
@@ -77,20 +79,81 @@ type verdict struct {
 	FailureReason   string            `json:"failure_reason,omitempty"`
 }
 
+// aggregateFailureClass returns "logical" | "environmental" | "mixed" | ""
+// based on the failed criterionResult entries for one attempt.
+//
+// Expectations:
+//   - Returns "" when no criterionResults or all are Met=true
+//   - Returns "logical" when all failed criteria have failure_class=="logical"
+//   - Returns "environmental" when all failed criteria have failure_class=="environmental"
+//   - Returns "mixed" when both classes are present
+func aggregateFailureClass(crs []criterionResult) string {
+	logical, env := 0, 0
+	for _, cr := range crs {
+		if cr.Met {
+			continue
+		}
+		switch cr.FailureClass {
+		case "logical":
+			logical++
+		case "environmental":
+			env++
+		}
+	}
+	switch {
+	case logical == 0 && env == 0:
+		return ""
+	case logical > 0 && env == 0:
+		return "logical"
+	case env > 0 && logical == 0:
+		return "environmental"
+	default:
+		return "mixed"
+	}
+}
+
+// toCriteriaVerdicts converts internal criterionResult slice to exported CriteriaVerdict slice.
+//
+// Expectations:
+//   - Returns nil when input is nil or empty
+//   - Verdict is "pass" when Met=true, "fail" when false
+//   - FailureClass and Evidence are forwarded as-is
+func toCriteriaVerdicts(crs []criterionResult) []types.CriteriaVerdict {
+	if len(crs) == 0 {
+		return nil
+	}
+	out := make([]types.CriteriaVerdict, len(crs))
+	for i, cr := range crs {
+		verdict := "pass"
+		if !cr.Met {
+			verdict = "fail"
+		}
+		out[i] = types.CriteriaVerdict{
+			Criterion:    cr.Criterion,
+			Verdict:      verdict,
+			FailureClass: cr.FailureClass,
+			Evidence:     cr.Evidence,
+		}
+	}
+	return out
+}
+
 // outcome builds a SubTaskOutcome carrying the original criteria so R4b can check them.
 // toolCalls are the tool calls from the final execution attempt, forwarded to R7 (GGS)
 // so it can derive blocked_tools for break_symmetry/change_approach directives.
-func (a *AgentValidator) outcome(st types.SubTask, status string, output any, reason *string, traj []types.GapTrajectoryPoint, toolCalls []string) types.SubTaskOutcome {
+// criteriaVerdicts carries per-criterion verdicts from the final attempt (nil for infra errors).
+func (a *AgentValidator) outcome(st types.SubTask, status string, output any, reason *string, traj []types.GapTrajectoryPoint, criteriaVerdicts []types.CriteriaVerdict, toolCalls []string) types.SubTaskOutcome {
 	return types.SubTaskOutcome{
-		SubTaskID:       st.SubTaskID,
-		ParentTaskID:    st.ParentTaskID,
-		Intent:          st.Intent,
-		SuccessCriteria: st.SuccessCriteria,
-		Status:          status,
-		Output:          output,
-		FailureReason:   reason,
-		GapTrajectory:   traj,
-		ToolCalls:       toolCalls,
+		SubTaskID:        st.SubTaskID,
+		ParentTaskID:     st.ParentTaskID,
+		Intent:           st.Intent,
+		SuccessCriteria:  st.SuccessCriteria,
+		Status:           status,
+		Output:           output,
+		FailureReason:    reason,
+		GapTrajectory:    traj,
+		CriteriaVerdicts: criteriaVerdicts,
+		ToolCalls:        toolCalls,
 	}
 }
 
@@ -136,13 +199,13 @@ func (a *AgentValidator) Run(
 		select {
 		case <-ctx.Done():
 			reason := "context cancelled"
-			o := a.outcome(subTask, "failed", nil, &reason, trajectory, lastToolCalls)
+			o := a.outcome(subTask, "failed", nil, &reason, trajectory, nil, lastToolCalls)
 			tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 			return o
 		case r, ok := <-resultCh:
 			if !ok {
 				reason := "result channel closed"
-				o := a.outcome(subTask, "failed", nil, &reason, trajectory, lastToolCalls)
+				o := a.outcome(subTask, "failed", nil, &reason, trajectory, nil, lastToolCalls)
 				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 				return o
 			}
@@ -209,12 +272,13 @@ func (a *AgentValidator) Run(
 			Attempt:       attempt,
 			Score:         v.Score,
 			UnmetCriteria: v.UnmetCriteria,
+			FailureClass:  aggregateFailureClass(v.CriteriaResults),
 		})
 
 		switch v.Verdict {
 		case "matched":
 			log.Printf("[R4a] subtask=%s MATCHED on attempt=%d", subTask.SubTaskID, attempt)
-			o := a.outcome(subTask, "matched", result.Output, nil, trajectory, lastToolCalls)
+			o := a.outcome(subTask, "matched", result.Output, nil, trajectory, toCriteriaVerdicts(v.CriteriaResults), lastToolCalls)
 			tlog.SubtaskEnd(subTask.SubTaskID, "matched")
 			a.publish(o)
 			return o
@@ -223,17 +287,31 @@ func (a *AgentValidator) Run(
 			if attempt >= maxRetries {
 				log.Printf("[R4a] subtask=%s max retries reached, reporting failed", subTask.SubTaskID)
 				reason := fmt.Sprintf("max retries (%d) reached; last issue: %s", maxRetries, v.WhatWasWrong)
-				o := a.outcome(subTask, "failed", result.Output, &reason, trajectory, lastToolCalls)
+				o := a.outcome(subTask, "failed", result.Output, &reason, trajectory, toCriteriaVerdicts(v.CriteriaResults), lastToolCalls)
 				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 				a.publish(o)
 				return o
 			}
 
+			// Extract the first failed criterion and its failure_class for the CorrectionSignal.
+			failedCriterion, failureClass := "", ""
+			for _, cr := range v.CriteriaResults {
+				if !cr.Met {
+					failedCriterion, failureClass = cr.Criterion, cr.FailureClass
+					break
+				}
+			}
+			if failedCriterion == "" && len(v.UnmetCriteria) > 0 {
+				failedCriterion = v.UnmetCriteria[0]
+			}
+
 			correction := types.CorrectionSignal{
-				SubTaskID:     subTask.SubTaskID,
-				AttemptNumber: attempt,
-				WhatWasWrong:  v.WhatWasWrong,
-				WhatToDo:      v.WhatToDo,
+				SubTaskID:       subTask.SubTaskID,
+				AttemptNumber:   attempt,
+				FailedCriterion: failedCriterion,
+				FailureClass:    failureClass,
+				WhatWasWrong:    v.WhatWasWrong,
+				WhatToDo:        v.WhatToDo,
 			}
 			tlog.Correction(subTask.SubTaskID, v.WhatWasWrong, v.WhatToDo, attempt)
 			a.b.Publish(types.Message{
@@ -248,7 +326,7 @@ func (a *AgentValidator) Run(
 			case correctionCh <- correction:
 			case <-ctx.Done():
 				reason := "context cancelled during correction"
-				o := a.outcome(subTask, "failed", nil, &reason, trajectory, lastToolCalls)
+				o := a.outcome(subTask, "failed", nil, &reason, trajectory, nil, lastToolCalls)
 				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 				return o
 			}
@@ -259,7 +337,7 @@ func (a *AgentValidator) Run(
 				reason = "validation failed"
 			}
 			log.Printf("[R4a] subtask=%s FAILED: %s", subTask.SubTaskID, reason)
-			o := a.outcome(subTask, "failed", result.Output, &reason, trajectory, lastToolCalls)
+			o := a.outcome(subTask, "failed", result.Output, &reason, trajectory, toCriteriaVerdicts(v.CriteriaResults), lastToolCalls)
 			tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 			a.publish(o)
 			return o

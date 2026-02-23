@@ -25,6 +25,11 @@ Dreamer deferred to v0.8.
 | `<think>` blocks stripped from all LLM output before JSON parsing | Reasoning models (e.g. deepseek-r1) emit `<think>...</think>` blocks in raw completions. These caused `json.Unmarshal` to fail with `invalid character '<'`, which R4a classified as infrastructure errors and marked subtasks failed without retry. `StripThinkBlocks()` is now called as the first step of `StripFences()` for all roles. |
 | `FinalResult` is a trajectory record; Loss/GradL/Replans populated on all GGS paths | GGS computed D/∇L/Ω on every cycle but previously discarded them from `FinalResult`. Now both `processAccept` (D=0) and the abandon path (D>0) populate `FinalResult.Loss`, `FinalResult.GradL`, and `FinalResult.Replans`. This closes the observability loop: every medium-loop cycle — including the final one — is visible in the pipeline display. Resolves Q5 (see below). |
 | Pipeline checkpoints at all key message types | `SubTaskOutcome` failed now shows R4a's final score. `ReplanRequest` shows N/M failed count and total. `FinalResult` always renders a flow line showing D/∇L/Ω. Abandon detection uses `Loss.D > 0` (code-driven, not text-parsing). |
+| Criterion-level D and structured P in GGS (issue #63) | `computeD` now uses `CriteriaVerdicts` when present: D = failed_criteria / total_criteria. Falls back to subtask-level (1 synthetic criterion per outcome) when absent. `computeP` uses `CriteriaVerdicts.FailureClass` when classified data is available; falls back to keyword heuristics via `computePKeyword`. |
+| `SubTaskOutcome` carries `CriteriaVerdicts`; `GapTrajectoryPoint` carries `FailureClass` | R4a now emits per-criterion verdicts (pass/fail/failure_class/evidence) in `SubTaskOutcome.CriteriaVerdicts`. Each trajectory point records the aggregate `FailureClass` for that attempt. `CorrectionSignal` carries `FailedCriterion` and `FailureClass` for the first failing criterion. |
+| R4a prompt requests `failure_class` on failed criteria | System prompt instructs: "For each failed criterion, set failure_class to 'logical' or 'environmental'." This closes the gap between R4a's internal per-criterion analysis and GGS's structured signal. |
+| GGS abandon summary enumerates intents (`buildAbandonSummary`) | Abandon-path `FinalResult.Summary` now lists completed and failed subtask intents by name, instead of a single inline format string. R2 graceful-failure (LLM-backed) deferred to v0.8. |
+| R6 detects GGS thrashing: consecutive `break_symmetry` without D decreasing | Auditor tracks `breakSymCount` and `lastBreakSymD` per task. Fires `ggs_thrashing` anomaly after 2+ consecutive `break_symmetry` directives without D improving. Counter resets on any non-`break_symmetry` directive. Resolves Q2/Q3/Q4/Q6 (see resolved questions above). |
 
 ---
 
@@ -635,11 +640,11 @@ The Auditor's gap_trend data across sessions provides the signal for tuning.
 
 | # | Question | Blocks |
 |---|---|---|
-| Q2 | Should GGS persist L_prev across sessions (in R5) or only within a single task's lifetime? Cross-session persistence enables better gradient estimation for recurring task types | R7, R5 |
-| Q3 | How should `change_path` directive communicate the *new* path hint to R2 — as free text in rationale, or as a structured `suggested_alternatives` field? | R7, R2 |
-| Q4 | When multiple subtasks fail with different failure_classes, how does GGS pick the dominant class for the directive? Proposed: majority vote; tie → "mixed" class → `change_approach` | R7 |
+| Q2 | ~~Should GGS persist L_prev across sessions (in R5) or only within a single task's lifetime?~~ **RESOLVED**: L_prev lives only within a single task's lifetime. Cross-session persistence deferred to v0.8 — requires associating gradient history with recurring task types, which needs intent hashing not yet designed. | — |
+| Q3 | ~~How should `change_path` directive communicate the *new* path hint to R2?~~ **RESOLVED**: Free text in `rationale` field only. A structured `suggested_alternatives` field would require GGS to enumerate paths — outside GGS's scope (gradient math, not path synthesis). R2 reads `rationale` when formulating the next plan. | — |
+| Q4 | ~~When multiple subtasks fail with different failure_classes, how does GGS pick the dominant class?~~ **RESOLVED**: `computeP` counts logical and environmental `CriteriaVerdicts.FailureClass` across all failed outcomes. P = logical / (logical + environmental). Majority by count; no tie-breaking needed — P=0.5 (tie) maps to `change_path` or neutral directive naturally. `computeFailureClass` derived from P: P>0.5 → "logical", P<0.5 → "environmental", P=0.5 → "mixed". | — |
 | Q5 | ~~Should the `abandon` directive from GGS be distinguishable from the `maxReplans` abandon in R4b?~~ **RESOLVED**: GGS is the sole emitter of `FinalResult` on all paths. R4b sends `ReplanRequest` (with `recommendation: abandon`) to R7; GGS decides based on Ω. Consistent abandonment path achieved. | — |
-| Q6 | How does R2's plan validator check `blocked_tools` — exact string match on tool name, or keyword match on intent? Proposed: exact match on tool name; R3's tool_calls format already carries the tool name prefix | R2, R7 |
+| Q6 | ~~How does R2's plan validator check `blocked_tools`?~~ **RESOLVED**: Exact string match on tool name prefix. R3's `ToolCalls` entries carry `"toolname: ..."` format; `deriveBlockedTools` strips at the first `:` to get the bare tool name. R2's prompt instructs it to exclude listed tool names from its plan — no keyword matching needed. | — |
 
 ---
 

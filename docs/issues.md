@@ -5,6 +5,23 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #63 — Spec-vs-code gaps: criterion-level D/P, structured failure_class, GGS thrashing detection
+
+**Symptom**: GGS computes D at subtask granularity (failed subtasks / total subtasks) and P via keyword heuristics on `FailureReason` strings. Spec defines criterion-level D (`failed_criteria / total_criteria`) and structured `failure_class`-based P. R4a had no `failure_class` field in its criterion output, so GGS had no structured signal. Auditor lacked GGS thrashing detection (consecutive `break_symmetry` without D decreasing). Abandon-path summary was a single inline format string with no enumeration of completed/failed intents.
+
+**Root cause**: `CriteriaVerdict` type was absent from `types.go`; `SubTaskOutcome` had no `CriteriaVerdicts` field; `GapTrajectoryPoint` had no `FailureClass`; `CorrectionSignal` had no `FailedCriterion`/`FailureClass`. R4a prompt did not instruct the LLM to classify `failure_class`. `computeD` counted subtasks, not criteria. `computeP` had no structured path, only keywords. Auditor had no `breakSymCount`/`lastBreakSymD` state.
+
+**Fix**:
+- `types.go`: Added `CriteriaVerdict` struct; added `CriteriaVerdicts []CriteriaVerdict` to `SubTaskOutcome`; added `FailureClass` to `GapTrajectoryPoint`; added `FailedCriterion` and `FailureClass` to `CorrectionSignal`.
+- `agentval.go`: Added `FailureClass` to `criterionResult`; updated system prompt to request `failure_class` on failed criteria; added `aggregateFailureClass` and `toCriteriaVerdicts` helpers; trajectory building now sets `GapTrajectoryPoint.FailureClass`; `outcome()` now accepts and forwards `criteriaVerdicts`; `CorrectionSignal` building now populates `FailedCriterion`/`FailureClass`.
+- `ggs.go`: `computeD` rewritten to use `CriteriaVerdicts` when present (criterion-level), with subtask-level fallback; old `computeP` renamed to `computePKeyword`; new `computeP` uses structured `FailureClass` from `CriteriaVerdicts`, falls back to `computePKeyword`; added `buildAbandonSummary` enumerating completed/failed intents; abandon path uses `buildAbandonSummary` instead of inline string.
+- `auditor.go`: Added `breakSymCount`/`lastBreakSymD` maps; GGS thrashing detection block in `MsgPlanDirective` handler — fires `ggs_thrashing` anomaly after 2+ consecutive `break_symmetry` without D decreasing; resets counter on non-`break_symmetry` directive.
+- `agentval_test.go` (new): Tests for `aggregateFailureClass` (5 cases) and `toCriteriaVerdicts` (6 cases).
+- `ggs_test.go`: Added `TestComputeD_CriterionLevelHigherThanSubtaskLevel`, `TestComputeD_FallsBackToSubtaskLevelWhenNoCriteriaVerdicts`, `TestComputeP_AllLogicalCriteriaReturnsOne`, `TestComputeP_AllEnvironmentalCriteriaReturnsZero`, `TestComputeP_FallsBackToKeywordWhenNoStructuredClass`.
+- `auditor_test.go` (new): `TestDetectGGSThrashing_FiredAfterTwoConsecutiveWithNoDDecrease`, `TestDetectGGSThrashing_NotFiredWhenDDecreases`, `TestDetectGGSThrashing_ResetOnNonBreakSymmetryDirective`.
+
+---
+
 ## Issue #62 — Trajectory checkpoints missing from pipeline display
 
 **Symptom**: The pipeline flow lines for `SubTaskOutcome`, `ReplanRequest`, and `FinalResult` showed only minimal detail. `SubTaskOutcome` failed only showed the unmet criterion (no R4a score). `ReplanRequest` showed only the gap summary (no "N/M failed" count). `FinalResult` had no flow line at all — only the `endTask` footer appeared. GGS integration path (R4b → R7 → R2) had no bus-level tests.
