@@ -1876,3 +1876,26 @@ Files changed:
 - `internal/roles/ggs/ggs_test.go`
 - `docs/mvp-roles-v0.7.md`
 - `docs/issues.md`
+
+---
+
+## Issue #74 — Memory constraint content truncated at 180 chars, hiding key lessons from R2
+
+**Symptom**
+The `MUST NOT` / `SHOULD PREFER` constraint lines injected into R2's prompt were cut mid-sentence.
+For example, a procedural entry's gap_summary `"The executor made claims about cleaning locations
+without actually searching/removing..."` appeared as `"cleaning lo…"` — the actual lesson was lost.
+
+**Root cause**
+`entrySummary()` in `internal/roles/planner/planner.go` hard-capped content JSON at 180 characters.
+180 chars (10 entries × 180 = 1.8 KB max) was set too conservatively; it cut long gap_summaries
+before the substance of the failure was communicated to R2.
+
+**Fix**
+Raised the cap from 180 to 400 chars. At 10 entries × 400 chars = 4 KB max, the constraint block
+stays well within LLM context budget while allowing a full gap_summary to reach R2 intact.
+Updated the corresponding expectation comment and test assertion.
+
+Files changed:
+- `internal/roles/planner/planner.go`
+- `internal/roles/planner/planner_test.go`
