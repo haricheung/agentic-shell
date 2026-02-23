@@ -320,23 +320,46 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 	}, toolCallHistory, nil
 }
 
-// isIrreversibleShell reports whether a shell command is irreversible and must not
-// be executed without explicit user confirmation.
-// Returns (true, reason) when destructive; (false, "") otherwise.
+// splitShellFragments splits a compound shell command into individual statement
+// fragments by tokenizing on common separators (&&, ||, ;, |, newlines) and
+// stripping leading shell control-flow keywords (then, do, else).
+// This is intentionally simple — it does not parse quoting or subshells —
+// but covers the patterns models use to embed destructive commands inside
+// loops, conditionals, and pipelines.
 //
 // Expectations:
-//   - Returns true for "rm " commands (including rm -rf, sudo rm)
-//   - Returns true for "rmdir" commands
-//   - Returns true for "truncate" commands
-//   - Returns true for "shred" commands
-//   - Returns true for "dd " with "of=" argument (device/file overwrite)
-//   - Returns true for "mkfs" commands
-//   - Returns true for "fdisk " commands
-//   - Returns true for "find " commands containing " -delete" (deletes matching files)
-//   - Returns true for "find " commands containing "-exec rm" (rm via find)
-//   - Returns false for read-only commands (ls, cat, grep, find without -delete, etc.)
-func isIrreversibleShell(cmd string) (bool, string) {
-	check := strings.TrimSpace(cmd)
+//   - Single command returns one fragment (itself, trimmed)
+//   - Splits on "&&", "||", ";", "|", and "\n"
+//   - Strips leading keywords "then ", "do ", "else ", "{ ", "( "
+//   - Returns only non-empty trimmed fragments
+func splitShellFragments(cmd string) []string {
+	for _, sep := range []string{"&&", "||", ";", "|", "\n"} {
+		cmd = strings.ReplaceAll(cmd, sep, "\x00")
+	}
+	leadingKeywords := []string{"then ", "do ", "else ", "{ ", "( "}
+	var out []string
+	for _, part := range strings.Split(cmd, "\x00") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		for _, kw := range leadingKeywords {
+			if strings.HasPrefix(part, kw) {
+				part = strings.TrimSpace(part[len(kw):])
+				break
+			}
+		}
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// isIrreversibleFragment checks a single normalized shell fragment (no compound
+// operators, no control-flow keywords) for destructive operations.
+func isIrreversibleFragment(fragment string) (bool, string) {
+	check := strings.TrimSpace(fragment)
 	if strings.HasPrefix(check, "sudo ") {
 		check = strings.TrimSpace(check[5:])
 	}
@@ -348,6 +371,8 @@ func isIrreversibleShell(cmd string) (bool, string) {
 		{"shred ", "shred irrecoverably destroys files"},
 		{"mkfs", "mkfs formats a filesystem, destroying all data"},
 		{"fdisk ", "fdisk modifies disk partition table"},
+		{"xargs rm", "xargs rm removes files permanently"},
+		{"xargs /bin/rm", "xargs /bin/rm removes files permanently"},
 	}
 	for _, p := range patterns {
 		if strings.HasPrefix(check, p.prefix) {
@@ -357,13 +382,38 @@ func isIrreversibleShell(cmd string) (bool, string) {
 	if strings.HasPrefix(check, "dd ") && strings.Contains(check, "of=") {
 		return true, "dd with of= overwrites a device or file"
 	}
-	// find -delete and find -exec rm bypass the rm check — detect them explicitly.
 	if strings.HasPrefix(check, "find ") {
 		if strings.Contains(check, " -delete") {
 			return true, "find -delete removes matching files permanently"
 		}
 		if strings.Contains(check, "-exec rm") || strings.Contains(check, "-exec /bin/rm") {
 			return true, "find -exec rm removes matching files permanently"
+		}
+	}
+	return false, ""
+}
+
+// isIrreversibleShell reports whether a shell command (including compound
+// commands with &&, ||, ;, |, for-loops, and if-statements) is irreversible.
+// It splits the command into fragments and checks each one independently.
+//
+// Expectations:
+//   - Returns true for "rm " commands (including rm -rf, sudo rm)
+//   - Returns true for "rmdir" commands
+//   - Returns true for "truncate" commands
+//   - Returns true for "shred" commands
+//   - Returns true for "dd " with "of=" argument (device/file overwrite)
+//   - Returns true for "mkfs" commands
+//   - Returns true for "fdisk " commands
+//   - Returns true for "find " commands containing " -delete"
+//   - Returns true for "find " commands containing "-exec rm"
+//   - Returns true for "xargs rm" (pipe to rm)
+//   - Returns true for compound commands embedding rm (for-loop, if-then, &&)
+//   - Returns false for read-only commands (ls, cat, grep, plain find, etc.)
+func isIrreversibleShell(cmd string) (bool, string) {
+	for _, fragment := range splitShellFragments(cmd) {
+		if ok, reason := isIrreversibleFragment(fragment); ok {
+			return true, reason
 		}
 	}
 	return false, ""

@@ -3,6 +3,7 @@ package executor
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -112,6 +113,113 @@ func TestIsIrreversibleShell_ReturnsFalseForFindWithoutDelete(t *testing.T) {
 	ok, _ := isIrreversibleShell(`find /tmp -type f -name "*.log"`)
 	if ok {
 		t.Error("expected false for find without -delete")
+	}
+}
+
+func TestIsIrreversibleShell_ReturnsTrueForForLoopWithRm(t *testing.T) {
+	// Returns true for compound commands embedding rm inside a for-loop
+	cmd := `for file in /tmp/a.log /tmp/b.log; do if [ -f "$file" ]; then rm "$file" && echo "done"; fi; done`
+	ok, reason := isIrreversibleShell(cmd)
+	if !ok {
+		t.Error("expected true for for-loop with rm")
+	}
+	if reason == "" {
+		t.Error("expected non-empty reason")
+	}
+}
+
+func TestIsIrreversibleShell_ReturnsTrueForAndAndRm(t *testing.T) {
+	// Returns true for "ls /tmp && rm /tmp/foo" (rm after &&)
+	ok, reason := isIrreversibleShell("ls /tmp && rm /tmp/foo")
+	if !ok {
+		t.Error("expected true for && rm")
+	}
+	if reason == "" {
+		t.Error("expected non-empty reason")
+	}
+}
+
+func TestIsIrreversibleShell_ReturnsTrueForXargsRm(t *testing.T) {
+	// Returns true for "find ... | xargs rm" (rm via xargs pipe)
+	ok, reason := isIrreversibleShell(`find /tmp -name "*.log" | xargs rm -f`)
+	if !ok {
+		t.Error("expected true for xargs rm")
+	}
+	if reason == "" {
+		t.Error("expected non-empty reason")
+	}
+}
+
+func TestIsIrreversibleShell_ReturnsFalseForReadOnlyPipeline(t *testing.T) {
+	// Returns false for read-only pipeline (no destructive fragment)
+	ok, _ := isIrreversibleShell("ls /tmp | grep foo | wc -l")
+	if ok {
+		t.Error("expected false for read-only pipeline")
+	}
+}
+
+// ── splitShellFragments ───────────────────────────────────────────────────────
+
+func TestSplitShellFragments_SingleCommandReturnsOneFragment(t *testing.T) {
+	// Single command returns one fragment (itself, trimmed)
+	got := splitShellFragments("ls -la /tmp")
+	if len(got) != 1 || got[0] != "ls -la /tmp" {
+		t.Errorf("expected [\"ls -la /tmp\"], got %v", got)
+	}
+}
+
+func TestSplitShellFragments_SplitsOnAndAnd(t *testing.T) {
+	// Splits on "&&" into two fragments
+	got := splitShellFragments("ls /tmp && rm /tmp/foo")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 fragments, got %d: %v", len(got), got)
+	}
+	if got[0] != "ls /tmp" || got[1] != "rm /tmp/foo" {
+		t.Errorf("unexpected fragments: %v", got)
+	}
+}
+
+func TestSplitShellFragments_SplitsOnSemicolon(t *testing.T) {
+	// Splits on ";" into multiple fragments
+	got := splitShellFragments("echo a; echo b; echo c")
+	if len(got) != 3 {
+		t.Fatalf("expected 3 fragments, got %d: %v", len(got), got)
+	}
+}
+
+func TestSplitShellFragments_StripsLeadingThenKeyword(t *testing.T) {
+	// Strips "then " from control-flow fragment → exposes the actual command
+	got := splitShellFragments(`if true; then rm foo; fi`)
+	found := false
+	for _, f := range got {
+		if f == "rm foo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected fragment \"rm foo\" after stripping 'then', got %v", got)
+	}
+}
+
+func TestSplitShellFragments_StripsLeadingDoKeyword(t *testing.T) {
+	// Strips "do " from loop-body fragment → exposes the actual command
+	got := splitShellFragments(`for f in a b; do rm "$f"; done`)
+	found := false
+	for _, f := range got {
+		if strings.HasPrefix(f, "rm ") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected fragment starting with \"rm\" after stripping 'do', got %v", got)
+	}
+}
+
+func TestSplitShellFragments_EmptyFragmentsDropped(t *testing.T) {
+	// Returns only non-empty trimmed fragments
+	got := splitShellFragments("echo a;;echo b")
+	if len(got) != 2 {
+		t.Errorf("expected 2 non-empty fragments, got %d: %v", len(got), got)
 	}
 }
 

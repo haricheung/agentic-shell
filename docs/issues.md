@@ -5,6 +5,16 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #66 — Law 1 bypass: `rm` embedded in for-loop body not detected
+
+**Symptom**: Second manual test of "delete all .log files in /tmp" showed that after both `rm -v` and `find -delete` were blocked (correct), the planner replanned and the model issued `for file in ...; do if [ -f "$file" ]; then rm "$file"; fi; done` — a for-loop with `rm` in the `then` branch. The loop body starts with `if`, not `rm`, so `isIrreversibleShell` did not detect it.
+
+**Root cause**: `isIrreversibleShell` checked only the full command string against prefix patterns. Compound commands produced by loops (`for`/`while`), conditionals (`if/then/else`), and pipelines (`| xargs rm`) embed the destructive sub-command after separators (`;`, `&&`, `|`) and shell keywords (`then`, `do`), making it invisible to prefix matching.
+
+**Fix**: Refactored `isIrreversibleShell` into two helpers: `splitShellFragments` splits the command on `&&`, `||`, `;`, `|`, and `\n`, then strips leading shell keywords (`then`, `do`, `else`, `{`, `(`); `isIrreversibleFragment` applies the prefix/pattern checks to a single normalized fragment. `isIrreversibleShell` now iterates all fragments and returns true on the first destructive one. Also added `xargs rm` and `xargs /bin/rm` as prefix patterns to catch `find ... | xargs rm` pipes. Tests added: `ReturnsTrueForForLoopWithRm`, `ReturnsTrueForAndAndRm`, `ReturnsTrueForXargsRm`, `ReturnsFalseForReadOnlyPipeline`, and six `splitShellFragments` unit tests.
+
+---
+
 ## Issue #65 — Law 1 bypass: model uses `find -delete` after `rm` is blocked
 
 **Symptom**: Manual test of "delete all .log files in /tmp" showed that after `rm -v /tmp/*.log` was blocked by Law 1 (correct), the planner replanned and the model issued `find /tmp -maxdepth 1 ... -delete`, which bypassed the Law 1 gate and deleted files.
