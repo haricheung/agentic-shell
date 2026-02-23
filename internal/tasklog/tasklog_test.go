@@ -159,7 +159,7 @@ func TestTaskLog_NilReceiverNoops(t *testing.T) {
 	// None of these should panic:
 	tl.SubtaskBegin("s1", "intent", 1, []string{"criterion"})
 	tl.SubtaskEnd("s1", "matched")
-	tl.LLMCall("executor", "sys", "user", "resp", 100, 50, 1)
+	tl.LLMCall("executor", "sys", "user", "resp", 100, 50, 500, 1)
 	tl.ToolCall("s1", "shell", "ls", "file.go", "")
 	tl.CriterionVerdict("s1", "output contains path", true, "evidence", 1)
 	tl.Correction("s1", "wrong", "try this", 1)
@@ -182,8 +182,8 @@ func TestTaskLog_TotalTokens_AccumulatesAcrossLLMCalls(t *testing.T) {
 	r := NewRegistry(filepath.Join(dir, "tasks"))
 	tl := r.Open("task1", "intent")
 
-	tl.LLMCall("planner", "sys", "user", "resp", 100, 50, 0)
-	tl.LLMCall("executor", "sys", "user", "resp", 200, 80, 1)
+	tl.LLMCall("planner", "sys", "user", "resp", 100, 50, 1000, 0)
+	tl.LLMCall("executor", "sys", "user", "resp", 200, 80, 2000, 1)
 
 	if got := tl.TotalTokens(); got != 430 {
 		t.Errorf("TotalTokens = %d, want 430 (100+50+200+80)", got)
@@ -198,8 +198,8 @@ func TestRegistry_Close_WritesAccumulatedTokens(t *testing.T) {
 	dir := t.TempDir()
 	r := NewRegistry(filepath.Join(dir, "tasks"))
 	tl := r.Open("task1", "intent")
-	tl.LLMCall("planner", "sys", "user", "resp", 10, 5, 0)
-	tl.LLMCall("executor", "sys", "user", "resp", 20, 8, 1)
+	tl.LLMCall("planner", "sys", "user", "resp", 10, 5, 100, 0)
+	tl.LLMCall("executor", "sys", "user", "resp", 20, 8, 200, 1)
 	r.Close("task1", "accepted")
 
 	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
@@ -237,4 +237,111 @@ func TestTaskLog_CriterionVerdict_FalseIsSerialised(t *testing.T) {
 		return
 	}
 	t.Fatal("no criterion_verdict event found")
+}
+
+// ── RoleStats + GetStats ─────────────────────────────────────────────────────
+
+func TestRoleStats_OneEntryPerRole(t *testing.T) {
+	// RoleStats returns one entry per role that called LLMCall
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.LLMCall("planner", "s", "u", "r", 10, 5, 100, 0)
+	tl.LLMCall("executor", "s", "u", "r", 20, 8, 200, 1)
+	stats := tl.RoleStats()
+	r.Close("task1", "accepted")
+	roles := make(map[string]bool)
+	for _, rs := range stats {
+		roles[rs.Role] = true
+	}
+	if !roles["planner"] {
+		t.Error("expected planner entry in RoleStats")
+	}
+	if !roles["executor"] {
+		t.Error("expected executor entry in RoleStats")
+	}
+	if len(stats) != 2 {
+		t.Errorf("expected 2 entries, got %d", len(stats))
+	}
+}
+
+func TestRoleStats_CallsCountMatchesInvocations(t *testing.T) {
+	// Calls count matches number of LLMCall invocations per role
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.LLMCall("executor", "s", "u", "r", 10, 5, 100, 1)
+	tl.LLMCall("executor", "s", "u", "r", 10, 5, 100, 2)
+	tl.LLMCall("executor", "s", "u", "r", 10, 5, 100, 3)
+	stats := tl.RoleStats()
+	r.Close("task1", "accepted")
+	for _, rs := range stats {
+		if rs.Role == "executor" && rs.Calls != 3 {
+			t.Errorf("executor Calls = %d, want 3", rs.Calls)
+		}
+	}
+}
+
+func TestRoleStats_PromptTokensMatchSum(t *testing.T) {
+	// PromptTokens total matches sum across calls for that role
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.LLMCall("planner", "s", "u", "r", 100, 50, 500, 0)
+	tl.LLMCall("planner", "s", "u", "r", 200, 80, 600, 0)
+	stats := tl.RoleStats()
+	r.Close("task1", "accepted")
+	for _, rs := range stats {
+		if rs.Role == "planner" {
+			if rs.PromptTokens != 300 {
+				t.Errorf("planner PromptTokens = %d, want 300", rs.PromptTokens)
+			}
+		}
+	}
+}
+
+func TestRoleStats_ElapsedMsMatchesSum(t *testing.T) {
+	// ElapsedMs total matches sum of all elapsedMs values for that role
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.LLMCall("agentval", "s", "u", "r", 10, 5, 300, 0)
+	tl.LLMCall("agentval", "s", "u", "r", 10, 5, 700, 0)
+	stats := tl.RoleStats()
+	r.Close("task1", "accepted")
+	for _, rs := range stats {
+		if rs.Role == "agentval" {
+			if rs.ElapsedMs != 1000 {
+				t.Errorf("agentval ElapsedMs = %d, want 1000", rs.ElapsedMs)
+			}
+		}
+	}
+}
+
+func TestGetStats_ReturnsNilForUnknownTaskID(t *testing.T) {
+	// GetStats returns nil for unknown taskID
+	dir := t.TempDir()
+	r := NewRegistry(dir)
+	got := r.GetStats("nonexistent")
+	if got != nil {
+		t.Errorf("expected nil for unknown taskID, got %v", got)
+	}
+}
+
+func TestGetStats_DeletesCacheEntryOnFirstCall(t *testing.T) {
+	// GetStats deletes the cache entry on first call (subsequent calls return nil)
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.LLMCall("planner", "s", "u", "r", 10, 5, 100, 0)
+	r.Close("task1", "accepted")
+
+	first := r.GetStats("task1")
+	if first == nil {
+		t.Fatal("expected non-nil stats on first call")
+	}
+	second := r.GetStats("task1")
+	if second != nil {
+		t.Error("expected nil on second call (cache entry should be deleted)")
+	}
 }

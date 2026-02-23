@@ -59,24 +59,31 @@ func New(b *bus.Bus, llmClient *llm.Client, clarifyFn func(string) (string, erro
 const maxClarificationRounds = 2
 
 // Process takes raw user input, possibly asks a clarifying question, and publishes a TaskSpec.
-// It returns the task ID so the caller can correlate the eventual FinalResult.
-// sessionContext is a summary of recent REPL history; pass "" for one-shot mode.
-func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string) (string, error) {
+// It returns the task ID and accumulated LLM usage so the caller can correlate the eventual
+// FinalResult and report per-role cost. sessionContext is a summary of recent REPL history;
+// pass "" for one-shot mode.
+func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string) (string, llm.Usage, error) {
 	input := rawInput
+	var totalUsage llm.Usage
 	for round := 0; round < maxClarificationRounds; round++ {
-		spec, needsClarification, question, err := p.perceive(ctx, input, sessionContext)
+		spec, needsClarification, question, usage, err := p.perceive(ctx, input, sessionContext)
+		totalUsage.PromptTokens += usage.PromptTokens
+		totalUsage.CompletionTokens += usage.CompletionTokens
+		totalUsage.TotalTokens += usage.TotalTokens
+		totalUsage.ElapsedMs += usage.ElapsedMs
 		if err != nil {
-			return "", fmt.Errorf("perceiver: %w", err)
+			return "", totalUsage, fmt.Errorf("perceiver: %w", err)
 		}
 
 		if !needsClarification {
-			return p.publish(spec)
+			taskID, err := p.publish(spec)
+			return taskID, totalUsage, err
 		}
 
 		// Ask user for clarification
 		answer, err := p.clarify(question)
 		if err != nil {
-			return "", fmt.Errorf("perceiver: clarification: %w", err)
+			return "", totalUsage, fmt.Errorf("perceiver: clarification: %w", err)
 		}
 		// Empty answer means "just do your best" — stop asking and proceed.
 		if strings.TrimSpace(answer) == "" {
@@ -89,11 +96,16 @@ func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string
 
 	// Max rounds reached or user gave empty answer — one final call with instruction to commit.
 	finalInput := input + "\n\n[Instruction: proceed with the best interpretation; do not request further clarification.]"
-	spec, _, _, err := p.perceive(ctx, finalInput, "")
+	spec, _, _, usage, err := p.perceive(ctx, finalInput, "")
+	totalUsage.PromptTokens += usage.PromptTokens
+	totalUsage.CompletionTokens += usage.CompletionTokens
+	totalUsage.TotalTokens += usage.TotalTokens
+	totalUsage.ElapsedMs += usage.ElapsedMs
 	if err != nil {
-		return "", fmt.Errorf("perceiver: %w", err)
+		return "", totalUsage, fmt.Errorf("perceiver: %w", err)
 	}
-	return p.publish(spec)
+	taskID, err := p.publish(spec)
+	return taskID, totalUsage, err
 }
 
 func (p *Perceiver) publish(spec types.TaskSpec) (string, error) {
@@ -109,14 +121,14 @@ func (p *Perceiver) publish(spec types.TaskSpec) (string, error) {
 	return spec.TaskID, nil
 }
 
-func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) (types.TaskSpec, bool, string, error) {
+func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) (types.TaskSpec, bool, string, llm.Usage, error) {
 	userPrompt := input
 	if sessionContext != "" {
 		userPrompt = "Recent session history:\n" + sessionContext + "\n\nNew input: " + input
 	}
-	raw, _, err := p.llm.Chat(ctx, systemPrompt, userPrompt)
+	raw, usage, err := p.llm.Chat(ctx, systemPrompt, userPrompt)
 	if err != nil {
-		return types.TaskSpec{}, false, "", err
+		return types.TaskSpec{}, false, "", usage, err
 	}
 
 	raw = llm.StripFences(raw)
@@ -127,12 +139,12 @@ func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) 
 		Question           string `json:"question"`
 	}
 	if err := json.Unmarshal([]byte(raw), &clarCheck); err == nil && clarCheck.NeedsClarification {
-		return types.TaskSpec{}, true, clarCheck.Question, nil
+		return types.TaskSpec{}, true, clarCheck.Question, usage, nil
 	}
 
 	var spec types.TaskSpec
 	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
-		return types.TaskSpec{}, false, "", fmt.Errorf("parse TaskSpec: %w (raw: %s)", err, raw)
+		return types.TaskSpec{}, false, "", usage, fmt.Errorf("parse TaskSpec: %w (raw: %s)", err, raw)
 	}
 
 	if spec.TaskID == "" {
@@ -140,5 +152,5 @@ func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) 
 	}
 	spec.RawInput = input
 
-	return spec, false, "", nil
+	return spec, false, "", usage, nil
 }

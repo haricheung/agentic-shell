@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,6 +55,37 @@ Failed or infrastructure error:
 No markdown, no prose, no code fences.`
 
 const maxRetries = 2
+
+// envErrorRe matches deterministic error patterns that indicate an environmental failure.
+// Case-insensitive; applied to criterion evidence and tool call output snippets.
+var envErrorRe = regexp.MustCompile(
+	`(?i)(permission denied|no such file|not found|not exist|` +
+		`connection refused|timed? ?out|network error|` +
+		`command not found|executable file not found|\[LAW1\])`,
+)
+
+// classifyEnvironmental reports whether the criterion evidence or any tool call output
+// contains a deterministic error pattern that unambiguously indicates an environmental
+// failure (network, permission, missing file, Law 1 block). Only promotes a criterion
+// to "environmental"; never demotes an existing "environmental" classification.
+//
+// Expectations:
+//   - Returns true when evidence contains "permission denied"
+//   - Returns true when evidence contains "[LAW1]"
+//   - Returns true when evidence contains "no such file"
+//   - Returns true when a tool call output contains "connection refused"
+//   - Returns false for a pure logic failure with no error keywords
+func classifyEnvironmental(evidence string, toolCalls []string) bool {
+	if envErrorRe.MatchString(evidence) {
+		return true
+	}
+	for _, tc := range toolCalls {
+		if envErrorRe.MatchString(tc) {
+			return true
+		}
+	}
+	return false
+}
 
 // AgentValidator is R4a. It drives the fast feedback loop for one sub-task.
 type AgentValidator struct {
@@ -357,7 +389,7 @@ func (a *AgentValidator) score(ctx context.Context, st types.SubTask, result typ
 	userPrompt := fmt.Sprintf("Today's date: %s\n\nSubTask:\n%s\n\nExecutionResult:\n%s", today, taskJSON, resultJSON)
 
 	raw, usage, err := a.llm.Chat(ctx, systemPrompt, userPrompt)
-	tlog.LLMCall("agentval", systemPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
+	tlog.LLMCall("agentval", systemPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, usage.ElapsedMs, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -367,5 +399,19 @@ func (a *AgentValidator) score(ctx context.Context, st types.SubTask, result typ
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
 		return nil, fmt.Errorf("parse verdict: %w (raw: %s)", err, raw)
 	}
+
+	// B1 — Law 0: deterministic environmental promotion.
+	// Override failure_class to "environmental" when unambiguous error patterns are
+	// present in the evidence or tool call output. Only promotes — never demotes
+	// an existing "environmental" classification to "logical".
+	for i := range v.CriteriaResults {
+		cr := &v.CriteriaResults[i]
+		if !cr.Met && cr.FailureClass != "environmental" {
+			if classifyEnvironmental(cr.Evidence, result.ToolCalls) {
+				cr.FailureClass = "environmental"
+			}
+		}
+	}
+
 	return &v, nil
 }

@@ -221,13 +221,13 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 	for i := 0; i < maxToolCalls; i++ {
 		prompt := userPrompt
 		if toolResultsCtx.Len() > 0 {
-			prompt += "\n\nTool results so far:\n" + toolResultsCtx.String()
+			prompt += "\n\nTool results so far:\n" + headTail(toolResultsCtx.String(), 8000)
 			prompt += "\nYou have the tool output above. Output the final ExecutionResult JSON now (status=completed). Only make another tool call if the output above is genuinely insufficient."
 		}
 
 		sysPrompt := buildSystemPrompt()
 		raw, usage, err := e.llm.Chat(ctx, sysPrompt, prompt)
-		tlog.LLMCall("executor", sysPrompt, prompt, raw, usage.PromptTokens, usage.CompletionTokens, i+1)
+		tlog.LLMCall("executor", sysPrompt, prompt, raw, usage.PromptTokens, usage.CompletionTokens, usage.ElapsedMs, i+1)
 		if err != nil {
 			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("llm: %w", err)
 		}

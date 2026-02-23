@@ -144,7 +144,7 @@ func main() {
 		}()
 
 		input := strings.Join(os.Args[1:], " ")
-		if err := runTask(ctx, b, toolClient, input, resultCh); err != nil {
+		if err := runTask(ctx, b, toolClient, input, resultCh, logReg); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			cancel()
 			os.Exit(1)
@@ -156,7 +156,7 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	} else {
 		// REPL mode
-		runREPL(ctx, b, toolClient, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh)
+		runREPL(ctx, b, toolClient, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh, logReg)
 	}
 }
 
@@ -373,7 +373,7 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 	}
 }
 
-func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input string, resultCh <-chan types.FinalResult) error {
+func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input string, resultCh <-chan types.FinalResult, logReg *tasklog.Registry) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	clarifyFn := func(question string) (string, error) {
 		fmt.Printf("? %s\n> ", question)
@@ -384,7 +384,8 @@ func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input strin
 	}
 
 	p := perceiver.New(b, llmClient, clarifyFn)
-	if _, err := p.Process(ctx, input, ""); err != nil {
+	_, perceiverUsage, err := p.Process(ctx, input, "")
+	if err != nil {
 		return fmt.Errorf("perceiver: %w", err)
 	}
 
@@ -394,6 +395,7 @@ func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input strin
 		return ctx.Err()
 	case result := <-resultCh:
 		printResult(result)
+		printCostStats(perceiverUsage, logReg.GetStats(result.TaskID))
 	}
 	return nil
 }
@@ -404,7 +406,7 @@ type sessionEntry struct {
 	Summary string
 }
 
-func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string) {
+func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string, logReg *tasklog.Registry) {
 	fmt.Println("\033[1m\033[36m⚡ agsh\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.cache/agsh/debug.log)\033[0m")
 
 	rl, err := readline.NewEx(&readline.Config{
@@ -531,7 +533,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 
 		disp.Resume() // lift post-abort suppression before the new pipeline starts
 		p := perceiver.New(b, llmClient, clarifyFn)
-		taskID, err := p.Process(taskCtx, input, buildSessionContext(history))
+		taskID, perceiverUsage, err := p.Process(taskCtx, input, buildSessionContext(history))
 		if err != nil {
 			taskMu.Lock()
 			taskCancel = nil
@@ -569,6 +571,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 				// display goroutine calls endTask(), whose \r\033[K then erases it.
 				disp.WaitTaskClose(300 * time.Millisecond)
 				printResult(result)
+				printCostStats(perceiverUsage, logReg.GetStats(result.TaskID))
 				history = append(history, sessionEntry{Input: input, Summary: result.Summary})
 				if len(history) > maxHistory {
 					history = history[len(history)-maxHistory:]
@@ -647,6 +650,68 @@ func printResult(result types.FinalResult) {
 	} else {
 		fmt.Println(result.Output)
 	}
+}
+
+// printCostStats prints a per-role LLM usage summary after each task.
+// Suppressed entirely when there are no stats and no perceiver tokens.
+func printCostStats(perceiverUsage llm.Usage, roleStats []tasklog.RoleStat) {
+	perceiverToks := perceiverUsage.PromptTokens + perceiverUsage.CompletionTokens
+	if perceiverToks == 0 && len(roleStats) == 0 {
+		return
+	}
+
+	const (
+		bold  = "\033[1m"
+		cyan  = "\033[36m"
+		dim   = "\033[2m"
+		reset = "\033[0m"
+	)
+	fmt.Printf("\n%s%s📊 Cost%s\n", bold, cyan, reset)
+
+	// formatToks formats a token count with thousands separator.
+	formatToks := func(n int) string {
+		s := fmt.Sprintf("%d", n)
+		// Insert comma separators from right.
+		if len(s) <= 3 {
+			return s
+		}
+		var out []byte
+		for i, c := range s {
+			if i > 0 && (len(s)-i)%3 == 0 {
+				out = append(out, ',')
+			}
+			out = append(out, byte(c))
+		}
+		return string(out)
+	}
+
+	printRow := func(role string, calls int, toks int, elapsedMs int64) {
+		callWord := "calls"
+		if calls == 1 {
+			callWord = "call "
+		}
+		secs := float64(elapsedMs) / 1000.0
+		fmt.Printf("  %-12s %2d %-6s %10s tok  %6.1fs\n",
+			role, calls, callWord, formatToks(toks), secs)
+	}
+
+	// Perceiver row (always 1 call, tracked separately from task log).
+	printRow("perceiver", 1, perceiverToks, perceiverUsage.ElapsedMs)
+
+	// Per-role rows from task log.
+	totalCalls := 1
+	totalToks := perceiverToks
+	totalElapsedMs := perceiverUsage.ElapsedMs
+	for _, rs := range roleStats {
+		printRow(rs.Role, rs.Calls, rs.PromptTokens+rs.CompletionTokens, rs.ElapsedMs)
+		totalCalls += rs.Calls
+		totalToks += rs.PromptTokens + rs.CompletionTokens
+		totalElapsedMs += rs.ElapsedMs
+	}
+
+	fmt.Printf("  %s──────────────────────────────────────────────────%s\n", dim, reset)
+	printRow("total", totalCalls, totalToks, totalElapsedMs)
+	fmt.Printf("  %s(LLM time only — excludes tool execution)%s\n\n", dim, reset)
 }
 
 func printAuditReport(rep types.AuditReport) {

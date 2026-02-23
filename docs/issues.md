@@ -5,6 +5,56 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #69 — No per-role LLM cost/time reporting after task completion
+
+**Symptom**: After each task the user had no visibility into how many tokens each role consumed or how long each LLM call took. The task log captured per-call token counts but the data was never surfaced to the terminal.
+
+**Root cause**:
+1. `llm.Usage` had no `ElapsedMs` field; HTTP round-trip time was measured but discarded.
+2. `tasklog.LLMCall` accumulated tokens globally but had no per-role breakdown.
+3. `tasklog.Registry.Close` discarded role stats on close.
+4. `perceiver.Process` ignored the `llm.Usage` returned by `Chat`; no way for `main.go` to track perceiver cost.
+
+**Fix**:
+- `internal/llm/client.go`: added `ElapsedMs int64` to `Usage`; timer wraps `httpClient.Do` + `io.ReadAll`.
+- `internal/tasklog/tasklog.go`: added `RoleStat` (exported) + `roleStat` accumulator inside `TaskLog`; `LLMCall` signature gains `elapsedMs int64` (before `iterIndex`); new `RoleStats() []RoleStat` sorted by canonical order; `Registry` gains `cache map[string][]RoleStat`; `Close` saves stats to cache; new `GetStats(taskID)` returns and deletes cache entry.
+- `internal/roles/perceiver/perceiver.go`: `Process` now returns `(string, llm.Usage, error)`; `perceive` returns `llm.Usage`; usage accumulated across clarification rounds.
+- `internal/roles/planner/planner.go`, `executor/executor.go`, `agentval/agentval.go`, `metaval/metaval.go`: pass `usage.ElapsedMs` to `LLMCall`.
+- `cmd/agsh/main.go`: capture `perceiverUsage` from `p.Process()`; new `printCostStats(perceiverUsage, roleStats)` prints a `📊 Cost` table with per-role call count, token count, and LLM time; called after `printResult` in both one-shot and REPL modes.
+
+Files changed:
+- `internal/llm/client.go`
+- `internal/tasklog/tasklog.go` (+6 new tests in `tasklog_test.go`)
+- `internal/roles/perceiver/perceiver.go`
+- `internal/roles/planner/planner.go`
+- `internal/roles/executor/executor.go`
+- `internal/roles/agentval/agentval.go`
+- `internal/roles/metaval/metaval.go`
+- `cmd/agsh/main.go`
+
+---
+
+## Issue #68 — Batch B: Law 0 misattribution, Law 2 prompt gap, Law 3 context cap
+
+**Symptom**:
+- **B1 (Law 0)**: R4a LLM misattributes failure_class (e.g., calls "permission denied" logical); deterministic environmental patterns were left to LLM discretion.
+- **B2 (Law 2)**: `planDirectivePrompt` described directive labels but never told R2 what `failure_class` means for replanning strategy; R2 often repeated the same approach even when signalled "environmental".
+- **B3 (Law 3)**: `toolResultsCtx` accumulated unbounded across up to 10 tool calls (up to 40 KB); only per-result truncation existed; the total context injected into each LLM turn was uncapped.
+
+**Root cause**: Three spec items that were marked "pending implementation" in ARCHITECTURE.md.
+
+**Fix**:
+- **B1** (`internal/roles/agentval/agentval.go`): added `classifyEnvironmental(evidence, toolCalls)` using compiled case-insensitive regex against: `permission denied`, `no such file`, `not found`, `not exist`, `connection refused`, `timeout`, `network error`, `command not found`, `executable file not found`, `[LAW1]`. After LLM verdict is parsed, post-processes each failed `criterionResult`: promotes to `"environmental"` if pattern matches; never demotes existing `"environmental"`. (+5 tests)
+- **B2** (`internal/roles/planner/planner.go`): appended failure_class guidance block to `planDirectivePrompt` explaining that `"environmental"` → change path/parameters, `"logical"` → change tool class/method, `"mixed"` → fix environmental blockers first.
+- **B3** (`internal/roles/executor/executor.go`): applied `headTail(toolResultsCtx.String(), 8000)` before appending accumulated context to prompt; keeps first ~2667 chars and last ~5333 chars. (+2 headTail tests)
+
+Files changed:
+- `internal/roles/agentval/agentval.go` (+5 tests in `agentval_test.go`)
+- `internal/roles/planner/planner.go`
+- `internal/roles/executor/executor.go` (+2 tests in `executor_test.go`)
+
+---
+
 ## Issue #67 — Safety-net abandon emits FinalResult with D=0.0; UI shows green (false success)
 
 **Symptom**: After the Law 1 gate forced the agent to exhaust its replan budget, the

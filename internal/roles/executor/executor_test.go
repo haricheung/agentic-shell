@@ -275,3 +275,36 @@ func TestIsIrreversibleWriteFile_ReturnsFalseForDirectory(t *testing.T) {
 		t.Error("expected false for directory path")
 	}
 }
+
+// ── headTail ─────────────────────────────────────────────────────────────────
+
+func TestHeadTail_PassesThroughShortString(t *testing.T) {
+	// Returns s unchanged for strings shorter than or equal to maxLen
+	s := strings.Repeat("a", 100)
+	got := headTail(s, 8000)
+	if got != s {
+		t.Errorf("expected passthrough for short string, got different result (len=%d)", len(got))
+	}
+}
+
+func TestHeadTail_TruncatesMiddleOfLongString(t *testing.T) {
+	// For a string longer than maxLen, keeps the head and tail and inserts a truncation marker
+	head := strings.Repeat("H", 3000)
+	middle := strings.Repeat("M", 5000)
+	tail := strings.Repeat("T", 3000)
+	s := head + middle + tail
+	const maxLen = 8000
+	got := headTail(s, maxLen)
+	if len(got) >= len(s) {
+		t.Errorf("expected truncation: got len=%d, original len=%d", len(got), len(s))
+	}
+	if !strings.HasPrefix(got, "H") {
+		t.Error("expected result to start with head content")
+	}
+	if !strings.HasSuffix(got, "T") {
+		t.Error("expected result to end with tail content")
+	}
+	if !strings.Contains(got, "[middle truncated]") {
+		t.Error("expected truncation marker in result")
+	}
+}

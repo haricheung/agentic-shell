@@ -199,7 +199,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 
 	raw, usage, err := m.llm.Chat(ctx, systemPrompt, userPrompt)
 	tl := m.logReg.Get(taskID)
-	tl.LLMCall("metaval", systemPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
+	tl.LLMCall("metaval", systemPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, usage.ElapsedMs, 0)
 	if err != nil {
 		log.Printf("[R4b] ERROR: LLM call failed: %v", err)
 		return

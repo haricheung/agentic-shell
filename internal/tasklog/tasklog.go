@@ -88,6 +88,26 @@ type Event struct {
 	ReplanRound int    `json:"replan_round,omitempty"`
 }
 
+// RoleStat summarises LLM usage for one role across all calls in a task.
+type RoleStat struct {
+	Role             string `json:"role"`
+	Calls            int    `json:"calls"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	ElapsedMs        int64  `json:"elapsed_ms"`
+}
+
+// roleStat is the unexported per-role accumulator stored inside a TaskLog.
+type roleStat struct {
+	calls            int
+	promptTokens     int
+	completionTokens int
+	elapsedMs        int64
+}
+
+// canonicalRoleOrder defines the display order for RoleStats().
+var canonicalRoleOrder = []string{"planner", "executor", "agentval", "metaval"}
+
 // TaskLog is a handle for writing structured events for one task.
 //
 // Expectations:
@@ -101,6 +121,7 @@ type TaskLog struct {
 	f                *os.File
 	promptTokens     int
 	completionTokens int
+	roleStats        map[string]*roleStat // role -> accumulator
 }
 
 // Registry maps task IDs to open TaskLogs.
@@ -116,14 +137,19 @@ type TaskLog struct {
 //   - Close removes the taskID from the registry so subsequent Get returns nil
 //   - Close no-ops gracefully when taskID is not registered
 type Registry struct {
-	dir  string
-	mu   sync.Mutex
-	logs map[string]*TaskLog
+	dir   string
+	mu    sync.Mutex
+	logs  map[string]*TaskLog
+	cache map[string][]RoleStat // taskID -> role stats snapshot saved on Close
 }
 
 // NewRegistry creates a Registry that writes one JSONL file per task under dir.
 func NewRegistry(dir string) *Registry {
-	return &Registry{dir: dir, logs: make(map[string]*TaskLog)}
+	return &Registry{
+		dir:   dir,
+		logs:  make(map[string]*TaskLog),
+		cache: make(map[string][]RoleStat),
+	}
 }
 
 // Open creates a new TaskLog for taskID, writes a task_begin event, and registers it.
@@ -147,7 +173,7 @@ func (r *Registry) Open(taskID, intent string) *TaskLog {
 		return nil
 	}
 
-	tl := &TaskLog{taskID: taskID, started: time.Now(), f: f}
+	tl := &TaskLog{taskID: taskID, started: time.Now(), f: f, roleStats: make(map[string]*roleStat)}
 	r.logs[taskID] = tl
 	tl.write(Event{
 		Kind:   KindTaskBegin,
@@ -180,6 +206,7 @@ func (r *Registry) Close(taskID, status string) {
 		r.mu.Unlock()
 		return
 	}
+	r.cache[taskID] = tl.RoleStats()
 	delete(r.logs, taskID)
 	r.mu.Unlock()
 
@@ -230,16 +257,26 @@ func (tl *TaskLog) SubtaskEnd(subtaskID, status string) {
 	})
 }
 
-// LLMCall writes an llm_call event with full prompts, response, and token counts.
+// LLMCall writes an llm_call event with full prompts, response, token counts, and elapsed time.
+// elapsedMs is the wall-clock ms for the LLM HTTP call (from llm.Usage.ElapsedMs).
 // iterIndex is 1-indexed for executor multi-turn calls; pass 0 for single-call roles
 // (it will be omitted from the JSON via omitempty).
-func (tl *TaskLog) LLMCall(role, systemPrompt, userPrompt, response string, promptToks, completionToks, iterIndex int) {
+func (tl *TaskLog) LLMCall(role, systemPrompt, userPrompt, response string, promptToks, completionToks int, elapsedMs int64, iterIndex int) {
 	if tl == nil {
 		return
 	}
 	tl.mu.Lock()
 	tl.promptTokens += promptToks
 	tl.completionTokens += completionToks
+	rs := tl.roleStats[role]
+	if rs == nil {
+		rs = &roleStat{}
+		tl.roleStats[role] = rs
+	}
+	rs.calls++
+	rs.promptTokens += promptToks
+	rs.completionTokens += completionToks
+	rs.elapsedMs += elapsedMs
 	tl.mu.Unlock()
 	tl.write(Event{
 		Kind:             KindLLMCall,
@@ -309,6 +346,54 @@ func (tl *TaskLog) Replan(gapSummary string, replanRound int) {
 		GapSummary:  gapSummary,
 		ReplanRound: replanRound,
 	})
+}
+
+// RoleStats returns a snapshot of per-role LLM usage sorted by canonical order.
+// Roles that made no LLM calls are omitted.
+//
+// Expectations:
+//   - Returns one entry per role that called LLMCall
+//   - Calls count matches number of LLMCall invocations per role
+//   - PromptTokens and CompletionTokens match the sum across calls for that role
+//   - ElapsedMs matches the sum of all elapsedMs values for that role
+func (tl *TaskLog) RoleStats() []RoleStat {
+	if tl == nil {
+		return nil
+	}
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	var out []RoleStat
+	for _, role := range canonicalRoleOrder {
+		rs, ok := tl.roleStats[role]
+		if !ok {
+			continue
+		}
+		out = append(out, RoleStat{
+			Role:             role,
+			Calls:            rs.calls,
+			PromptTokens:     rs.promptTokens,
+			CompletionTokens: rs.completionTokens,
+			ElapsedMs:        rs.elapsedMs,
+		})
+	}
+	return out
+}
+
+// GetStats returns and removes the cached RoleStat slice for taskID.
+// Returns nil if taskID is not in the cache (unknown or already consumed).
+//
+// Expectations:
+//   - Returns nil for unknown taskID
+//   - Deletes the cache entry on first call (subsequent calls return nil)
+func (r *Registry) GetStats(taskID string) []RoleStat {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.cache[taskID]
+	delete(r.cache, taskID)
+	return s
 }
 
 // TotalTokens returns the total token count accumulated so far.

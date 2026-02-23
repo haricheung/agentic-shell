@@ -91,6 +91,13 @@ Directive semantics:
 - "change_approach": use a clearly different tool class. The current approach is logically wrong.
 - "break_symmetry": the system is stuck in a local minimum. You MUST NOT reuse any tool in blocked_tools. Demand a novel approach unlike anything tried before.
 
+Failure class guidance (from failure_class field in PlanDirective):
+- "environmental": approach is sound but the specific path/target is blocked.
+  Change target, parameters, or search terms — NOT the algorithm or tool class.
+- "logical": the algorithm or approach itself is wrong.
+  Change the tool class or method entirely — NOT just the search terms.
+- "mixed": both present — fix the environmental blockers first, then reassess approach.
+
 Rules:
 - You MUST follow the directive field above — this overrides your own judgment about the best approach.
 - You MUST NOT use any tool listed in blocked_tools — this is code-enforced.
@@ -366,7 +373,7 @@ func memTokenize(s string) []string {
 //   - Retries are handled externally (replanning); this function runs once per plan attempt
 func (p *Planner) dispatch(ctx context.Context, spec types.TaskSpec, userPrompt, sysPrompt string, tl *tasklog.TaskLog) error {
 	raw, usage, err := p.llm.Chat(ctx, sysPrompt, userPrompt)
-	tl.LLMCall("planner", sysPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, 0)
+	tl.LLMCall("planner", sysPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, usage.ElapsedMs, 0)
 	if err != nil {
 		return fmt.Errorf("llm: %w", err)
 	}

@@ -97,11 +97,12 @@ type chatMsg struct {
 	Content string `json:"content"`
 }
 
-// Usage reports token consumption for one LLM call.
+// Usage reports token consumption and wall-clock time for one LLM call.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int   `json:"prompt_tokens"`
+	CompletionTokens int   `json:"completion_tokens"`
+	TotalTokens      int   `json:"total_tokens"`
+	ElapsedMs        int64 `json:"elapsed_ms"` // wall-clock ms from request dispatch to response body read
 }
 
 type chatResponse struct {
@@ -143,6 +144,7 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
+	start := time.Now()
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", Usage{}, fmt.Errorf("llm: http request: %w", err)
@@ -150,6 +152,7 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, 
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
+	elapsedMs := time.Since(start).Milliseconds()
 	if err != nil {
 		return "", Usage{}, fmt.Errorf("llm: read response: %w", err)
 	}
@@ -172,8 +175,9 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, 
 	}
 
 	content := chatResp.Choices[0].Message.Content
-	log.Printf("[%s] ── RESPONSE (tokens: prompt=%d completion=%d) ──\n%s\n── END RESPONSE ────────────────────────────────",
-		c.label, chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, content)
+	chatResp.Usage.ElapsedMs = elapsedMs
+	log.Printf("[%s] ── RESPONSE (tokens: prompt=%d completion=%d elapsed=%dms) ──\n%s\n── END RESPONSE ────────────────────────────────",
+		c.label, chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, elapsedMs, content)
 	return content, chatResp.Usage, nil
 }
 

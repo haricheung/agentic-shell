@@ -6,6 +6,44 @@ import (
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
+// ── classifyEnvironmental ────────────────────────────────────────────────────
+
+func TestClassifyEnvironmental_PermissionDeniedInEvidence(t *testing.T) {
+	// Returns true when evidence contains "permission denied"
+	if !classifyEnvironmental("permission denied: /etc/shadow", nil) {
+		t.Error("expected true for evidence containing 'permission denied'")
+	}
+}
+
+func TestClassifyEnvironmental_LAW1InEvidence(t *testing.T) {
+	// Returns true when evidence contains "[LAW1]"
+	if !classifyEnvironmental("[LAW1] rm deletes files permanently — command blocked", nil) {
+		t.Error("expected true for evidence containing '[LAW1]'")
+	}
+}
+
+func TestClassifyEnvironmental_NoSuchFileInEvidence(t *testing.T) {
+	// Returns true when evidence contains "no such file"
+	if !classifyEnvironmental("open /tmp/missing: no such file or directory", nil) {
+		t.Error("expected true for evidence containing 'no such file'")
+	}
+}
+
+func TestClassifyEnvironmental_ConnectionRefusedInToolCall(t *testing.T) {
+	// Returns true when a tool call output contains "connection refused"
+	toolCalls := []string{"shell:curl http://internal → connection refused"}
+	if !classifyEnvironmental("", toolCalls) {
+		t.Error("expected true when tool call contains 'connection refused'")
+	}
+}
+
+func TestClassifyEnvironmental_FalseForPureLogicFailure(t *testing.T) {
+	// Returns false for a pure logic failure with no error keywords
+	if classifyEnvironmental("the algorithm returned unexpected results: got 42, want 0", nil) {
+		t.Error("expected false for pure logic failure with no environmental keywords")
+	}
+}
+
 // ── aggregateFailureClass ────────────────────────────────────────────────────
 
 func TestAggregateFailureClass_EmptyReturnsEmpty(t *testing.T) {
