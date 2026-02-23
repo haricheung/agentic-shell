@@ -352,14 +352,14 @@ func calibrate(entries []types.MemoryEntry, intent string) string {
 // entrySummary produces a short readable description of a memory entry for constraint text.
 //
 // Expectations:
-//   - Truncates content JSON at 180 chars, appending "…" when trimmed
+//   - Truncates content JSON at 400 chars, appending "…" when trimmed
 //   - Prepends "[tags: t1, t2] " when tags are present
 //   - Returns raw content JSON with no prefix when tags are empty
 func entrySummary(e types.MemoryEntry) string {
 	raw, _ := json.Marshal(e.Content)
 	s := string(raw)
-	if len(s) > 180 {
-		s = s[:180] + "…"
+	if len(s) > 400 {
+		s = s[:400] + "…"
 	}
 	if len(e.Tags) > 0 {
 		return fmt.Sprintf("[tags: %s] %s", strings.Join(e.Tags, ", "), s)

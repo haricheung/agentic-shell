@@ -104,14 +104,14 @@ func TestCalibrate_EpisodicUnderShouldPrefer(t *testing.T) {
 // --- entrySummary ---
 
 func TestEntrySummary_TruncatesLongContent(t *testing.T) {
-	// Truncates content JSON at 180 chars, appending "…" when trimmed
-	long := strings.Repeat("x", 200)
+	// Truncates content JSON at 400 chars, appending "…" when trimmed
+	long := strings.Repeat("x", 500)
 	e := types.MemoryEntry{Content: long}
 	got := entrySummary(e)
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("expected trailing ellipsis for long content, got %q", got)
 	}
-	if len([]rune(got)) > 185 { // 180 content + "…" + small overhead
+	if len([]rune(got)) > 405 { // 400 content + "…" + small overhead
 		t.Errorf("summary too long: %d runes", len([]rune(got)))
 	}
 }
