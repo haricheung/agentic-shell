@@ -488,9 +488,9 @@ Practical constraints:
 |---|---|---|
 | 0 | Scope integrity (no silent goal substitution) | Spec complete; enforced in R4b prompt |
 | 0 | failure_class accurate attribution | Spec complete; pending implementation |
-| 1 | Confirmation before irreversible actions | Not yet specified — pending |
+| 1 | Confirmation before irreversible actions | Implemented: executor gates rm/rmdir/truncate/shred/dd/mkfs and write_file-overwrite; [LAW1] prefix propagates to FinalResult summary |
 | 2 | Retry + replan budget exhaustion | Implemented (maxRetries=2, maxReplans=3) |
 | 2 | failure_class-aware replanning routing | Spec complete; pending implementation |
-| 2 | Convergence kill-switch (2× worsening → abort) | Not yet specified — pending |
-| 3 | Memory integrity enforcement | Not yet specified — pending |
+| 2 | Convergence kill-switch (2× worsening → abort) | Implemented: GGS worseningCount map; forces abandon after 2 consecutive worsening gradients |
+| 3 | Memory integrity enforcement | Implemented: procedural MemoryEntry derives failure_class from CriteriaVerdicts; tagged failure_class:<value> for R2 memory queries |
 | 3 | Cost model compliance | Partially implemented (caps, headTail) |

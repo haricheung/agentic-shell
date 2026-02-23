@@ -320,6 +320,61 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 	}, toolCallHistory, nil
 }
 
+// isIrreversibleShell reports whether a shell command is irreversible and must not
+// be executed without explicit user confirmation.
+// Returns (true, reason) when destructive; (false, "") otherwise.
+//
+// Expectations:
+//   - Returns true for "rm " commands (including rm -rf, sudo rm)
+//   - Returns true for "rmdir" commands
+//   - Returns true for "truncate" commands
+//   - Returns true for "shred" commands
+//   - Returns true for "dd " with "of=" argument (device/file overwrite)
+//   - Returns true for "mkfs" commands
+//   - Returns true for "fdisk " commands
+//   - Returns false for read-only commands (ls, cat, grep, find, etc.)
+func isIrreversibleShell(cmd string) (bool, string) {
+	check := strings.TrimSpace(cmd)
+	if strings.HasPrefix(check, "sudo ") {
+		check = strings.TrimSpace(check[5:])
+	}
+	type pattern struct{ prefix, reason string }
+	patterns := []pattern{
+		{"rm ", "rm deletes files permanently"},
+		{"rmdir", "rmdir removes directories permanently"},
+		{"truncate ", "truncate destroys file contents"},
+		{"shred ", "shred irrecoverably destroys files"},
+		{"mkfs", "mkfs formats a filesystem, destroying all data"},
+		{"fdisk ", "fdisk modifies disk partition table"},
+	}
+	for _, p := range patterns {
+		if strings.HasPrefix(check, p.prefix) {
+			return true, p.reason
+		}
+	}
+	if strings.HasPrefix(check, "dd ") && strings.Contains(check, "of=") {
+		return true, "dd with of= overwrites a device or file"
+	}
+	return false, ""
+}
+
+// isIrreversibleWriteFile reports whether writing to path would overwrite an existing file.
+//
+// Expectations:
+//   - Returns true when path exists and is a regular file
+//   - Returns false when path does not exist (creating a new file is safe)
+//   - Returns false when path is a directory (write_file will fail anyway)
+func isIrreversibleWriteFile(path string) (bool, string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, ""
+	}
+	if info.IsDir() {
+		return false, ""
+	}
+	return true, fmt.Sprintf("write_file would overwrite existing file: %s", path)
+}
+
 // maxdepthRe strips -maxdepth N from find commands so the LLM never accidentally
 // limits searches to a single directory level in a project with subdirectories.
 var maxdepthRe = regexp.MustCompile(`-maxdepth\s+\d+\s*`)
@@ -379,6 +434,9 @@ func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 	case "mdfind":
 		return tools.RunMdfind(ctx, tc.Query)
 	case "shell":
+		if irreversible, reason := isIrreversibleShell(tc.Command); irreversible {
+			return fmt.Sprintf("[LAW1] %s — command blocked: %q. Re-issue the task with explicit permission to proceed.", reason, tc.Command), nil
+		}
 		// Intercept personal-file find commands and redirect to mdfind.
 		// The model occasionally ignores the prompt priority and emits
 		// `find /Users/... -name <pattern>` which is extremely slow (~6 min).
@@ -423,6 +481,9 @@ func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 	case "read_file":
 		return tools.ReadFile(tc.Path)
 	case "write_file":
+		if irreversible, reason := isIrreversibleWriteFile(tc.Path); irreversible {
+			return fmt.Sprintf("[LAW1] %s — write blocked. Re-issue the task with explicit permission to overwrite.", reason), nil
+		}
 		return "ok", tools.WriteFile(tc.Path, tc.Content)
 	case "search":
 		return tools.Search(ctx, tc.Query)

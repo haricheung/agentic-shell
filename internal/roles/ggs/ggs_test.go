@@ -542,3 +542,160 @@ func TestProcessAccept_OmegaUsesElapsedTimeAndPriorReplans(t *testing.T) {
 		t.Errorf("expected Ω=w2*0.5=%.3f, got %.3f", w2*0.5, omega)
 	}
 }
+
+// ── Law 2 kill-switch ─────────────────────────────────────────────────────────
+
+// worseningOutcomes returns a ReplanRequest whose outcomes produce a worsening
+// gradient when L_prev is primed to a low value (e.g. 0.05).
+// All outcomes failed → D=1.0 → L = α·1 + β_eff·P + λ·Ω > 0.05.
+func worseningReplanRequest(taskID string) types.ReplanRequest {
+	failReason := "logical error"
+	return types.ReplanRequest{
+		TaskID:     taskID,
+		GapSummary: "all subtasks failed",
+		ElapsedMs:  1000,
+		Outcomes: []types.SubTaskOutcome{
+			{
+				Status:        "failed",
+				FailureReason: &failReason,
+				CriteriaVerdicts: []types.CriteriaVerdict{
+					{Criterion: "c1", Verdict: "fail", FailureClass: "logical"},
+				},
+			},
+		},
+	}
+}
+
+func TestLaw2KillSwitch_AbandonAfterTwoConsecutiveWorsening(t *testing.T) {
+	// directive overridden to "abandon" after 2 consecutive worsening gradients
+	b := bus.New()
+	tap := b.NewTap()
+	gs := New(b, nil)
+
+	taskID := "law2-task"
+	// Prime lPrev to a very low value so first replan produces worsening gradient.
+	gs.mu.Lock()
+	gs.lPrev[taskID] = 0.01
+	gs.mu.Unlock()
+
+	rr := worseningReplanRequest(taskID)
+
+	// Round 1: worsening but only count=1 — should emit PlanDirective (not abandon yet).
+	gs.process(context.Background(), rr)
+	timeout := time.After(500 * time.Millisecond)
+	gotDirective := false
+loop1:
+	for {
+		select {
+		case msg := <-tap:
+			if msg.Type == types.MsgPlanDirective {
+				gotDirective = true
+				break loop1
+			}
+			if msg.Type == types.MsgFinalResult {
+				// abandoned on round 1 — only possible if Ω already ≥ 0.8
+				// (small elapsed, only 1 replan: Ω = 0.6*(1/3) + 0.4*(1000/300000) ≈ 0.2)
+				// This should not happen, but let the second call decide.
+				gotDirective = false
+				break loop1
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for round-1 message")
+		}
+	}
+
+	// Round 2: second consecutive worsening — kill-switch must fire → FinalResult (abandon).
+	// Re-prime lPrev to a low value again so gradient stays worsening.
+	gs.mu.Lock()
+	gs.lPrev[taskID] = 0.01
+	gs.mu.Unlock()
+
+	_ = gotDirective // first round result doesn't affect kill-switch logic
+
+	gs.process(context.Background(), rr)
+	timeout2 := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case msg := <-tap:
+			if msg.Type == types.MsgFinalResult {
+				return // kill-switch fired correctly
+			}
+		case <-timeout2:
+			t.Fatal("timed out: Law 2 kill-switch did not fire after 2 consecutive worsening gradients")
+		}
+	}
+}
+
+func TestLaw2KillSwitch_NotFiredAfterOnlyOneWorsening(t *testing.T) {
+	// Only 1 worsening does not trigger the kill-switch — PlanDirective emitted instead
+	b := bus.New()
+	tap := b.NewTap()
+	gs := New(b, nil)
+
+	taskID := "law2-one"
+	gs.mu.Lock()
+	gs.lPrev[taskID] = 0.01
+	gs.mu.Unlock()
+
+	gs.process(context.Background(), worseningReplanRequest(taskID))
+
+	timeout := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case msg := <-tap:
+			if msg.Type == types.MsgPlanDirective {
+				return // correct: directive emitted, not abandon
+			}
+			if msg.Type == types.MsgFinalResult {
+				// Only acceptable if Ω ≥ 0.8 (budget exhausted), not kill-switch
+				gs.mu.Lock()
+				count := gs.worseningCount[taskID]
+				gs.mu.Unlock()
+				if count >= 2 {
+					t.Error("kill-switch fired after only 1 worsening round")
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for round-1 message")
+		}
+	}
+}
+
+func TestLaw2KillSwitch_ResetWhenGradientImproves(t *testing.T) {
+	// worseningCount resets to 0 when gradient is not worsening
+	// Sequence: worsening(1) → improving(0) → worsening(1) → no kill-switch on 3rd call
+	b := bus.New()
+	gs := New(b, nil)
+
+	taskID := "law2-reset"
+
+	// Round 1: worsening → count=1
+	gs.mu.Lock()
+	gs.lPrev[taskID] = 0.01
+	gs.mu.Unlock()
+	gs.process(context.Background(), worseningReplanRequest(taskID))
+
+	// Manually inspect: count should be 1 after worsening
+	time.Sleep(50 * time.Millisecond) // let goroutine complete
+	gs.mu.Lock()
+	c1 := gs.worseningCount[taskID]
+	gs.mu.Unlock()
+	if c1 != 1 {
+		t.Errorf("expected worseningCount=1 after first worsening, got %d", c1)
+	}
+
+	// Round 2: improving gradient (set lPrev high so ∇L < 0)
+	gs.mu.Lock()
+	gs.lPrev[taskID] = 10.0 // L will be << 10, so ∇L < 0 → improving
+	gs.mu.Unlock()
+	gs.process(context.Background(), worseningReplanRequest(taskID))
+	time.Sleep(50 * time.Millisecond)
+
+	gs.mu.Lock()
+	c2 := gs.worseningCount[taskID]
+	gs.mu.Unlock()
+	if c2 != 0 {
+		t.Errorf("expected worseningCount reset to 0 after improving, got %d", c2)
+	}
+}

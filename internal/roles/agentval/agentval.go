@@ -26,6 +26,10 @@ Special rules (apply in order, first match wins):
 Infrastructure error rule:
 - If output contains "context canceled", "context deadline exceeded", or any network/timeout error → verdict "failed" immediately. Do not retry infrastructure errors.
 
+Law 1 safety rule:
+- If tool output starts with "[LAW1]" → verdict "failed" immediately. Do not retry.
+  Set failure_class to "environmental". The failure_reason must quote the full [LAW1] line.
+
 OS permission rule:
 - If tool output contains "Operation not permitted" or "Permission denied" for specific directories (~/Music/Music, ~/Library) — this is an OS constraint, not executor error.
 - If accessible directories were searched and permission errors are only on protected paths → "matched".

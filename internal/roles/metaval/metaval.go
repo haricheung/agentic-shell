@@ -295,6 +295,45 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 	}
 }
 
+// aggregateFailureClassFromOutcomes derives the dominant failure_class from
+// SubTaskOutcome.CriteriaVerdicts across all failed outcomes.
+//
+// Expectations:
+//   - Returns "" when no failed outcomes or no classified criteria
+//   - Returns "logical" when logical count > environmental count
+//   - Returns "environmental" when environmental count > logical count
+//   - Returns "mixed" when tied and non-zero
+//   - Ignores matched outcomes
+func aggregateFailureClassFromOutcomes(outcomes []types.SubTaskOutcome) string {
+	logical, env := 0, 0
+	for _, o := range outcomes {
+		if o.Status != "failed" {
+			continue
+		}
+		for _, cv := range o.CriteriaVerdicts {
+			if cv.Verdict != "fail" {
+				continue
+			}
+			switch cv.FailureClass {
+			case "logical":
+				logical++
+			case "environmental":
+				env++
+			}
+		}
+	}
+	switch {
+	case logical == 0 && env == 0:
+		return ""
+	case logical > env:
+		return "logical"
+	case env > logical:
+		return "environmental"
+	default:
+		return "mixed"
+	}
+}
+
 // triggerReplan handles the replan path for both the hard gate (code-enforced
 // failed subtask check) and the LLM-driven replan verdict. It writes a
 // procedural memory entry, publishes a ReplanRequest to R7 (GGS), and resets
@@ -361,16 +400,22 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 
 	// Write procedural memory so the planner can avoid repeating the failure.
 	type failureLesson struct {
-		Lesson      string   `json:"lesson"`
-		GapSummary  string   `json:"gap_summary"`
-		FailedTasks []string `json:"failed_subtasks"`
+		Lesson       string   `json:"lesson"`
+		GapSummary   string   `json:"gap_summary"`
+		FailedTasks  []string `json:"failed_subtasks"`
+		FailureClass string   `json:"failure_class,omitempty"`
 	}
+	fc := aggregateFailureClassFromOutcomes(outcomes)
 	lesson := failureLesson{
-		Lesson:      "Task failed: " + gapSummary + ". Avoid repeating the same approach.",
-		GapSummary:  gapSummary,
-		FailedTasks: failedIDs,
+		Lesson:       "Task failed: " + gapSummary + ". Avoid repeating the same approach.",
+		GapSummary:   gapSummary,
+		FailedTasks:  failedIDs,
+		FailureClass: fc,
 	}
 	tags := []string{"failure", "replan", taskID}
+	if fc != "" {
+		tags = append(tags, "failure_class:"+fc)
+	}
 	for _, word := range strings.Fields(gapSummary) {
 		if len(word) >= 4 {
 			tags = append(tags, strings.ToLower(strings.Trim(word, ".,;:!?")))

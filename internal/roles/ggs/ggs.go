@@ -36,20 +36,22 @@ const (
 // When Ω ≥ abandonOmega, GGS handles abandonment directly (publishes FinalResult
 // and calls outputFn) and does NOT forward a PlanDirective to R2.
 type GGS struct {
-	b        *bus.Bus
-	outputFn func(taskID, summary string, output any)
-	mu       sync.Mutex
-	lPrev    map[string]float64 // L_{t-1} per task_id
-	replans  map[string]int     // replan round counter per task_id
+	b               *bus.Bus
+	outputFn        func(taskID, summary string, output any)
+	mu              sync.Mutex
+	lPrev           map[string]float64 // L_{t-1} per task_id
+	replans         map[string]int     // replan round counter per task_id
+	worseningCount  map[string]int     // consecutive "worsening" gradient count per task_id
 }
 
 // New creates a GGS.
 func New(b *bus.Bus, outputFn func(taskID, summary string, output any)) *GGS {
 	return &GGS{
-		b:        b,
-		outputFn: outputFn,
-		lPrev:    make(map[string]float64),
-		replans:  make(map[string]int),
+		b:              b,
+		outputFn:       outputFn,
+		lPrev:          make(map[string]float64),
+		replans:        make(map[string]int),
+		worseningCount: make(map[string]int),
 	}
 }
 
@@ -122,6 +124,24 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 
 	gradient := computeGradient(gradL, D)
 	directive := selectDirective(gradL, D, P, Omega, gradient)
+
+	// Law 2 kill-switch: 2 consecutive worsening replans → force abandon regardless of Ω.
+	g.mu.Lock()
+	if gradient == "worsening" {
+		g.worseningCount[taskID]++
+	} else {
+		g.worseningCount[taskID] = 0
+	}
+	consecutiveWorsening := g.worseningCount[taskID]
+	g.mu.Unlock()
+
+	const law2KillThreshold = 2
+	if consecutiveWorsening >= law2KillThreshold && directive != "abandon" {
+		log.Printf("[R7] LAW2 KILL-SWITCH: task=%s consecutive_worsening=%d — overriding %s→abandon",
+			taskID, consecutiveWorsening, directive)
+		directive = "abandon"
+	}
+
 	blockedTools := deriveBlockedTools(rr.Outcomes, directive)
 	failedCriterion := primaryFailedCriterion(rr.Outcomes)
 	failureClass := computeFailureClass(rr.Outcomes)
@@ -159,6 +179,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		g.mu.Lock()
 		delete(g.lPrev, taskID)
 		delete(g.replans, taskID)
+		delete(g.worseningCount, taskID)
 		g.mu.Unlock()
 		return
 	}
@@ -234,6 +255,7 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 	g.mu.Lock()
 	delete(g.lPrev, taskID)
 	delete(g.replans, taskID)
+	delete(g.worseningCount, taskID)
 	g.mu.Unlock()
 
 	// GGS is the sole emitter of FinalResult — consistent path for both accept and abandon.

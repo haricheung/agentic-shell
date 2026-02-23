@@ -5,6 +5,19 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #64 — Laws 1, 2, 3 from ARCHITECTURE.md not implemented
+
+**Symptom**: Laws 1, 2, 3 from ARCHITECTURE.md marked "not yet implemented". Executor would execute destructive shell commands (rm -rf, mkfs, etc.) and overwrite existing files without any gate. GGS had no kill-switch for consecutive worsening replans. Procedural `MemoryEntry` had no `failure_class` field — future tasks could not filter memory by failure type.
+
+**Root cause**: No irreversible-action gate in executor; no consecutive-worsening kill-switch in GGS; procedural `MemoryEntry` derived `failure_class` from free-text `gap_summary` keywords instead of structured `CriteriaVerdicts`.
+
+**Fix**:
+- Law 1 — `isIrreversibleShell` + `isIrreversibleWriteFile` in `executor.go:runTool`; both return a `[LAW1]` prefixed string on block (no error, treated as a tool result); R4a prompt adds "Law 1 safety rule" — `[LAW1]` output → immediate `failed` verdict with `failure_class=environmental`.
+- Law 2 — `worseningCount map[string]int` added to GGS struct; `process()` increments count on `worsening` gradient and resets on non-worsening; after 2 consecutive worsening gradients the directive is overridden to `abandon` with a `[R7] LAW2 KILL-SWITCH` log line; `worseningCount` cleaned up on both abandon and accept exit paths.
+- Law 3 — `aggregateFailureClassFromOutcomes` helper in `metaval.go` counts `fail`-verdict `CriteriaVerdicts` across failed outcomes; `failureLesson` struct gains `FailureClass` field; procedural `MemoryEntry` carries structured `failure_class` and a `failure_class:<value>` tag for R2 memory queries.
+
+---
+
 ## Issue #63 — Spec-vs-code gaps: criterion-level D/P, structured failure_class, GGS thrashing detection
 
 **Symptom**: GGS computes D at subtask granularity (failed subtasks / total subtasks) and P via keyword heuristics on `FailureReason` strings. Spec defines criterion-level D (`failed_criteria / total_criteria`) and structured `failure_class`-based P. R4a had no `failure_class` field in its criterion output, so GGS had no structured signal. Auditor lacked GGS thrashing detection (consecutive `break_symmetry` without D decreasing). Abandon-path summary was a single inline format string with no enumeration of completed/failed intents.
