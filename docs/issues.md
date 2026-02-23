@@ -5,6 +5,24 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #62 — Trajectory checkpoints missing from pipeline display
+
+**Symptom**: The pipeline flow lines for `SubTaskOutcome`, `ReplanRequest`, and `FinalResult` showed only minimal detail. `SubTaskOutcome` failed only showed the unmet criterion (no R4a score). `ReplanRequest` showed only the gap summary (no "N/M failed" count). `FinalResult` had no flow line at all — only the `endTask` footer appeared. GGS integration path (R4b → R7 → R2) had no bus-level tests.
+
+**Root cause**: (1) `SubTaskOutcome` detail didn't include `GapTrajectoryPoint.Score`. (2) `ReplanRequest` detail didn't compute failed/total from `Outcomes`. (3) `printFlow` skipped `FinalResult` entirely (comment said "surfaced via endTask"). (4) `FinalResult` type had no loss fields — GGS computed D/P/Ω/∇L but discarded them after logging. (5) No integration tests verified the R4b→R7→R2 bus flow.
+
+**Fix**:
+- `types.go`: Added `Loss LossBreakdown`, `GradL float64`, `Replans int` to `FinalResult`.
+- `ggs.go`: Set `Loss`, `GradL`, `Replans` on `FinalResult` in both `processAccept` and the abandon path of `process()`.
+- `display.go msgDetail`: `SubTaskOutcome` failed → `"failed | score=X.XX | unmet: criterion"`; `ReplanRequest` → `"N/M failed | gap_summary"`; new `FinalResult` case → `"D=X.XX ∇L=±X.XX Ω=X%"` (+ `| N replan(s)` when replans > 0).
+- `display.go printFlow`: Removed early return for `MsgFinalResult` so the trajectory checkpoint is always shown.
+- `display.go Run`: Detects abandon (Loss.D > 0) to pass `success=false` to `endTask`.
+- `display.go dynamicStatus`: Added `MsgReplanRequest` case → `"📊 N/M subtasks failed — computing gradient..."`.
+- `display_test.go`: Updated `TestMsgDetail_SubTaskOutcome_FailedWithUnmetCriteria`; added 5 new tests.
+- `ggs_integration_test.go`: 5 bus-level integration tests (change_path, break_symmetry, refine/improving, abandon→FinalResult, accept→FinalResult with D=0).
+
+---
+
 ## Issue #61 — Reasoning model `<think>` blocks cause JSON parse failure in Executor
 
 **Symptom**: Task abandoned with "Infrastructure/executor error: LLM output contained malformed JSON with stray `</think>` token between tool calls." R4a classifies this as an infrastructure error and marks the subtask failed immediately — no retry is attempted.

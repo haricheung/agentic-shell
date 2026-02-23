@@ -23,6 +23,8 @@ Dreamer deferred to v0.8.
 | v0.6 criteria ownership design implemented in code | R1 no longer outputs success_criteria (it was still doing so in code despite the v0.6 spec). R2 now outputs `{"task_criteria":[...],"subtasks":[...]}` wrapper. task_criteria are plain strings in `DispatchManifest`; R4b reads them from there. |
 | PlanDirective pipeline line shows D, P, ∇L, Ω; spinner shows rationale | All four GGS metrics are now visible in the terminal pipeline display. The gradient arrow (↑ ↓ ⊥ →) encodes direction; D, P, ∇L, Ω are shown numerically. While R2 replans, the spinner shows the human-readable rationale explaining why the directive was chosen. |
 | `<think>` blocks stripped from all LLM output before JSON parsing | Reasoning models (e.g. deepseek-r1) emit `<think>...</think>` blocks in raw completions. These caused `json.Unmarshal` to fail with `invalid character '<'`, which R4a classified as infrastructure errors and marked subtasks failed without retry. `StripThinkBlocks()` is now called as the first step of `StripFences()` for all roles. |
+| `FinalResult` is a trajectory record; Loss/GradL/Replans populated on all GGS paths | GGS computed D/∇L/Ω on every cycle but previously discarded them from `FinalResult`. Now both `processAccept` (D=0) and the abandon path (D>0) populate `FinalResult.Loss`, `FinalResult.GradL`, and `FinalResult.Replans`. This closes the observability loop: every medium-loop cycle — including the final one — is visible in the pipeline display. Resolves Q5 (see below). |
+| Pipeline checkpoints at all key message types | `SubTaskOutcome` failed now shows R4a's final score. `ReplanRequest` shows N/M failed count and total. `FinalResult` always renders a flow line showing D/∇L/Ω. Abandon detection uses `Loss.D > 0` (code-driven, not text-parsing). |
 
 ---
 
@@ -465,11 +467,14 @@ persistent) with session-scoped, task-specific MUST NOTs derived from the live g
 
 **Skills**:
 - Receive `ReplanRequest` from R4b carrying full `SubTaskOutcome[]` data
+- Receive `OutcomeSummary` from R4b when all subtasks matched (happy path)
 - Compute D, P, Ω, L for the current round
 - Compute ∇L from previous round's L (maintained per task_id)
 - Detect plateau condition
 - Select directive from decision table
-- Emit `PlanDirective` to R2
+- Emit `PlanDirective` to R2 (all non-abandon directives)
+- Emit `FinalResult` to User on **both** paths: accept (D=0) and abandon (D>0, Ω≥0.8)
+- Populate `FinalResult.Loss`, `FinalResult.GradL`, `FinalResult.Replans` on every emission — this is the trajectory closure that makes every medium-loop cycle observable
 - Log loss breakdown and gradient to the bus (Auditor visibility)
 
 **Contract**:
@@ -477,7 +482,9 @@ persistent) with session-scoped, task-specific MUST NOTs derived from the live g
 | Direction | Counterparty | Format |
 |---|---|---|
 | Receives | Meta-Validator (R4b) | `ReplanRequest` JSON (with full outcomes data) |
-| Produces | Planner (R2) | `PlanDirective` JSON |
+| Receives | Meta-Validator (R4b) | `OutcomeSummary` JSON (all subtasks matched) |
+| Produces | Planner (R2) | `PlanDirective` JSON (all non-abandon directives) |
+| Produces | User (via bus) | `FinalResult` JSON (accept and abandon paths) |
 
 ```json
 PlanDirective {
@@ -496,6 +503,24 @@ PlanDirective {
   "budget_pressure":   "float",           // Ω for display (same as loss.Omega)
   "grad_l":            "float",           // ∇L = L_t − L_{t-1}; 0 on first replan round
   "rationale":         "string"           // human-readable explanation; logged by Auditor; shown in UI spinner
+}
+
+// FinalResult is the trajectory closure — GGS is the sole emitter on all paths.
+// Loss.D == 0.0 on the accept path (all subtasks matched).
+// Loss.D > 0.0 on the abandon path (Ω ≥ 0.8 with at least one failed subtask).
+// The display layer uses Loss.D > 0 as the programmatic signal to show ❌ vs ✅.
+FinalResult {
+  "task_id":  "string",
+  "summary":  "string",
+  "output":   "any",                  // null on abandon path
+  "loss": {
+    "D":     "float",                 // 0.0 on accept; > 0 on abandon
+    "P":     "float",
+    "Omega": "float",                 // ≥ 0.8 on abandon
+    "L":     "float"
+  },
+  "grad_l":   "float",               // ∇L across the final round; 0 on first-try accept
+  "replans":  "integer"              // number of GGS-directed replan rounds; 0 on first-try accept
 }
 ```
 
@@ -582,6 +607,8 @@ User
 | R2 plan cannot reuse an approach flagged in memory MUST NOT | R2 plan validator |
 | Memory calibration (Steps 1–3) involves no LLM call; bounded at 10 entries | R2 Go code |
 | GGS emits `abandon` when Ω ≥ 0.8 regardless of gradient signal | R7 decision table |
+| GGS is the sole emitter of `FinalResult` on all paths (accept and abandon); R4b never emits it directly | R7 code; R4b sends OutcomeSummary/ReplanRequest |
+| `FinalResult.Loss.D == 0.0` iff accept path; `> 0.0` iff abandon path | R7 `processAccept` sets D=0; `process()` abandon uses `computeD(outcomes) > 0` |
 
 ---
 
@@ -611,7 +638,7 @@ The Auditor's gap_trend data across sessions provides the signal for tuning.
 | Q2 | Should GGS persist L_prev across sessions (in R5) or only within a single task's lifetime? Cross-session persistence enables better gradient estimation for recurring task types | R7, R5 |
 | Q3 | How should `change_path` directive communicate the *new* path hint to R2 — as free text in rationale, or as a structured `suggested_alternatives` field? | R7, R2 |
 | Q4 | When multiple subtasks fail with different failure_classes, how does GGS pick the dominant class for the directive? Proposed: majority vote; tie → "mixed" class → `change_approach` | R7 |
-| Q5 | Should the `abandon` directive from GGS be distinguishable from the `maxReplans` abandon in R4b? Current: both produce FinalResult with failure summary. Unifying them under GGS would give a consistent abandonment path | R7, R4b |
+| Q5 | ~~Should the `abandon` directive from GGS be distinguishable from the `maxReplans` abandon in R4b?~~ **RESOLVED**: GGS is the sole emitter of `FinalResult` on all paths. R4b sends `ReplanRequest` (with `recommendation: abandon`) to R7; GGS decides based on Ω. Consistent abandonment path achieved. | — |
 | Q6 | How does R2's plan validator check `blocked_tools` — exact string match on tool name, or keyword match on intent? Proposed: exact match on tool name; R3's tool_calls format already carries the tool name prefix | R2, R7 |
 
 ---

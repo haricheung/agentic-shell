@@ -227,11 +227,16 @@ type OutcomeSummary struct {
 	Outcomes     []SubTaskOutcome `json:"outcomes"`      // full outcomes; GGS records final D/L
 }
 
-// FinalResult carries the merged result to the user
+// FinalResult carries the merged result to the user.
+// Loss, GradL, and Replans are set by GGS so the UI can display the full
+// trajectory checkpoint (D, ∇L, Ω) on every path — accept and abandon.
 type FinalResult struct {
-	TaskID  string `json:"task_id"`
-	Summary string `json:"summary"`
-	Output  any    `json:"output"`
+	TaskID  string        `json:"task_id"`
+	Summary string        `json:"summary"`
+	Output  any           `json:"output"`
+	Loss    LossBreakdown `json:"loss"`
+	GradL   float64       `json:"grad_l,omitempty"`
+	Replans int           `json:"replans,omitempty"`
 }
 
 

@@ -137,13 +137,20 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 			replanCount, Omega*100, rr.GapSummary)
 
 		// Publish FinalResult on bus for auditor + REPL subscription.
+		// Loss/GradL/Replans populated for trajectory checkpoint display.
 		g.b.Publish(types.Message{
 			ID:        uuid.New().String(),
 			Timestamp: time.Now().UTC(),
 			From:      types.RoleGGS,
 			To:        types.RoleUser,
 			Type:      types.MsgFinalResult,
-			Payload:   types.FinalResult{TaskID: taskID, Summary: summary},
+			Payload: types.FinalResult{
+				TaskID:  taskID,
+				Summary: summary,
+				Loss:    types.LossBreakdown{D: D, P: P, Omega: Omega, L: L},
+				GradL:   gradL,
+				Replans: replanCount,
+			},
 		})
 		if g.outputFn != nil {
 			g.outputFn(taskID, summary, nil)
@@ -199,6 +206,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 //   - Ω is computed from prior replan count + elapsed time (rewards fast, first-try solutions)
 //   - gradient is always "stable" (D=0 ≤ δ)
 //   - Emits MsgFinalResult to RoleUser with the merged output and summary
+//   - FinalResult carries Loss (D=0), GradL, and Replans for trajectory checkpoint display
 //   - Calls outputFn so the REPL can display the result
 //   - Cleans up lPrev and replans state for the task
 func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
@@ -230,6 +238,7 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 	g.mu.Unlock()
 
 	// GGS is the sole emitter of FinalResult — consistent path for both accept and abandon.
+	// Loss, GradL, Replans are populated so the UI can display the full trajectory checkpoint.
 	g.b.Publish(types.Message{
 		ID:        uuid.New().String(),
 		Timestamp: time.Now().UTC(),
@@ -240,6 +249,9 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 			TaskID:  taskID,
 			Summary: os.Summary,
 			Output:  os.MergedOutput,
+			Loss:    types.LossBreakdown{D: D, P: P, Omega: Omega, L: L},
+			GradL:   gradL,
+			Replans: replanCount,
 		},
 	})
 	if g.outputFn != nil {

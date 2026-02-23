@@ -74,12 +74,20 @@ var msgStatus = map[types.MessageType]string{
 // Expectations:
 //   - MsgPlanDirective with non-empty Rationale: returns "📐 replanning — <rationale clipped>"
 //   - MsgPlanDirective with empty Rationale: falls through to static msgStatus label
+//   - MsgReplanRequest: returns "📊 N/M subtasks failed — computing gradient..." when outcomes present
 func dynamicStatus(msg types.Message) string {
 	switch msg.Type {
 	case types.MsgPlanDirective:
 		var pd types.PlanDirective
 		if remarshal(msg.Payload, &pd) == nil && pd.Rationale != "" {
 			return "📐 replanning — " + clipCols(pd.Rationale, 42)
+		}
+	case types.MsgReplanRequest:
+		var r types.ReplanRequest
+		if remarshal(msg.Payload, &r) == nil && len(r.Outcomes) > 0 {
+			failed := len(r.FailedSubTasks)
+			total := len(r.Outcomes)
+			return fmt.Sprintf("📊 %d/%d subtasks failed — computing gradient...", failed, total)
 		}
 	case types.MsgCorrectionSignal:
 		var c types.CorrectionSignal
@@ -201,7 +209,13 @@ func (d *Display) Run(ctx context.Context) {
 			d.printFlow(msg)
 			d.setStatus(dynamicStatus(msg))
 			if msg.Type == types.MsgFinalResult {
-				d.endTask(true)
+				// Detect abandon path: D > 0 means task failed (GGS budget exceeded).
+				success := true
+				var fr types.FinalResult
+				if remarshal(msg.Payload, &fr) == nil && fr.Loss.D > 0 {
+					success = false
+				}
+				d.endTask(success)
 			}
 
 		case <-ticker.C:
@@ -271,11 +285,6 @@ func (d *Display) setStatus(s string) {
 }
 
 func (d *Display) printFlow(msg types.Message) {
-	// FinalResult is surfaced via endTask; skip its flow line.
-	if msg.Type == types.MsgFinalResult {
-		return
-	}
-
 	from := roleLabel(msg.From)
 	to := roleLabel(msg.To)
 
@@ -316,10 +325,12 @@ func roleLabel(r types.Role) string {
 // Expectations:
 //   - MsgSubTask: returns "#N intent | first_criterion" when criteria present; "+N" suffix when multiple
 //   - MsgSubTask: returns "#N intent" with no suffix when SuccessCriteria is empty
-//   - MsgSubTaskOutcome failed with trajectory: returns "failed | unmet: <first unmet criterion>"
+//   - MsgSubTaskOutcome failed with trajectory: returns "failed | score=X.XX | unmet: criterion"
 //   - MsgSubTaskOutcome matched or failed with no trajectory: returns status string only
 //   - MsgCorrectionSignal: returns "attempt N — what_was_wrong" clipped to 40 chars
+//   - MsgReplanRequest: returns "N/M failed | gap_summary" when outcomes present
 //   - MsgPlanDirective: returns "<arrow> <gradient> | <directive>  D=X P=X ∇L=±X Ω=X%" with all four metrics
+//   - MsgFinalResult: returns "D=X.XX ∇L=±X.XX Ω=X%" (+ "| N replan(s)" when Replans > 0)
 //   - Returns "" for unknown or unparseable message types
 func msgDetail(msg types.Message) string {
 	switch msg.Type {
@@ -350,9 +361,11 @@ func msgDetail(msg types.Message) string {
 		if remarshal(msg.Payload, &o) == nil && o.Status != "" {
 			if o.Status == "failed" && len(o.GapTrajectory) > 0 {
 				last := o.GapTrajectory[len(o.GapTrajectory)-1]
+				detail := fmt.Sprintf("failed | score=%.2f", last.Score)
 				if len(last.UnmetCriteria) > 0 {
-					return fmt.Sprintf("failed | unmet: %s", clip(last.UnmetCriteria[0], 38))
+					detail += " | unmet: " + clip(last.UnmetCriteria[0], 32)
 				}
+				return detail
 			}
 			return o.Status
 		}
@@ -372,8 +385,14 @@ func msgDetail(msg types.Message) string {
 		}
 	case types.MsgReplanRequest:
 		var r types.ReplanRequest
-		if remarshal(msg.Payload, &r) == nil && r.GapSummary != "" {
-			return clip(r.GapSummary, 45)
+		if remarshal(msg.Payload, &r) == nil {
+			summary := clip(r.GapSummary, 35)
+			if total := len(r.Outcomes); total > 0 {
+				return fmt.Sprintf("%d/%d failed | %s", len(r.FailedSubTasks), total, summary)
+			}
+			if r.GapSummary != "" {
+				return summary
+			}
 		}
 	case types.MsgPlanDirective:
 		var pd types.PlanDirective
@@ -398,6 +417,15 @@ func msgDetail(msg types.Message) string {
 		var os types.OutcomeSummary
 		if remarshal(msg.Payload, &os) == nil && os.Summary != "" {
 			return clip(os.Summary, 50)
+		}
+	case types.MsgFinalResult:
+		var fr types.FinalResult
+		if remarshal(msg.Payload, &fr) == nil {
+			detail := fmt.Sprintf("D=%.2f ∇L=%+.2f Ω=%.0f%%", fr.Loss.D, fr.GradL, fr.Loss.Omega*100)
+			if fr.Replans > 0 {
+				detail += fmt.Sprintf(" | %d replan(s)", fr.Replans)
+			}
+			return detail
 		}
 	}
 	return ""

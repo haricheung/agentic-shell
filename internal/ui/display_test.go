@@ -60,16 +60,22 @@ func TestMsgDetail_SubTask_NoCriteria(t *testing.T) {
 // --- msgDetail: MsgSubTaskOutcome ---
 
 func TestMsgDetail_SubTaskOutcome_FailedWithUnmetCriteria(t *testing.T) {
-	// MsgSubTaskOutcome failed with trajectory: returns "failed | unmet: <first unmet criterion>"
+	// MsgSubTaskOutcome failed with trajectory: returns "failed | score=X.XX | unmet: criterion"
 	o := types.SubTaskOutcome{
 		Status: "failed",
 		GapTrajectory: []types.GapTrajectoryPoint{
-			{Attempt: 1, UnmetCriteria: []string{"output contains a valid file path"}},
+			{Attempt: 1, Score: 0.33, UnmetCriteria: []string{"output contains a valid file path"}},
 		},
 	}
 	got := msgDetail(makeMsg(types.MsgSubTaskOutcome, o))
-	if !strings.HasPrefix(got, "failed | unmet:") {
-		t.Errorf("expected 'failed | unmet:' prefix, got %q", got)
+	if !strings.HasPrefix(got, "failed |") {
+		t.Errorf("expected 'failed |' prefix, got %q", got)
+	}
+	if !strings.Contains(got, "score=") {
+		t.Errorf("expected 'score=' in detail, got %q", got)
+	}
+	if !strings.Contains(got, "unmet:") {
+		t.Errorf("expected 'unmet:' in detail, got %q", got)
 	}
 	if !strings.Contains(got, "output contains") {
 		t.Errorf("expected unmet criterion text, got %q", got)
@@ -91,6 +97,105 @@ func TestMsgDetail_SubTaskOutcome_FailedNoTrajectory(t *testing.T) {
 	got := msgDetail(makeMsg(types.MsgSubTaskOutcome, o))
 	if got != "failed" {
 		t.Errorf("expected 'failed' with no unmet detail, got %q", got)
+	}
+}
+
+func TestMsgDetail_SubTaskOutcome_FailedShowsScore(t *testing.T) {
+	// MsgSubTaskOutcome failed: score is always included even without unmet criteria
+	o := types.SubTaskOutcome{
+		Status: "failed",
+		GapTrajectory: []types.GapTrajectoryPoint{
+			{Attempt: 1, Score: 0.75},
+		},
+	}
+	got := msgDetail(makeMsg(types.MsgSubTaskOutcome, o))
+	if !strings.Contains(got, "score=0.75") {
+		t.Errorf("expected 'score=0.75' in detail, got %q", got)
+	}
+	if strings.Contains(got, "unmet:") {
+		t.Errorf("unexpected 'unmet:' when UnmetCriteria is empty, got %q", got)
+	}
+}
+
+// --- msgDetail: MsgReplanRequest ---
+
+func TestMsgDetail_ReplanRequest_ShowsFailedCount(t *testing.T) {
+	// MsgReplanRequest: returns "N/M failed | gap_summary" when outcomes present
+	reason := "not found"
+	rr := types.ReplanRequest{
+		TaskID:         "task-1",
+		GapSummary:     "file not found",
+		FailedSubTasks: []string{"st-1"},
+		Outcomes: []types.SubTaskOutcome{
+			{SubTaskID: "st-1", Status: "failed", FailureReason: &reason},
+			{SubTaskID: "st-2", Status: "matched"},
+		},
+	}
+	got := msgDetail(makeMsg(types.MsgReplanRequest, rr))
+	if !strings.Contains(got, "1/2 failed") {
+		t.Errorf("expected '1/2 failed' in detail, got %q", got)
+	}
+	if !strings.Contains(got, "file not found") {
+		t.Errorf("expected gap summary in detail, got %q", got)
+	}
+}
+
+// --- msgDetail: MsgFinalResult ---
+
+func TestMsgDetail_FinalResult_ShowsLossMetrics(t *testing.T) {
+	// MsgFinalResult with Replans > 0: returns "D=X.XX ∇L=±X.XX Ω=X% | N replan(s)"
+	fr := types.FinalResult{
+		TaskID:  "task-1",
+		Summary: "all done",
+		Loss:    types.LossBreakdown{D: 0.5, P: 0.5, Omega: 0.4, L: 0.55},
+		GradL:   -0.25,
+		Replans: 2,
+	}
+	got := msgDetail(makeMsg(types.MsgFinalResult, fr))
+	for _, want := range []string{"D=", "∇L=", "Ω=", "2 replan"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in FinalResult detail, got %q", want, got)
+		}
+	}
+}
+
+func TestMsgDetail_FinalResult_FirstTryNoReplanSuffix(t *testing.T) {
+	// MsgFinalResult with Replans=0: shows loss metrics but no "replan" suffix
+	fr := types.FinalResult{
+		TaskID:  "task-1",
+		Summary: "done",
+		Loss:    types.LossBreakdown{D: 0.0, P: 0.5, Omega: 0.05, L: 0.17},
+	}
+	got := msgDetail(makeMsg(types.MsgFinalResult, fr))
+	if strings.Contains(got, "replan") {
+		t.Errorf("unexpected 'replan' in first-try result, got %q", got)
+	}
+	if !strings.Contains(got, "D=") {
+		t.Errorf("expected 'D=' in first-try result, got %q", got)
+	}
+}
+
+// --- dynamicStatus: MsgReplanRequest ---
+
+func TestDynamicStatus_ReplanRequest_ShowsFailedCount(t *testing.T) {
+	// MsgReplanRequest with outcomes: returns "📊 N/M subtasks failed — computing gradient..."
+	reason := "logic error"
+	rr := types.ReplanRequest{
+		TaskID:         "task-1",
+		GapSummary:     "criterion not met",
+		FailedSubTasks: []string{"st-1", "st-2"},
+		Outcomes: []types.SubTaskOutcome{
+			{SubTaskID: "st-1", Status: "failed", FailureReason: &reason},
+			{SubTaskID: "st-2", Status: "failed", FailureReason: &reason},
+			{SubTaskID: "st-3", Status: "matched"},
+		},
+	}
+	got := dynamicStatus(makeMsg(types.MsgReplanRequest, rr))
+	if !strings.Contains(got, "2/3") {
+		t.Errorf("expected '2/3' in dynamicStatus, got %q", got)
+	}
+	if !strings.Contains(got, "gradient") {
+		t.Errorf("expected 'gradient' in dynamicStatus, got %q", got)
 	}
 }
 

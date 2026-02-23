@@ -29,8 +29,6 @@ Copy one of the pre-configured env files to `.env` before running:
 - `.env` — Volcengine/Ark endpoint (`ark.cn-beijing.volces.com`)
 - `.env.ds` — DeepSeek API (`api.deepseek.com`)
 
-`R2_BRAIN` env var overrides the R2 planning engine: `cc` (default) or `llm` (faster, lower quality). Use `R2_BRAIN=llm` to opt out of cc brain.
-
 `LANGSEARCH_API_KEY` enables the `search` tool (LangSearch web search API). When unset the tool is absent from R3's prompt entirely. Optional `LANGSEARCH_BASE_URL` overrides the endpoint (default: `https://api.langsearch.com/v1/web-search`).
 
 All use the OpenAI-compatible convention: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` as shared fallbacks.
@@ -104,7 +102,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3; closes task log via `logReg.Close()` |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
 | `internal/roles/auditor/` | R6 | Active entity: taps bus read-only (passive observation) + subscribes to `MsgAuditQuery` (on-demand) + publishes `MsgAuditReport`; 5-min periodic ticker; accumulates window stats (tasks, corrections, gap trends, violations, drift alerts); resets window after each report |
-| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualizer; reads its own bus tap; `Abort()` sets `suppressed=true` to block stale post-abort messages; `Resume()` lifts it before each new task; spinner uses `\r\033[K` to prevent line-wrap flood |
+| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualiser; reads its own bus tap; `Abort()` / `Resume()` suppress stale post-abort messages; spinner uses `\r\033[K`; each message type shows a specific checkpoint detail (see **Pipeline Checkpoints** section below); `FinalResult` flow line always rendered with D/∇L/Ω; `endTask` success/failure detection via `Loss.D > 0` |
 | `internal/tools/mdfind.go` | Tool | macOS Spotlight wrapper; `RunMdfind(ctx, query)` → `mdfind -name <query>`; if no results and query has an extension, retries with stem only and post-filters by extension (Spotlight CJK+extension quirk) |
 
 ## Tools Available to Executor
@@ -186,10 +184,38 @@ Ctrl+C in REPL aborts only the current task, never the process:
 4. `disp.Abort()` closes the pipeline box and sets `suppressed=true`; stale in-flight messages are drained silently.
 5. `disp.Resume()` is called at the top of the next user task to re-enable the pipeline box.
 
+## Terminal UI — Pipeline Checkpoints
+
+`internal/ui/display.go` renders a live pipeline visualiser. Every bus message produces
+one flow line. Each message type has a defined **checkpoint format** — the inline detail
+shown in the flow line and the spinner label shown while downstream roles process it.
+
+| Message type | Flow line detail | Spinner label |
+|---|---|---|
+| `SubTask` | `#N intent \| first_criterion (+M)` | `📐 scheduling subtasks...` |
+| `ExecutionResult` | `completed \| failed` | `🔍 evaluating result...` |
+| `CorrectionSignal` | `attempt N — what_was_wrong` | `⚙️  retry N — what_to_do` |
+| `SubTaskOutcome` failed | `failed \| score=X.XX \| unmet: criterion` | `🔮 subtask failed — assessing...` |
+| `SubTaskOutcome` matched | `matched` | `🔮 subtask matched — merging...` |
+| `ReplanRequest` | `N/M failed \| gap_summary` | `📊 N/M subtasks failed — computing gradient...` |
+| `PlanDirective` | `<arrow> gradient \| directive  D=X P=X ∇L=±X Ω=X%` | `📐 replanning — rationale` |
+| `FinalResult` | `D=X.XX ∇L=±X.XX Ω=X% [\| N replan(s)]` | — (triggers `endTask`) |
+
+**FinalResult as trajectory record**: `FinalResult.Loss` (D, P, Ω, L), `FinalResult.GradL`
+(∇L), and `FinalResult.Replans` are always populated by GGS — on both the accept path
+(`processAccept`) and the abandon path (`process()`). This closes the observability loop:
+every cycle of the medium loop is visible in the pipeline display, including the final one.
+The FinalResult flow line is always rendered (not suppressed).
+
+**Abandon detection rule**: `endTask(success=false)` fires when `FinalResult.Loss.D > 0`.
+On the accept path D is always 0.0 (all subtasks matched). On the abandon path D > 0 (at
+least one subtask failed, which is what drove Ω ≥ 0.8). This is code-driven — no text
+parsing of the summary string is required.
+
 ## Design Documents
 
 | File | Description |
 |---|---|
 | `ARCHITECTURE.md` | Full system architecture, philosophy, data flow, risk register |
-| `docs/mvp-roles-v0.5.md` | Role definitions v0.5 — current canonical spec |
+| `docs/mvp-roles-v0.7.md` | Role definitions v0.7 — current canonical spec |
 | `docs/issues.md` | Bug log: all issues found in first test session, root causes, fix sequences |
