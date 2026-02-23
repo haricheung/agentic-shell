@@ -27,7 +27,8 @@ Tool selection — use the FIRST tool that fits; do not skip down the list:
    Input: {"action":"tool","tool":"glob","pattern":"*.json","root":"."}
    Pattern matches FILENAME ONLY — no "/" allowed. root:"." = project directory.
 3. read_file  — read a file. Input: {"action":"tool","tool":"read_file","path":"..."}
-4. write_file — write a file. Input: {"action":"tool","tool":"write_file","path":"...","content":"..."}
+4. write_file — write a file. Output files (scripts, reports, generated content) MUST use ~/agsh_workspace/ as the base. Example: {"action":"tool","tool":"write_file","path":"~/agsh_workspace/report.md","content":"..."}
+   Project source files may use their normal relative paths (e.g. "internal/foo/bar.go").
 5. applescript — control macOS/Apple apps (Mail, Calendar, Reminders, Messages, Music, Focus).
    Input: {"action":"tool","tool":"applescript","script":"tell application \"Reminders\" to ..."}
    Calendar/Reminders sync to iPhone/iPad/Watch via iCloud automatically.
@@ -542,10 +543,18 @@ func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 	case "read_file":
 		return tools.ReadFile(tc.Path)
 	case "write_file":
-		if irreversible, reason := isIrreversibleWriteFile(tc.Path); irreversible {
+		// Expand "~/" before path analysis so workspace-rooted paths are not misclassified.
+		writePath := tools.ExpandHome(tc.Path)
+		// Redirect bare filenames and "./" paths to the workspace so generated files
+		// (scripts, reports, data) never land in the project root or CWD.
+		if resolved, redirected := tools.ResolveOutputPath(writePath); redirected {
+			log.Printf("[R3] write_file: redirecting %q → workspace %q", tc.Path, resolved)
+			writePath = resolved
+		}
+		if irreversible, reason := isIrreversibleWriteFile(writePath); irreversible {
 			return fmt.Sprintf("[LAW1] %s — write blocked. Re-issue the task with explicit permission to overwrite.", reason), nil
 		}
-		return "ok", tools.WriteFile(tc.Path, tc.Content)
+		return "ok", tools.WriteFile(writePath, tc.Content)
 	case "search":
 		return tools.Search(ctx, tc.Query)
 	default:

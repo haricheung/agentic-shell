@@ -112,7 +112,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `mdfind` | `query` | **Personal file search** — macOS Spotlight index, < 100 ms. Always use for user files (Downloads, Documents, Music, etc.) |
 | `glob` | `pattern`, `root` | **Project file search** — `root:"."` only; pattern matches filename, not full path; `**/` prefix stripped automatically |
 | `read_file` | `path` | Read a single file |
-| `write_file` | `path`, `content` | Write a file |
+| `write_file` | `path`, `content` | Write a file. Generated output (scripts, reports, data) goes to `~/agsh_workspace/` — bare filenames are redirected there automatically. Project source files use their normal relative paths. |
 | `applescript` | `script` | Control macOS apps (Mail, Calendar, Reminders, Messages, Music…); Calendar/Reminders sync to iPhone/iPad/Watch via iCloud |
 | `shortcuts` | `name`, `input` | Run a named Apple Shortcut (iCloud-synced; can trigger iPhone/Watch automations) |
 | `shell` | `command` | General bash; counting/aggregation (`wc -l`), not file discovery |

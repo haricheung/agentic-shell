@@ -5,6 +5,35 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #70 — Agent-generated files land in project root, polluting VCS
+
+**Symptom**: Files created by the agent as task output (Python scripts, Markdown reports,
+generated data) were written relative to CWD (the project root), appearing as untracked
+VCS noise and requiring manual cleanup.
+
+**Root cause**: `write_file` resolved relative paths against the process working directory.
+No designated output directory existed; the executor prompt gave no guidance on where
+to place generated files.
+
+**Fix**:
+- `internal/tools/workspace.go` (new): `WorkspaceDir()` returns `$AGSH_WORKSPACE` or
+  `~/agsh_workspace`; `ExpandHome()` expands `~/`; `ResolveOutputPath()` redirects bare
+  filenames (no directory component) and `./`-prefixed paths to the workspace; `EnsureWorkspace()`
+  creates the directory.
+- `internal/roles/executor/executor.go`: in `write_file` handler, expand `~` then call
+  `ResolveOutputPath`; logs redirect. Executor system prompt updated: output files MUST
+  use `~/agsh_workspace/` as base.
+- `cmd/agsh/main.go`: calls `tools.EnsureWorkspace()` at startup.
+- `CLAUDE.md`: updated `write_file` tool table row.
+
+Files changed:
+- `internal/tools/workspace.go` (new, +8 tests in `workspace_test.go`)
+- `internal/roles/executor/executor.go`
+- `cmd/agsh/main.go`
+- `CLAUDE.md`
+
+---
+
 ## Issue #69 — No per-role LLM cost/time reporting after task completion
 
 **Symptom**: After each task the user had no visibility into how many tokens each role consumed or how long each LLM call took. The task log captured per-call token counts but the data was never surfaced to the terminal.

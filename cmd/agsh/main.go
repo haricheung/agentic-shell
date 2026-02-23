@@ -21,6 +21,7 @@ import (
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/llm"
 	"github.com/haricheung/agentic-shell/internal/roles/agentval"
+	"github.com/haricheung/agentic-shell/internal/tools"
 	"github.com/haricheung/agentic-shell/internal/roles/auditor"
 	"github.com/haricheung/agentic-shell/internal/roles/executor"
 	"github.com/haricheung/agentic-shell/internal/roles/ggs"
@@ -43,6 +44,12 @@ func main() {
 
 	// Ensure cache directory exists before opening any files.
 	_ = os.MkdirAll(cacheDir, 0755)
+
+	// Ensure the agent workspace exists so write_file never fails on a missing dir.
+	// Generated files (scripts, reports, data) are redirected here automatically.
+	if err := tools.EnsureWorkspace(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create workspace: %v\n", err)
+	}
 
 	// Redirect debug logs to file so they don't interfere with the terminal UI.
 	// Tail ~/.cache/agsh/debug.log to observe internal role activity.
