@@ -1800,3 +1800,33 @@ Files changed:
 - `internal/tools/websearch.go` — full rewrite (Bocha API)
 - `internal/tools/websearch_test.go` (new, 7 tests for `formatBochaResult`)
 - `CLAUDE.md` — updated tool table and env config section
+
+---
+
+## Issue #72 — Three cost-tracking gaps: tool timing, task_end stats, episodic cost
+
+**Symptom**
+1. Tool execution time was not tracked — `ToolCall` had no elapsed-ms parameter, so the `📊 Cost` block showed no "tools" row.
+2. `task_end` JSONL events were missing `role_stats` and `tool_elapsed_ms`, making offline analysis of per-role cost impossible.
+3. Episodic `MemoryEntry` had no cost field, so R2 could not calibrate planning heuristics from past token/tool costs.
+
+**Root cause**
+- `tasklog.ToolCall()` signature lacked an `elapsedMs int64` parameter; executor called it without timing.
+- `Close()` wrote a `task_end` event but only included `total_tokens`, `tool_call_count`, and `tool_elapsed_ms` were missing; `role_stats` array was absent.
+- `types.MemoryEntry` had no `Cost` field; metaval never captured stats before closing the log.
+
+**Fix**
+- `internal/types/types.go`: Added `RoleCost`, `TaskCost` structs; added `Cost *TaskCost` to `MemoryEntry`.
+- `internal/tasklog/tasklog.go`: Added `TaskStats` struct (`Roles []RoleStat`, `ToolCallCount int`, `ToolElapsedMs int64`); added `toolCallCount`/`toolElapsedMs` accumulators to `TaskLog`; added `Stats()` pre-close snapshot method; updated `ToolCall()` to accept `elapsedMs int64`; enriched `task_end` event with `role_stats`, `tool_call_count`, `tool_elapsed_ms`; changed `GetStats()` return type to `*TaskStats`.
+- `internal/roles/executor/executor.go`: Wrapped each `runTool()` call with `time.Now()` timer; passed `toolElapsedMs` to `ToolCall`.
+- `internal/roles/metaval/metaval.go`: Added `toTaskCost(*tasklog.TaskStats) *types.TaskCost` helper; snapshot stats via `tl.Stats()` before `Close()` on accept path; included `Cost` in episodic `MemoryEntry`.
+- `cmd/agsh/main.go`: Updated `printCostStats` to accept `*tasklog.TaskStats`; added "tools" row showing call count and wall-clock execution time.
+- `internal/tasklog/tasklog_test.go`: Fixed `ToolCall` call signatures; added 3 new tests (`TestToolStats_AccumulatesCallCount`, `TestToolStats_AccumulatesElapsedMs`, `TestTaskEnd_IncludesToolStats`).
+
+Files changed:
+- `internal/types/types.go`
+- `internal/tasklog/tasklog.go`
+- `internal/roles/executor/executor.go`
+- `internal/roles/metaval/metaval.go`
+- `cmd/agsh/main.go`
+- `internal/tasklog/tasklog_test.go`

@@ -222,6 +222,9 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 	switch v.Verdict {
 	case "accept":
 		log.Printf("[R4b] task=%s ACCEPTED — forwarding to R7 (GGS) for final loss record and delivery", taskID)
+		// Snapshot cost metrics BEFORE Close() removes the log from the registry.
+		tl := m.logReg.Get(taskID)
+		taskStats := tl.Stats()
 		m.logReg.Close(taskID, "accepted") // write task_end and flush before delivering result
 
 		// Build meaningful tags from task intent for cross-task retrieval
@@ -242,6 +245,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 			Content:   v.MergedOutput,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 			Tags:      intentTags,
+			Cost:      toTaskCost(taskStats),
 		}
 		for _, o := range tracker.outcomes {
 			if o.Status == "matched" {
@@ -499,6 +503,34 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 	m.mu.Lock()
 	tracker.outcomes = nil
 	m.mu.Unlock()
+}
+
+// toTaskCost converts a tasklog.TaskStats snapshot into a types.TaskCost for
+// embedding in episodic MemoryEntry.Cost so R2 can calibrate planning heuristics.
+func toTaskCost(stats *tasklog.TaskStats) *types.TaskCost {
+	if stats == nil {
+		return nil
+	}
+	var byCost []types.RoleCost
+	var totalTok int
+	var llmMs int64
+	for _, rs := range stats.Roles {
+		byCost = append(byCost, types.RoleCost{
+			Role:        rs.Role,
+			Calls:       rs.Calls,
+			TotalTokens: rs.PromptTokens + rs.CompletionTokens,
+			ElapsedMs:   rs.ElapsedMs,
+		})
+		totalTok += rs.PromptTokens + rs.CompletionTokens
+		llmMs += rs.ElapsedMs
+	}
+	return &types.TaskCost{
+		ByRole:        byCost,
+		TotalTokens:   totalTok,
+		LLMElapsedMs:  llmMs,
+		ToolCallCount: stats.ToolCallCount,
+		ToolElapsedMs: stats.ToolElapsedMs,
+	}
 }
 
 func toDispatchManifest(payload any) (types.DispatchManifest, error) {

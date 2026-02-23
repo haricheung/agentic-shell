@@ -689,11 +689,12 @@ func printResult(result types.FinalResult) {
 	}
 }
 
-// printCostStats prints a per-role LLM usage summary after each task.
+// printCostStats prints a per-role LLM + tool usage summary after each task.
 // Suppressed entirely when there are no stats and no perceiver tokens.
-func printCostStats(perceiverUsage llm.Usage, roleStats []tasklog.RoleStat) {
+func printCostStats(perceiverUsage llm.Usage, stats *tasklog.TaskStats) {
 	perceiverToks := perceiverUsage.PromptTokens + perceiverUsage.CompletionTokens
-	if perceiverToks == 0 && len(roleStats) == 0 {
+	hasStats := stats != nil && (len(stats.Roles) > 0 || stats.ToolCallCount > 0)
+	if perceiverToks == 0 && !hasStats {
 		return
 	}
 
@@ -708,7 +709,6 @@ func printCostStats(perceiverUsage llm.Usage, roleStats []tasklog.RoleStat) {
 	// formatToks formats a token count with thousands separator.
 	formatToks := func(n int) string {
 		s := fmt.Sprintf("%d", n)
-		// Insert comma separators from right.
 		if len(s) <= 3 {
 			return s
 		}
@@ -722,7 +722,7 @@ func printCostStats(perceiverUsage llm.Usage, roleStats []tasklog.RoleStat) {
 		return string(out)
 	}
 
-	printRow := func(role string, calls int, toks int, elapsedMs int64) {
+	printLLMRow := func(role string, calls int, toks int, elapsedMs int64) {
 		callWord := "calls"
 		if calls == 1 {
 			callWord = "call "
@@ -733,22 +733,37 @@ func printCostStats(perceiverUsage llm.Usage, roleStats []tasklog.RoleStat) {
 	}
 
 	// Perceiver row (always 1 call, tracked separately from task log).
-	printRow("perceiver", 1, perceiverToks, perceiverUsage.ElapsedMs)
+	printLLMRow("perceiver", 1, perceiverToks, perceiverUsage.ElapsedMs)
 
-	// Per-role rows from task log.
-	totalCalls := 1
+	// Per-role LLM rows from task log.
+	totalLLMCalls := 1
 	totalToks := perceiverToks
-	totalElapsedMs := perceiverUsage.ElapsedMs
-	for _, rs := range roleStats {
-		printRow(rs.Role, rs.Calls, rs.PromptTokens+rs.CompletionTokens, rs.ElapsedMs)
-		totalCalls += rs.Calls
-		totalToks += rs.PromptTokens + rs.CompletionTokens
-		totalElapsedMs += rs.ElapsedMs
+	totalLLMMs := perceiverUsage.ElapsedMs
+	if stats != nil {
+		for _, rs := range stats.Roles {
+			printLLMRow(rs.Role, rs.Calls, rs.PromptTokens+rs.CompletionTokens, rs.ElapsedMs)
+			totalLLMCalls += rs.Calls
+			totalToks += rs.PromptTokens + rs.CompletionTokens
+			totalLLMMs += rs.ElapsedMs
+		}
 	}
 
 	fmt.Printf("  %s──────────────────────────────────────────────────%s\n", dim, reset)
-	printRow("total", totalCalls, totalToks, totalElapsedMs)
-	fmt.Printf("  %s(LLM time only — excludes tool execution)%s\n\n", dim, reset)
+
+	// Tool execution row (wall-clock time, no tokens).
+	if stats != nil && stats.ToolCallCount > 0 {
+		toolSecs := float64(stats.ToolElapsedMs) / 1000.0
+		toolWord := "calls"
+		if stats.ToolCallCount == 1 {
+			toolWord = "call "
+		}
+		fmt.Printf("  %-12s %2d %-6s %10s      %6.1fs\n",
+			"tools", stats.ToolCallCount, toolWord, "(exec)", toolSecs)
+		fmt.Printf("  %s──────────────────────────────────────────────────%s\n", dim, reset)
+	}
+
+	printLLMRow("total (LLM)", totalLLMCalls, totalToks, totalLLMMs)
+	fmt.Println()
 }
 
 func printAuditReport(rep types.AuditReport) {

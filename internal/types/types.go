@@ -166,15 +166,35 @@ type PlanDirective struct {
 	Rationale       string        `json:"rationale"`         // human-readable explanation; logged by Auditor
 }
 
+// RoleCost records LLM usage for one role in a completed task.
+type RoleCost struct {
+	Role        string `json:"role"`
+	Calls       int    `json:"calls"`
+	TotalTokens int    `json:"total_tokens"`
+	ElapsedMs   int64  `json:"elapsed_ms"`
+}
+
+// TaskCost summarises all resource consumption for a task.
+// Written into episodic MemoryEntry so R2 can calibrate planning heuristics
+// (e.g. prefer simpler plans when prior attempts consumed many tokens/tool calls).
+type TaskCost struct {
+	ByRole        []RoleCost `json:"by_role"`
+	TotalTokens   int        `json:"total_tokens"`
+	LLMElapsedMs  int64      `json:"llm_elapsed_ms"`
+	ToolCallCount int        `json:"tool_call_count"`
+	ToolElapsedMs int64      `json:"tool_elapsed_ms"`
+}
+
 // MemoryEntry is written by R4b and read by R2
 type MemoryEntry struct {
-	EntryID     string   `json:"entry_id"`
-	TaskID      string   `json:"task_id"`
-	Type        string   `json:"type"` // "episodic"
-	Content     any      `json:"content"`
-	CriteriaMet []string `json:"criteria_met"`
-	Timestamp   string   `json:"timestamp"`
-	Tags        []string `json:"tags"`
+	EntryID     string    `json:"entry_id"`
+	TaskID      string    `json:"task_id"`
+	Type        string    `json:"type"` // "episodic" | "procedural"
+	Content     any       `json:"content"`
+	CriteriaMet []string  `json:"criteria_met"`
+	Timestamp   string    `json:"timestamp"`
+	Tags        []string  `json:"tags"`
+	Cost        *TaskCost `json:"cost,omitempty"` // nil for procedural entries
 }
 
 // MemoryQuery is sent by R2 to R5

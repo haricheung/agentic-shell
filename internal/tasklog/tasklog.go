@@ -46,11 +46,14 @@ type Event struct {
 	Timestamp string    `json:"ts"`
 
 	// task_begin / task_end
-	TaskID      string `json:"task_id,omitempty"`
-	Intent      string `json:"intent,omitempty"`
-	Status      string `json:"status,omitempty"` // "accepted" | "abandoned"
-	ElapsedMs   int64  `json:"elapsed_ms,omitempty"`
-	TotalTokens int    `json:"total_tokens,omitempty"`
+	TaskID        string     `json:"task_id,omitempty"`
+	Intent        string     `json:"intent,omitempty"`
+	Status        string     `json:"status,omitempty"` // "accepted" | "abandoned"
+	ElapsedMs     int64      `json:"elapsed_ms,omitempty"`
+	TotalTokens   int        `json:"total_tokens,omitempty"`
+	RoleStats     []RoleStat `json:"role_stats,omitempty"`     // task_end only
+	ToolCallCount int        `json:"tool_call_count,omitempty"` // task_end only
+	ToolElapsedMs int64      `json:"tool_elapsed_ms,omitempty"` // task_end only
 
 	// subtask_begin / subtask_end / tool_call / criterion_verdict / correction
 	SubtaskID string   `json:"subtask_id,omitempty"`
@@ -88,6 +91,19 @@ type Event struct {
 	ReplanRound int    `json:"replan_round,omitempty"`
 }
 
+// TaskStats aggregates all cost metrics for a completed task.
+// Includes per-role LLM usage and tool execution totals.
+//
+// Expectations:
+//   - Roles is sorted in canonical order (planner, executor, agentval, metaval)
+//   - ToolCallCount equals the total number of ToolCall invocations
+//   - ToolElapsedMs equals the sum of all elapsed times passed to ToolCall
+type TaskStats struct {
+	Roles         []RoleStat `json:"roles"`
+	ToolCallCount int        `json:"tool_call_count"`
+	ToolElapsedMs int64      `json:"tool_elapsed_ms"`
+}
+
 // RoleStat summarises LLM usage for one role across all calls in a task.
 type RoleStat struct {
 	Role             string `json:"role"`
@@ -122,6 +138,8 @@ type TaskLog struct {
 	promptTokens     int
 	completionTokens int
 	roleStats        map[string]*roleStat // role -> accumulator
+	toolCallCount    int                  // total tool calls made this task
+	toolElapsedMs    int64                // total tool wall-clock time ms
 }
 
 // Registry maps task IDs to open TaskLogs.
@@ -140,7 +158,7 @@ type Registry struct {
 	dir   string
 	mu    sync.Mutex
 	logs  map[string]*TaskLog
-	cache map[string][]RoleStat // taskID -> role stats snapshot saved on Close
+	cache map[string]*TaskStats // taskID -> full stats snapshot saved on Close
 }
 
 // NewRegistry creates a Registry that writes one JSONL file per task under dir.
@@ -148,7 +166,7 @@ func NewRegistry(dir string) *Registry {
 	return &Registry{
 		dir:   dir,
 		logs:  make(map[string]*TaskLog),
-		cache: make(map[string][]RoleStat),
+		cache: make(map[string]*TaskStats),
 	}
 }
 
@@ -206,7 +224,8 @@ func (r *Registry) Close(taskID, status string) {
 		r.mu.Unlock()
 		return
 	}
-	r.cache[taskID] = tl.RoleStats()
+	stats := tl.Stats() // snapshot before delete
+	r.cache[taskID] = stats
 	delete(r.logs, taskID)
 	r.mu.Unlock()
 
@@ -215,12 +234,23 @@ func (r *Registry) Close(taskID, status string) {
 	total := tl.promptTokens + tl.completionTokens
 	tl.mu.Unlock()
 
+	var roleStats []RoleStat
+	var toolCallCount int
+	var toolElapsedMs int64
+	if stats != nil {
+		roleStats = stats.Roles
+		toolCallCount = stats.ToolCallCount
+		toolElapsedMs = stats.ToolElapsedMs
+	}
 	tl.write(Event{
-		Kind:        KindTaskEnd,
-		TaskID:      taskID,
-		Status:      status,
-		ElapsedMs:   elapsed,
-		TotalTokens: total,
+		Kind:          KindTaskEnd,
+		TaskID:        taskID,
+		Status:        status,
+		ElapsedMs:     elapsed,
+		TotalTokens:   total,
+		RoleStats:     roleStats,
+		ToolCallCount: toolCallCount,
+		ToolElapsedMs: toolElapsedMs,
 	})
 
 	tl.mu.Lock()
@@ -291,10 +321,20 @@ func (tl *TaskLog) LLMCall(role, systemPrompt, userPrompt, response string, prom
 }
 
 // ToolCall writes a tool_call event. toolError is empty on success.
-func (tl *TaskLog) ToolCall(subtaskID, tool, toolInput, toolOutput, toolError string) {
+// elapsedMs is the wall-clock milliseconds the tool execution took; pass 0 if unknown.
+//
+// Expectations:
+//   - ToolCallCount increments by 1 per invocation
+//   - ToolElapsedMs accumulates the sum of all elapsedMs values
+//   - No-op on nil receiver
+func (tl *TaskLog) ToolCall(subtaskID, tool, toolInput, toolOutput, toolError string, elapsedMs int64) {
 	if tl == nil {
 		return
 	}
+	tl.mu.Lock()
+	tl.toolCallCount++
+	tl.toolElapsedMs += elapsedMs
+	tl.mu.Unlock()
 	tl.write(Event{
 		Kind:       KindToolCall,
 		SubtaskID:  subtaskID,
@@ -379,13 +419,34 @@ func (tl *TaskLog) RoleStats() []RoleStat {
 	return out
 }
 
-// GetStats returns and removes the cached RoleStat slice for taskID.
+// Stats returns a snapshot of all cost metrics (LLM + tool) for the live task.
+// Safe to call before Close() — metaval uses this to capture stats for memory entries.
+//
+// Expectations:
+//   - Returns nil on nil receiver
+//   - Includes accumulated role stats and tool call stats
+func (tl *TaskLog) Stats() *TaskStats {
+	if tl == nil {
+		return nil
+	}
+	tl.mu.Lock()
+	tc := tl.toolCallCount
+	te := tl.toolElapsedMs
+	tl.mu.Unlock()
+	return &TaskStats{
+		Roles:         tl.RoleStats(), // takes its own lock internally
+		ToolCallCount: tc,
+		ToolElapsedMs: te,
+	}
+}
+
+// GetStats returns and removes the cached TaskStats for taskID.
 // Returns nil if taskID is not in the cache (unknown or already consumed).
 //
 // Expectations:
 //   - Returns nil for unknown taskID
 //   - Deletes the cache entry on first call (subsequent calls return nil)
-func (r *Registry) GetStats(taskID string) []RoleStat {
+func (r *Registry) GetStats(taskID string) *TaskStats {
 	if r == nil {
 		return nil
 	}

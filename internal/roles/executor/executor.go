@@ -295,13 +295,15 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		}
 
 		tcInputJSON, _ := json.Marshal(tc)
+		toolStart := time.Now()
 		result, err := e.runTool(ctx, tc)
+		toolElapsedMs := time.Since(toolStart).Milliseconds()
 		if err != nil {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s ERROR: %v\n", tc.Tool, err))
 			log.Printf("[R3] tool[%d] → ERROR: %v", i+1, err)
 			// Append error evidence to tool_calls so R4a can verify
 			toolCallHistory[len(toolCallHistory)-1] += " → ERROR: " + firstN(err.Error(), 80)
-			tlog.ToolCall(st.SubTaskID, tc.Tool, string(tcInputJSON), "", err.Error())
+			tlog.ToolCall(st.SubTaskID, tc.Tool, string(tcInputJSON), "", err.Error(), toolElapsedMs)
 		} else {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, headTail(result, 4000)))
 			log.Printf("[R3] tool[%d] → %s", i+1, firstN(strings.TrimSpace(result), 500))
@@ -309,7 +311,7 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			// firstN: nearly all tool outputs (search titles, file paths, shell results)
 			// put the relevant content at the start. lastN was wrong for search results.
 			toolCallHistory[len(toolCallHistory)-1] += " → " + firstN(strings.TrimSpace(result), 200)
-			tlog.ToolCall(st.SubTaskID, tc.Tool, string(tcInputJSON), firstN(strings.TrimSpace(result), 500), "")
+			tlog.ToolCall(st.SubTaskID, tc.Tool, string(tcInputJSON), firstN(strings.TrimSpace(result), 500), "", toolElapsedMs)
 		}
 	}
 

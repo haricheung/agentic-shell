@@ -160,7 +160,7 @@ func TestTaskLog_NilReceiverNoops(t *testing.T) {
 	tl.SubtaskBegin("s1", "intent", 1, []string{"criterion"})
 	tl.SubtaskEnd("s1", "matched")
 	tl.LLMCall("executor", "sys", "user", "resp", 100, 50, 500, 1)
-	tl.ToolCall("s1", "shell", "ls", "file.go", "")
+	tl.ToolCall("s1", "shell", "ls", "file.go", "", 120)
 	tl.CriterionVerdict("s1", "output contains path", true, "evidence", 1)
 	tl.Correction("s1", "wrong", "try this", 1)
 	tl.Replan("gap summary", 1)
@@ -338,10 +338,63 @@ func TestGetStats_DeletesCacheEntryOnFirstCall(t *testing.T) {
 
 	first := r.GetStats("task1")
 	if first == nil {
-		t.Fatal("expected non-nil stats on first call")
+		t.Fatal("expected non-nil *TaskStats on first call")
 	}
 	second := r.GetStats("task1")
 	if second != nil {
 		t.Error("expected nil on second call (cache entry should be deleted)")
+	}
+}
+
+// ── Tool accumulation ─────────────────────────────────────────────────────────
+
+func TestToolStats_AccumulatesCallCount(t *testing.T) {
+	// ToolCallCount increments by 1 per ToolCall invocation
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.ToolCall("s1", "shell", "ls", "file.go", "", 100)
+	tl.ToolCall("s1", "mdfind", "q", "result", "", 200)
+	tl.ToolCall("s1", "glob", "*", "match", "", 50)
+	stats := tl.Stats()
+	r.Close("task1", "accepted")
+	if stats.ToolCallCount != 3 {
+		t.Errorf("ToolCallCount = %d, want 3", stats.ToolCallCount)
+	}
+}
+
+func TestToolStats_AccumulatesElapsedMs(t *testing.T) {
+	// ToolElapsedMs equals the sum of all elapsedMs values passed to ToolCall
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.ToolCall("s1", "shell", "ls", "file.go", "", 100)
+	tl.ToolCall("s1", "mdfind", "q", "result", "", 250)
+	stats := tl.Stats()
+	r.Close("task1", "accepted")
+	if stats.ToolElapsedMs != 350 {
+		t.Errorf("ToolElapsedMs = %d, want 350", stats.ToolElapsedMs)
+	}
+}
+
+func TestTaskEnd_IncludesToolStats(t *testing.T) {
+	// task_end event includes tool_call_count and tool_elapsed_ms from ToolCall invocations
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.ToolCall("s1", "shell", "ls", "file.go", "", 400)
+	tl.ToolCall("s1", "glob", "*.go", "x.go", "", 600)
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	last := events[len(events)-1]
+	if last.Kind != KindTaskEnd {
+		t.Fatalf("last event kind = %q, want task_end", last.Kind)
+	}
+	if last.ToolCallCount != 2 {
+		t.Errorf("tool_call_count = %d, want 2", last.ToolCallCount)
+	}
+	if last.ToolElapsedMs != 1000 {
+		t.Errorf("tool_elapsed_ms = %d, want 1000", last.ToolElapsedMs)
 	}
 }
