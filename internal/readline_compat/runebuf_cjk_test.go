@@ -60,3 +60,40 @@ func TestGetBackspaceSequence_SingleLine_NoSepEscape(t *testing.T) {
 		t.Errorf("single-line input should not contain line-up escape, got: %v", got)
 	}
 }
+
+// ── wideExtra (fullwidth punctuation width) ────────────────────────────────
+
+func TestWidth_FullwidthCommaIsDoubleWide(t *testing.T) {
+	// Returns 2 for fullwidth comma "，" (U+FF0C)
+	if got := runes.Width('，'); got != 2 {
+		t.Errorf("Width('，' U+FF0C) = %d, want 2", got)
+	}
+}
+
+func TestWidth_FullwidthColonIsDoubleWide(t *testing.T) {
+	// Returns 2 for fullwidth colon "：" (U+FF1A)
+	if got := runes.Width('：'); got != 2 {
+		t.Errorf("Width('：' U+FF1A) = %d, want 2", got)
+	}
+}
+
+func TestWidth_IdeographicPeriodIsDoubleWide(t *testing.T) {
+	// Returns 2 for CJK ideographic period "。" (U+3002)
+	if got := runes.Width('。'); got != 2 {
+		t.Errorf("Width('。' U+3002) = %d, want 2", got)
+	}
+}
+
+func TestWidth_IdeographicCommaIsDoubleWide(t *testing.T) {
+	// Returns 2 for CJK ideographic comma "、" (U+3001)
+	if got := runes.Width('、'); got != 2 {
+		t.Errorf("Width('、' U+3001) = %d, want 2", got)
+	}
+}
+
+func TestWidth_ASCIIIsNotDoubleWide(t *testing.T) {
+	// Returns 1 for ASCII 'a' (not double-wide)
+	if got := runes.Width('a'); got != 1 {
+		t.Errorf("Width('a') = %d, want 1", got)
+	}
+}

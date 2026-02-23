@@ -499,6 +499,36 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			break
 		}
 
+		// Multi-line mode: type `"""` on its own to open/close a multi-paragraph block.
+		// While accumulating, the prompt changes to `... ` to signal continuation.
+		// Ctrl+C cancels accumulation and returns to normal prompt.
+		if input == `"""` {
+			rl.SetPrompt("\033[2m...\033[0m ")
+			var lines []string
+			aborted := false
+			for {
+				mline, merr := rl.Readline()
+				if merr == readline.ErrInterrupt {
+					aborted = true
+					break
+				}
+				if merr != nil {
+					cancel()
+					return
+				}
+				if strings.TrimSpace(mline) == `"""` {
+					break
+				}
+				lines = append(lines, mline)
+			}
+			rl.SetPrompt("\033[36m>\033[0m ")
+			if aborted || len(lines) == 0 {
+				fmt.Println("\033[2m(multi-line input cancelled)\033[0m")
+				continue
+			}
+			input = strings.Join(lines, "\n")
+		}
+
 		// /audit — request an on-demand audit report directly from R6, bypassing the pipeline.
 		if input == "/audit" {
 			b.Publish(types.Message{

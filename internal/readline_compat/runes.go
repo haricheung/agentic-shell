@@ -136,11 +136,40 @@ var zeroWidth = []*unicode.RangeTable{
 	unicode.Cf,
 }
 
+// wideExtra covers wide East Asian character ranges not already included in
+// unicode.Han, unicode.Hangul, unicode.Hiragana, or unicode.Katakana.
+// Key additions for real-world Chinese text:
+//   - U+2E80-U+303E: CJK Radicals, Kangxi, CJK Symbols & Punctuation
+//     (covers 、。〈〉《》「」【】and other wide bracket/punct not in Han)
+//   - U+FF01-U+FF60: Fullwidth Latin Forms (，。：；！？（）【】etc.)
+//   - U+FFE0-U+FFE6: Fullwidth Signs (￠￡¥)
+//   - U+1100-U+115F: Hangul Jamo (wide leading consonants)
+//   - U+FE10-U+FE19: Vertical Forms
+//   - U+FE30-U+FE6B: CJK Compat Forms + Small Form Variants
+//
+// Expectations:
+//   - Returns 2 for fullwidth comma "，" (U+FF0C)
+//   - Returns 2 for fullwidth colon "：" (U+FF1A)
+//   - Returns 2 for CJK ideographic period "。" (U+3002)
+//   - Returns 2 for CJK ideographic comma "、" (U+3001)
+//   - Returns 1 for ASCII 'a' (not double-wide)
+var wideExtra = &unicode.RangeTable{
+	R16: []unicode.Range16{
+		{Lo: 0x1100, Hi: 0x115F, Stride: 1}, // Hangul Jamo
+		{Lo: 0x2E80, Hi: 0x303E, Stride: 1}, // CJK Radicals + CJK Symbols & Punct
+		{Lo: 0xFE10, Hi: 0xFE19, Stride: 1}, // Vertical Forms
+		{Lo: 0xFE30, Hi: 0xFE6B, Stride: 1}, // CJK Compat Forms + Small Form Variants
+		{Lo: 0xFF01, Hi: 0xFF60, Stride: 1}, // Fullwidth Forms
+		{Lo: 0xFFE0, Hi: 0xFFE6, Stride: 1}, // Fullwidth Signs
+	},
+}
+
 var doubleWidth = []*unicode.RangeTable{
 	unicode.Han,
 	unicode.Hangul,
 	unicode.Hiragana,
 	unicode.Katakana,
+	wideExtra,
 }
 
 func (Runes) Width(r rune) int {

@@ -5,6 +5,41 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #71 — REPL: CJK fullwidth punctuation causes line repetition; no multi-line input
+
+**Symptom**:
+1. Pasting Chinese text containing fullwidth punctuation (，。：！？【】 etc.) caused the
+   same line to be repeated many times in the readline display — stale previous renders
+   were not properly erased.
+2. Pasting a multi-paragraph block was impossible: each embedded newline submitted the
+   current buffer as a separate (incomplete) task, fragmenting the input.
+
+**Root cause**:
+1. `readline_compat/runes.go` `Width()` only counted characters in `unicode.Han`,
+   `unicode.Hangul`, `unicode.Hiragana`, `unicode.Katakana` as double-wide. Fullwidth
+   forms (U+FF01-U+FF60, e.g. ，。：) and other East Asian wide characters outside
+   those tables were counted as width 1. The resulting undercount of visual columns made
+   `idxLine` return too-small a value, so `cleanOutput` went up too few terminal lines on
+   each `Refresh`, leaving stale rendered text visible.
+2. No multi-line input path existed; readline submitted on every `\n`.
+
+**Fix**:
+- `internal/readline_compat/runes.go`: Added `wideExtra` `*unicode.RangeTable` covering
+  U+1100-U+115F (Hangul Jamo), U+2E80-U+303E (CJK Radicals + Symbols & Punct — includes
+  、。〈〉《》【】), U+FE10-U+FE19 (Vertical Forms), U+FE30-U+FE6B (CJK Compat Forms),
+  U+FF01-U+FF60 (Fullwidth Forms ，。：！？), U+FFE0-U+FFE6 (Fullwidth Signs). Added
+  `wideExtra` to `doubleWidth` slice so `Width()` returns 2 for all East Asian wide chars.
+- `cmd/agsh/main.go`: Multi-line input via `"""` sentinel — typing `"""` alone enters
+  accumulation mode (prompt changes to `... `); subsequent lines are collected; closing
+  `"""` joins them with `\n` and submits as a single task; Ctrl+C cancels accumulation.
+
+Files changed:
+- `internal/readline_compat/runes.go` (5 new expectations + `wideExtra` table)
+- `internal/readline_compat/runebuf_cjk_test.go` (+5 tests for fullwidth chars)
+- `cmd/agsh/main.go` (multi-line `"""` sentinel in `runREPL`)
+
+---
+
 ## Issue #70 — Agent-generated files land in project root, polluting VCS
 
 **Symptom**: Files created by the agent as task output (Python scripts, Markdown reports,
