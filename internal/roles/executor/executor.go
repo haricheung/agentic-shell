@@ -27,7 +27,7 @@ Tool selection — use the FIRST tool that fits; do not skip down the list:
    Input: {"action":"tool","tool":"glob","pattern":"*.json","root":"."}
    Pattern matches FILENAME ONLY — no "/" allowed. root:"." = project directory.
 3. read_file  — read a file. Input: {"action":"tool","tool":"read_file","path":"..."}
-4. write_file — write a file. Output files (scripts, reports, generated content) MUST use ~/agsh_workspace/ as the base. Example: {"action":"tool","tool":"write_file","path":"~/agsh_workspace/report.md","content":"..."}
+4. write_file — write a file. Output files (scripts, reports, generated content) MUST use ~/artoo_workspace/ as the base. Example: {"action":"tool","tool":"write_file","path":"~/artoo_workspace/report.md","content":"..."}
    Project source files may use their normal relative paths (e.g. "internal/foo/bar.go").
 5. applescript — control macOS/Apple apps (Mail, Calendar, Reminders, Messages, Music, Focus).
    Input: {"action":"tool","tool":"applescript","script":"tell application \"Reminders\" to ..."}

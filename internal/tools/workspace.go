@@ -7,14 +7,14 @@ import (
 )
 
 // WorkspaceDir returns the agent's designated output directory.
-// Reads $AGSH_WORKSPACE; defaults to ~/agsh_workspace.
+// Reads $ARTOO_WORKSPACE; defaults to ~/artoo_workspace.
 // All generated files (scripts, reports, data) must land here instead of CWD.
 func WorkspaceDir() string {
-	if env := os.Getenv("AGSH_WORKSPACE"); env != "" {
+	if env := os.Getenv("ARTOO_WORKSPACE"); env != "" {
 		return ExpandHome(env)
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "agsh_workspace")
+	return filepath.Join(home, "artoo_workspace")
 }
 
 // EnsureWorkspace creates the workspace directory if it does not exist.

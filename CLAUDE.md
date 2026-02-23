@@ -6,11 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 go build ./...                                      # build all packages
-go run ./cmd/agsh                                   # REPL mode
-go run ./cmd/agsh "list all go files"               # one-shot mode
+go run ./cmd/artoo                                  # REPL mode
+go run ./cmd/artoo "list all go files"              # one-shot mode
 ```
 
-Cache / log files written to `~/.cache/agsh/`:
+Data / log files written to `~/.artoo/` (override with `ARTOO_DATA_DIR`):
 
 | File | Contents |
 |---|---|
@@ -20,7 +20,7 @@ Cache / log files written to `~/.cache/agsh/`:
 | `debug.log` | Internal role debug logs (redirected from stderr at startup) |
 | `tasks/<task_id>.jsonl` | Per-task structured log: LLM calls (with full prompts), tool calls, criterion verdicts, corrections, replans |
 
-To watch debug output live: `tail -f ~/.cache/agsh/debug.log`
+To watch debug output live: `tail -f ~/.artoo/debug.log`
 
 ## Environment Configuration
 
@@ -60,7 +60,7 @@ Seven roles communicate exclusively via an observable message bus. No role calls
 
 ```
 User input
-  └─ R1 Perceiver       cmd/agsh/main.go → perceiver/
+  └─ R1 Perceiver       cmd/artoo/main.go → perceiver/
        └─ R2 Planner    planner/          (queries R5 before planning)
             └─ R3 Executor (N goroutines, one per subtask)
                  ↕ CorrectionSignal (fast loop)
@@ -74,7 +74,7 @@ R6 Auditor  auditor/   (bus tap + subscriber; JSONL log; periodic + on-demand re
 can register independent tap channels via `bus.NewTap()` (Auditor and UI each hold one). Publish
 is non-blocking — slow subscribers drop messages with a log warning.
 
-**Subtask dispatcher** (`cmd/agsh/main.go:runSubtaskDispatcher`): sequence-aware; subscribes to
+**Subtask dispatcher** (`cmd/artoo/main.go:runSubtaskDispatcher`): sequence-aware; subscribes to
 `MsgDispatchManifest` to learn expected subtask count, buffers incoming `SubTask` messages by
 `sequence` number, then dispatches in order:
 - Same sequence number → all subtasks in that group launch in parallel.
@@ -90,7 +90,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 
 | Path | Role | Notes |
 |---|---|---|
-| `cmd/agsh/main.go` | Entry point | REPL + one-shot; wires all roles; session history |
+| `cmd/artoo/main.go` | Entry point | REPL + one-shot; wires all roles; session history |
 | `internal/types/types.go` | Shared schemas | All message and data types |
 | `internal/bus/bus.go` | Message bus | Foundation; all roles depend on this |
 | `internal/llm/client.go` | LLM client | `Chat(ctx, system, user) (string, Usage, error)` — returns token usage; `StripFences()` helper |
@@ -112,7 +112,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `mdfind` | `query` | **Personal file search** — macOS Spotlight index, < 100 ms. Always use for user files (Downloads, Documents, Music, etc.) |
 | `glob` | `pattern`, `root` | **Project file search** — `root:"."` only; pattern matches filename, not full path; `**/` prefix stripped automatically |
 | `read_file` | `path` | Read a single file |
-| `write_file` | `path`, `content` | Write a file. Generated output (scripts, reports, data) goes to `~/agsh_workspace/` — bare filenames are redirected there automatically. Project source files use their normal relative paths. |
+| `write_file` | `path`, `content` | Write a file. Generated output (scripts, reports, data) goes to `~/artoo_workspace/` — bare filenames are redirected there automatically. Project source files use their normal relative paths. |
 | `applescript` | `script` | Control macOS apps (Mail, Calendar, Reminders, Messages, Music…); Calendar/Reminders sync to iPhone/iPad/Watch via iCloud |
 | `shortcuts` | `name`, `input` | Run a named Apple Shortcut (iCloud-synced; can trigger iPhone/Watch automations) |
 | `shell` | `command` | General bash; counting/aggregation (`wc -l`), not file discovery |
@@ -166,7 +166,7 @@ to `json.MarshalIndent`. Output is suppressed when it duplicates the summary.
 
 R6 is a fully active entity — it both observes and reports:
 
-- **Passive tap**: reads every bus message via `bus.NewTap()` to detect boundary violations, convergence failures, and thrashing. Writes one `AuditEvent` JSONL line per message to `~/.cache/agsh/audit.jsonl`.
+- **Passive tap**: reads every bus message via `bus.NewTap()` to detect boundary violations, convergence failures, and thrashing. Writes one `AuditEvent` JSONL line per message to `~/.artoo/audit.jsonl`.
 - **Active subscription**: subscribes to `MsgAuditQuery`. When a query arrives, calls `publishReport("on-demand")`.
 - **Periodic ticker**: fires every 5 minutes (configurable via `auditor.New(... interval)`). Calls `publishReport("periodic")`.
 - **Window stats**: each report window accumulates `tasksObserved`, `totalCorrections`, `gapTrends`, `boundaryViolations`, `driftAlerts`, `anomalies`. Stats reset after each report.

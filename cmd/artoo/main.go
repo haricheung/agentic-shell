@@ -38,11 +38,14 @@ func main() {
 	// Load env
 	_ = godotenv.Load(".env")
 
-	// Resolve cache dir
+	// Resolve data dir — ARTOO_DATA_DIR overrides the default ~/.artoo/
 	homeDir, _ := os.UserHomeDir()
-	cacheDir := filepath.Join(homeDir, ".cache", "agsh")
+	cacheDir := os.Getenv("ARTOO_DATA_DIR")
+	if cacheDir == "" {
+		cacheDir = filepath.Join(homeDir, ".artoo")
+	}
 
-	// Ensure cache directory exists before opening any files.
+	// Ensure data directory exists before opening any files.
 	_ = os.MkdirAll(cacheDir, 0755)
 
 	// Ensure the agent workspace exists so write_file never fails on a missing dir.
@@ -52,7 +55,7 @@ func main() {
 	}
 
 	// Redirect debug logs to file so they don't interfere with the terminal UI.
-	// Tail ~/.cache/agsh/debug.log to observe internal role activity.
+	// Tail ~/.artoo/debug.log (or $ARTOO_DATA_DIR/debug.log) to observe internal role activity.
 	if f, err := os.OpenFile(filepath.Join(cacheDir, "debug.log"),
 		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
 		log.SetOutput(f)
@@ -414,7 +417,7 @@ type sessionEntry struct {
 }
 
 func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string, logReg *tasklog.Registry) {
-	fmt.Println("\033[1m\033[36m⚡ agsh\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.cache/agsh/debug.log)\033[0m")
+	fmt.Println("\033[1m\033[36m⚡ artoo\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.artoo/debug.log)\033[0m")
 
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:            "\033[36m>\033[0m ",
