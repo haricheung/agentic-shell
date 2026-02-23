@@ -319,7 +319,7 @@ func roleLabel(r types.Role) string {
 //   - MsgSubTaskOutcome failed with trajectory: returns "failed | unmet: <first unmet criterion>"
 //   - MsgSubTaskOutcome matched or failed with no trajectory: returns status string only
 //   - MsgCorrectionSignal: returns "attempt N — what_was_wrong" clipped to 40 chars
-//   - MsgPlanDirective: returns "<arrow> <gradient> | <directive>  D=X P=X ∆L=±X Ω=X%" with all four metrics
+//   - MsgPlanDirective: returns "<arrow> <gradient> | <directive>  D=X P=X ∇L=±X Ω=X%" with all four metrics
 //   - Returns "" for unknown or unparseable message types
 func msgDetail(msg types.Message) string {
 	switch msg.Type {
@@ -390,7 +390,7 @@ func msgDetail(msg types.Message) string {
 			case "plateau":
 				arrowFmt = ansiYellow + "⊥"
 			}
-			return fmt.Sprintf("%s %s | %s  D=%.2f P=%.2f ∆L=%+.2f Ω=%.0f%%",
+			return fmt.Sprintf("%s %s | %s  D=%.2f P=%.2f ∇L=%+.2f Ω=%.0f%%",
 				arrowFmt, pd.Gradient, pd.Directive,
 				pd.Loss.D, pd.Loss.P, pd.GradL, pd.BudgetPressure*100)
 		}

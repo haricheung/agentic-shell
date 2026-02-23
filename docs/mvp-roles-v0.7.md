@@ -21,7 +21,7 @@ Dreamer deferred to v0.8.
 | R2 now receives PlanDirective (from GGS) instead of ReplanRequest (from R4b) | PlanDirective carries: loss breakdown, gradient signal, blocked_tools, directive type (refine / change_approach / break_symmetry / abandon), and rationale. R2 can now make a principled plan adjustment |
 | Dynamic MUST NOT injection: GGS appends blocked_tools to R2's MUST NOT set | Memory-sourced MUST NOTs are static (recorded from prior tasks). GGS-sourced MUST NOTs are dynamic (derived from the current task's failure trajectory). Both feed R2's plan validator |
 | v0.6 criteria ownership design implemented in code | R1 no longer outputs success_criteria (it was still doing so in code despite the v0.6 spec). R2 now outputs `{"task_criteria":[...],"subtasks":[...]}` wrapper. task_criteria are plain strings in `DispatchManifest`; R4b reads them from there. |
-| PlanDirective pipeline line shows D, P, ∇L, Ω; spinner shows rationale | All four GGS metrics are now visible in the terminal pipeline display. The gradient arrow (↑ ↓ ⊥ →) encodes direction; D, P, ∆L, Ω are shown numerically. While R2 replans, the spinner shows the human-readable rationale explaining why the directive was chosen. |
+| PlanDirective pipeline line shows D, P, ∇L, Ω; spinner shows rationale | All four GGS metrics are now visible in the terminal pipeline display. The gradient arrow (↑ ↓ ⊥ →) encodes direction; D, P, ∇L, Ω are shown numerically. While R2 replans, the spinner shows the human-readable rationale explaining why the directive was chosen. |
 | `<think>` blocks stripped from all LLM output before JSON parsing | Reasoning models (e.g. deepseek-r1) emit `<think>...</think>` blocks in raw completions. These caused `json.Unmarshal` to fail with `invalid character '<'`, which R4a classified as infrastructure errors and marked subtasks failed without retry. `StripThinkBlocks()` is now called as the first step of `StripFences()` for all roles. |
 
 ---
@@ -608,7 +608,6 @@ The Auditor's gap_trend data across sessions provides the signal for tuning.
 
 | # | Question | Blocks |
 |---|---|---|
-| Q1 | ~~How does GGS handle the first replan round when L_prev is undefined?~~ **Resolved**: set ∇L = 0 for the first round; if D > δ, this triggers `change_path` or `break_symmetry` depending on P. Implemented in code. | R7 ✓ |
 | Q2 | Should GGS persist L_prev across sessions (in R5) or only within a single task's lifetime? Cross-session persistence enables better gradient estimation for recurring task types | R7, R5 |
 | Q3 | How should `change_path` directive communicate the *new* path hint to R2 — as free text in rationale, or as a structured `suggested_alternatives` field? | R7, R2 |
 | Q4 | When multiple subtasks fail with different failure_classes, how does GGS pick the dominant class for the directive? Proposed: majority vote; tie → "mixed" class → `change_approach` | R7 |

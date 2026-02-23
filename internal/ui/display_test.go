@@ -106,7 +106,7 @@ func TestMsgDetail_PlanDirective_ContainsAllMetrics(t *testing.T) {
 		BudgetPressure: 0.28,
 	}
 	got := msgDetail(makeMsg(types.MsgPlanDirective, pd))
-	for _, want := range []string{"D=", "P=", "∆L=", "Ω="} {
+	for _, want := range []string{"D=", "P=", "∇L=", "Ω="} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected %q in PlanDirective detail, got %q", want, got)
 		}
