@@ -431,6 +431,32 @@ func msgDetail(msg types.Message) string {
 	return ""
 }
 
+// ClipQuestion shortens a raw user input for display in the Result header.
+// It uses only the first line of multi-line inputs, then truncates at the
+// first sentence-ending punctuation (after at least 15 runes to skip
+// abbreviations like "e.g."), falling back to a hard clip at 80 runes.
+//
+// Expectations:
+//   - Returns s unchanged when s is 80 runes or fewer and has no newline
+//   - Multi-line input: returns only the text before the first newline (then applies limit)
+//   - Truncates at first sentence-end punctuation (. ? ! 。 ？ ！) found after rune 15
+//   - Falls back to clip at 80 runes with "…" when no sentence end found within 80 runes
+func ClipQuestion(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	runes := []rune(s)
+	if len(runes) <= 80 {
+		return s
+	}
+	for i, r := range runes[:80] {
+		if i >= 15 && (r == '.' || r == '?' || r == '!' || r == '。' || r == '？' || r == '！') {
+			return string(runes[:i+1])
+		}
+	}
+	return string(runes[:80]) + "…"
+}
+
 // clip truncates s to at most n runes, appending "…" if trimmed.
 // Use clipCols when the string will appear on a terminal line that must not wrap.
 func clip(s string, n int) string {

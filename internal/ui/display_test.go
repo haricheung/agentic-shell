@@ -359,3 +359,45 @@ func TestDynamicStatus_CorrectionSignal_CJKFitsWithinOneLine(t *testing.T) {
 		t.Errorf("dynamicStatus CJK: status is %d visual cols, want ≤ 60 (got %q)", cols, got)
 	}
 }
+
+// ── ClipQuestion ─────────────────────────────────────────────────────────────
+
+func TestClipQuestion_ShortInputUnchanged(t *testing.T) {
+	// Returns s unchanged when s is 80 runes or fewer and has no newline
+	q := "what is the capital of France?"
+	if got := ClipQuestion(q); got != q {
+		t.Errorf("expected %q unchanged, got %q", q, got)
+	}
+}
+
+func TestClipQuestion_MultilineUsesFirstLine(t *testing.T) {
+	// Multi-line input: returns only the text before the first newline
+	q := "first line\nsecond line\nthird line"
+	if got := ClipQuestion(q); got != "first line" {
+		t.Errorf("expected %q, got %q", "first line", got)
+	}
+}
+
+func TestClipQuestion_TruncatesAtSentenceEnd(t *testing.T) {
+	// Truncates at first sentence-ending punctuation found after rune 15
+	// The sentence end must appear in a string longer than 80 runes.
+	short := "This is an introductory sentence."                       // 33 runes
+	padding := strings.Repeat(" And more words follow here.", 3)      // pushes total > 80
+	q := short + padding
+	got := ClipQuestion(q)
+	if got != short {
+		t.Errorf("expected truncation at first sentence end %q, got %q", short, got)
+	}
+}
+
+func TestClipQuestion_FallsBackToHardClipAt80Runes(t *testing.T) {
+	// Falls back to clip at 80 runes with "…" when no sentence end found within 80 runes
+	q := strings.Repeat("x", 100)
+	got := ClipQuestion(q)
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("expected trailing ellipsis, got %q", got)
+	}
+	if len([]rune(got)) != 81 { // 80 runes + "…"
+		t.Errorf("expected 81 runes (80 + ellipsis), got %d", len([]rune(got)))
+	}
+}

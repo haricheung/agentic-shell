@@ -401,7 +401,7 @@ func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input strin
 	case <-ctx.Done():
 		return ctx.Err()
 	case result := <-resultCh:
-		printResult(result)
+		printResult(result, input)
 		printCostStats(perceiverUsage, logReg.GetStats(result.TaskID))
 	}
 	return nil
@@ -607,7 +607,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 				// goroutine can reach rl.Readline() (which draws ❯) before the
 				// display goroutine calls endTask(), whose \r\033[K then erases it.
 				disp.WaitTaskClose(300 * time.Millisecond)
-				printResult(result)
+				printResult(result, input)
 				printCostStats(perceiverUsage, logReg.GetStats(result.TaskID))
 				history = append(history, sessionEntry{Input: input, Summary: result.Summary})
 				if len(history) > maxHistory {
@@ -652,13 +652,17 @@ func firstN(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func printResult(result types.FinalResult) {
+func printResult(result types.FinalResult, rawInput string) {
 	const (
 		bold  = "\033[1m"
 		green = "\033[32m"
+		dim   = "\033[2m"
 		reset = "\033[0m"
 	)
 	fmt.Printf("\n%s%s📋 Result%s\n", bold, green, reset)
+	if rawInput != "" {
+		fmt.Printf("%s  › %s%s\n", dim, ui.ClipQuestion(rawInput), reset)
+	}
 	fmt.Println(result.Summary)
 	if result.Output == nil {
 		return
