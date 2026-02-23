@@ -1,5 +1,7 @@
 # artoo — Agentic Shell
 
+*agentic-shell is art too*
+
 A multi-agent AI system that takes natural language goals and coordinates a hierarchy of LLM-based agents to achieve them — with structured feedback loops, gradient-directed replanning, and cross-task memory.
 
 ```
