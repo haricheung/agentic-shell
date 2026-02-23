@@ -85,6 +85,36 @@ func TestIsIrreversibleShell_ReturnsTrueForMkfs(t *testing.T) {
 	}
 }
 
+func TestIsIrreversibleShell_ReturnsTrueForFindDelete(t *testing.T) {
+	// Returns true for "find " commands containing " -delete"
+	ok, reason := isIrreversibleShell(`find /tmp -maxdepth 1 -type f -name "*.log" -delete`)
+	if !ok {
+		t.Error("expected true for find -delete command")
+	}
+	if reason == "" {
+		t.Error("expected non-empty reason")
+	}
+}
+
+func TestIsIrreversibleShell_ReturnsTrueForFindExecRm(t *testing.T) {
+	// Returns true for "find " commands containing "-exec rm"
+	ok, reason := isIrreversibleShell(`find /tmp -name "*.log" -exec rm {} \;`)
+	if !ok {
+		t.Error("expected true for find -exec rm command")
+	}
+	if reason == "" {
+		t.Error("expected non-empty reason")
+	}
+}
+
+func TestIsIrreversibleShell_ReturnsFalseForFindWithoutDelete(t *testing.T) {
+	// Returns false for plain find without -delete (read-only)
+	ok, _ := isIrreversibleShell(`find /tmp -type f -name "*.log"`)
+	if ok {
+		t.Error("expected false for find without -delete")
+	}
+}
+
 func TestIsIrreversibleShell_ReturnsFalseForReadOnlyCommands(t *testing.T) {
 	// Returns false for read-only commands
 	readOnly := []string{

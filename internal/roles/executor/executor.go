@@ -332,7 +332,9 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 //   - Returns true for "dd " with "of=" argument (device/file overwrite)
 //   - Returns true for "mkfs" commands
 //   - Returns true for "fdisk " commands
-//   - Returns false for read-only commands (ls, cat, grep, find, etc.)
+//   - Returns true for "find " commands containing " -delete" (deletes matching files)
+//   - Returns true for "find " commands containing "-exec rm" (rm via find)
+//   - Returns false for read-only commands (ls, cat, grep, find without -delete, etc.)
 func isIrreversibleShell(cmd string) (bool, string) {
 	check := strings.TrimSpace(cmd)
 	if strings.HasPrefix(check, "sudo ") {
@@ -354,6 +356,15 @@ func isIrreversibleShell(cmd string) (bool, string) {
 	}
 	if strings.HasPrefix(check, "dd ") && strings.Contains(check, "of=") {
 		return true, "dd with of= overwrites a device or file"
+	}
+	// find -delete and find -exec rm bypass the rm check — detect them explicitly.
+	if strings.HasPrefix(check, "find ") {
+		if strings.Contains(check, " -delete") {
+			return true, "find -delete removes matching files permanently"
+		}
+		if strings.Contains(check, "-exec rm") || strings.Contains(check, "-exec /bin/rm") {
+			return true, "find -exec rm removes matching files permanently"
+		}
 	}
 	return false, ""
 }

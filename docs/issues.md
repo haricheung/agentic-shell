@@ -5,6 +5,16 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
+## Issue #65 — Law 1 bypass: model uses `find -delete` after `rm` is blocked
+
+**Symptom**: Manual test of "delete all .log files in /tmp" showed that after `rm -v /tmp/*.log` was blocked by Law 1 (correct), the planner replanned and the model issued `find /tmp -maxdepth 1 ... -delete`, which bypassed the Law 1 gate and deleted files.
+
+**Root cause**: `isIrreversibleShell` only checked prefix patterns (`rm `, `rmdir`, etc.). `find ... -delete` and `find ... -exec rm` are equally destructive but start with `find `, which is otherwise read-only.
+
+**Fix**: Added two additional checks in `isIrreversibleShell` for `find` commands: (1) contains ` -delete` → blocked; (2) contains `-exec rm` or `-exec /bin/rm` → blocked. Added three tests: `ReturnsTrueForFindDelete`, `ReturnsTrueForFindExecRm`, `ReturnsFalseForFindWithoutDelete`.
+
+---
+
 ## Issue #64 — Laws 1, 2, 3 from ARCHITECTURE.md not implemented
 
 **Symptom**: Laws 1, 2, 3 from ARCHITECTURE.md marked "not yet implemented". Executor would execute destructive shell commands (rm -rf, mkfs, etc.) and overwrite existing files without any gate. GGS had no kill-switch for consecutive worsening replans. Procedural `MemoryEntry` had no `failure_class` field — future tasks could not filter memory by failure type.
