@@ -19,3 +19,9 @@
 .idea/
 .vscode/
 *.swp
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
