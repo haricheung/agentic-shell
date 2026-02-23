@@ -223,17 +223,19 @@ func (p *Planner) plan(ctx context.Context, spec types.TaskSpec, memory []types.
 }
 
 // replanWithDirective is called when R2 receives a PlanDirective from GGS (v0.7+).
-// It merges GGS blocked_tools into the MUST NOT constraint set and applies the directive.
+// It merges GGS blocked_tools and blocked_targets into the MUST NOT constraint set and applies the directive.
 func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, pd types.PlanDirective, memory []types.MemoryEntry) error {
 	tl := p.logReg.Get(spec.TaskID) // log already open from initial plan()
 
 	pdJSON, _ := json.MarshalIndent(pd, "", "  ")
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
 
-	// Merge memory-sourced constraints with GGS blocked_tools.
+	// Merge memory-sourced constraints with GGS blocked_tools and blocked_targets.
 	constraints := calibrate(memory, spec.Intent)
+
+	// blocked_tools: tool names to avoid (logical failure directives: break_symmetry, change_approach).
 	if len(pd.BlockedTools) > 0 {
-		ggsBlock := "MUST NOT (GGS blocked_tools — dynamic, for this task only):\n"
+		ggsBlock := "MUST NOT (GGS blocked_tools — tool names that are logically wrong for this task):\n"
 		for _, t := range pd.BlockedTools {
 			ggsBlock += "  - Do not use tool: " + t + "\n"
 		}
@@ -243,6 +245,21 @@ func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, 
 			constraints = ggsBlock + "\n" + constraints
 		}
 	}
+
+	// blocked_targets: specific failed inputs to avoid (environmental failure directives: change_path, refine).
+	// These accumulate across all replan rounds — the full history of tried-and-blocked targets.
+	if len(pd.BlockedTargets) > 0 {
+		targBlock := "MUST NOT (GGS blocked_targets — specific inputs already tried and blocked by environment):\n"
+		for _, t := range pd.BlockedTargets {
+			targBlock += "  - Do not use this specific query/command/path again: " + t + "\n"
+		}
+		if constraints == "" {
+			constraints = targBlock
+		} else {
+			constraints = targBlock + "\n" + constraints
+		}
+	}
+
 	if constraints == "" {
 		constraints = "(none)"
 	}

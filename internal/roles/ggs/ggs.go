@@ -39,9 +39,10 @@ type GGS struct {
 	b               *bus.Bus
 	outputFn        func(taskID, summary string, output any)
 	mu              sync.Mutex
-	lPrev           map[string]float64 // L_{t-1} per task_id
-	replans         map[string]int     // replan round counter per task_id
-	worseningCount  map[string]int     // consecutive "worsening" gradient count per task_id
+	lPrev           map[string]float64    // L_{t-1} per task_id
+	replans         map[string]int        // replan round counter per task_id
+	worseningCount  map[string]int        // consecutive "worsening" gradient count per task_id
+	triedTargets    map[string][]string   // accumulated failed tool inputs per task_id (for environmental directives)
 }
 
 // New creates a GGS.
@@ -52,6 +53,7 @@ func New(b *bus.Bus, outputFn func(taskID, summary string, output any)) *GGS {
 		lPrev:          make(map[string]float64),
 		replans:        make(map[string]int),
 		worseningCount: make(map[string]int),
+		triedTargets:   make(map[string][]string),
 	}
 }
 
@@ -143,6 +145,16 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 	}
 
 	blockedTools := deriveBlockedTools(rr.Outcomes, directive)
+
+	// Accumulate tried targets for environmental directives across all rounds.
+	newTargets := deriveBlockedTargets(rr.Outcomes, directive)
+	g.mu.Lock()
+	if len(newTargets) > 0 {
+		g.triedTargets[taskID] = appendDeduped(g.triedTargets[taskID], newTargets)
+	}
+	allBlockedTargets := g.triedTargets[taskID]
+	g.mu.Unlock()
+
 	failedCriterion := primaryFailedCriterion(rr.Outcomes)
 	failureClass := computeFailureClass(rr.Outcomes)
 	rationale := buildRationale(directive, gradient, D, P, Omega, gradL, rr.GapSummary)
@@ -180,6 +192,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		delete(g.lPrev, taskID)
 		delete(g.replans, taskID)
 		delete(g.worseningCount, taskID)
+		delete(g.triedTargets, taskID)
 		g.mu.Unlock()
 		return
 	}
@@ -195,6 +208,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		Gradient:        gradient,
 		Directive:       directive,
 		BlockedTools:    blockedTools,
+		BlockedTargets:  allBlockedTargets,
 		FailedCriterion: failedCriterion,
 		FailureClass:    failureClass,
 		BudgetPressure:  Omega,
@@ -256,6 +270,7 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 	delete(g.lPrev, taskID)
 	delete(g.replans, taskID)
 	delete(g.worseningCount, taskID)
+	delete(g.triedTargets, taskID)
 	g.mu.Unlock()
 
 	// GGS is the sole emitter of FinalResult — consistent path for both accept and abandon.
@@ -533,6 +548,73 @@ func deriveBlockedTools(outcomes []types.SubTaskOutcome, directive string) []str
 		}
 	}
 	return tools
+}
+
+// deriveBlockedTargets extracts specific failed tool inputs from environmental-failure
+// subtask tool calls. Only populated for change_path and refine directives.
+//
+// Tool call entries have the format: "tool: {json_input} → output_snippet".
+// For each failed outcome, the JSON input is parsed and the following fields are
+// extracted: "query" (search tool), "command" (shell tool), "path" (file tools).
+// This gives R2 the concrete inputs that failed so it can avoid them in the next plan.
+//
+// Expectations:
+//   - Returns nil for directives other than "change_path" and "refine"
+//   - Returns nil when no failed outcomes have ToolCalls
+//   - Extracts "query" field from search tool calls in failed outcomes
+//   - Extracts "command" field from shell tool calls in failed outcomes
+//   - Extracts "path" field from file tool calls in failed outcomes
+//   - Returns deduplicated list of extracted input values
+func deriveBlockedTargets(outcomes []types.SubTaskOutcome, directive string) []string {
+	if directive != "change_path" && directive != "refine" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var targets []string
+	for _, o := range outcomes {
+		if o.Status != "failed" {
+			continue
+		}
+		for _, tc := range o.ToolCalls {
+			// Format: "tool: {json_input} → output_snippet"
+			// Strip output snippet first.
+			input := tc
+			if idx := strings.Index(tc, " → "); idx > 0 {
+				input = tc[:idx]
+			}
+			// Strip tool name prefix ("tool: ").
+			if idx := strings.Index(input, ": "); idx > 0 {
+				rawInput := input[idx+2:]
+				// Parse the JSON input and extract known target fields.
+				var m map[string]string
+				if err := json.Unmarshal([]byte(rawInput), &m); err == nil {
+					for _, key := range []string{"query", "command", "path"} {
+						if val := strings.TrimSpace(m[key]); val != "" && !seen[val] {
+							seen[val] = true
+							targets = append(targets, val)
+						}
+					}
+				}
+			}
+		}
+	}
+	return targets
+}
+
+// appendDeduped appends newItems to existing, skipping any already present.
+func appendDeduped(existing, newItems []string) []string {
+	seen := make(map[string]bool, len(existing))
+	for _, v := range existing {
+		seen[v] = true
+	}
+	result := existing
+	for _, v := range newItems {
+		if !seen[v] {
+			seen[v] = true
+			result = append(result, v)
+		}
+	}
+	return result
 }
 
 // primaryFailedCriterion returns the first unmet criterion across all failed outcomes.

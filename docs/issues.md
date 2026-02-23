@@ -1830,3 +1830,49 @@ Files changed:
 - `internal/roles/metaval/metaval.go`
 - `cmd/agsh/main.go`
 - `internal/tasklog/tasklog_test.go`
+
+---
+
+## Issue #73 — GGS has no mechanism to pass failed targets to R2 for environmental failures
+
+**Symptom**
+When a task fails due to environmental blockage (e.g. reuters.com returning HTTP 451), GGS correctly
+identifies `failure_class = "environmental"` and emits `change_path`/`refine` directive. However,
+R2 receives no structured data about *which specific targets were already tried and blocked*. Each
+replan round's `PlanDirective` carried `blocked_tools: null` for environmental directives — the only
+signal was free text in `gap_summary`. R2 could re-select already-tried domains (e.g. reuters.com →
+bbc.com → back to reuters.com) with no code-enforced constraint against it. Additionally, failed
+targets were not accumulated across rounds: if round 1 blocked reuters.com and round 2 blocked
+bbc.com, round 3 had no memory of either.
+
+**Root cause**
+`deriveBlockedTools` in `ggs.go` returned nil for all directives except `break_symmetry` and
+`change_approach`. Environmental failure directives (`change_path`, `refine`) never populated any
+structured constraint. `PlanDirective` had no `blocked_targets` field. GGS had no per-task state
+for accumulating tried targets across rounds.
+
+**Fix**
+- `internal/types/types.go`: Added `BlockedTargets []string` to `PlanDirective` (alongside
+  `BlockedTools`). `BlockedTools` = tool names for logical failures; `BlockedTargets` = specific
+  failed inputs for environmental failures.
+- `internal/roles/ggs/ggs.go`: Added `deriveBlockedTargets()` — extracts `query`/`command`/`path`
+  fields from failed subtask `ToolCalls` JSON inputs for `change_path`/`refine` directives. Added
+  `appendDeduped()` helper. Added `triedTargets map[string][]string` to `GGS` struct; accumulates
+  across all replan rounds per task; cleaned up on accept and abandon paths. `BlockedTargets` in
+  each `PlanDirective` carries the full accumulated history.
+- `internal/roles/planner/planner.go`: `replanWithDirective` now injects `blocked_targets` into
+  the MUST NOT constraints block under a distinct heading
+  `"GGS blocked_targets — specific inputs already tried and blocked by environment"`.
+- `internal/roles/ggs/ggs_test.go`: Added 6 new tests: `NilForBreakSymmetryDirective`,
+  `NilForNonFailedOutcomes`, `ExtractsQueryFromSearchToolCall`, `ExtractsCommandFromShellToolCall`,
+  `DeduplicatesAcrossMultipleCalls`, `AppendDeduped_AddsNewItemsOnly`.
+- `docs/mvp-roles-v0.7.md`: Updated directive semantics, Dynamic MUST NOT Injection section,
+  `PlanDirective` schema, R2 Memory Calibration Protocol, Q3 resolution, Key Invariants.
+
+Files changed:
+- `internal/types/types.go`
+- `internal/roles/ggs/ggs.go`
+- `internal/roles/planner/planner.go`
+- `internal/roles/ggs/ggs_test.go`
+- `docs/mvp-roles-v0.7.md`
+- `docs/issues.md`

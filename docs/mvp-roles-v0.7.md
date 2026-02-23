@@ -30,6 +30,7 @@ Dreamer deferred to v0.8.
 | R4a prompt requests `failure_class` on failed criteria | System prompt instructs: "For each failed criterion, set failure_class to 'logical' or 'environmental'." This closes the gap between R4a's internal per-criterion analysis and GGS's structured signal. |
 | GGS abandon summary enumerates intents (`buildAbandonSummary`) | Abandon-path `FinalResult.Summary` now lists completed and failed subtask intents by name, instead of a single inline format string. R2 graceful-failure (LLM-backed) deferred to v0.8. |
 | R6 detects GGS thrashing: consecutive `break_symmetry` without D decreasing | Auditor tracks `breakSymCount` and `lastBreakSymD` per task. Fires `ggs_thrashing` anomaly after 2+ consecutive `break_symmetry` directives without D improving. Counter resets on any non-`break_symmetry` directive. Resolves Q2/Q3/Q4/Q6 (see resolved questions above). |
+| `blocked_targets` added to `PlanDirective` for environmental failures (issue #73) | `blocked_tools` (tool names) only populated for logical failures — exactly the wrong case for environmental blockages where the *tool* is correct but the *specific target* is inaccessible. Added `blocked_targets []string` carrying failed query strings, commands, and paths. GGS accumulates these across all replan rounds per task (unlike per-round `blocked_tools`), so R2 sees the full history of tried-and-failed targets. Resolves Q3 fully (structured data, not just free text). |
 
 ---
 
@@ -158,7 +159,12 @@ controller role — that belongs to GGS. R2 receives a `PlanDirective` and execu
 - Graceful failure on `abandon`: partial result + next-move suggestions (deferred to v0.8 implementation)
 
 **Memory Calibration Protocol**: Unchanged from v0.6. Runs before every plan and replan.
-MUST NOT set = memory-sourced constraints ∪ GGS-sourced `blocked_tools`.
+MUST NOT set = memory-sourced constraints ∪ GGS-sourced `blocked_tools` ∪ GGS-sourced `blocked_targets`.
+
+`blocked_tools` carries tool *names* (for logical failures: `break_symmetry`, `change_approach`).
+`blocked_targets` carries specific *inputs* — query strings, commands, paths — that already failed
+due to environmental blocking (for `change_path`, `refine`). Both are code-derived; both are
+mandatory for R2 to obey.
 
 **Contract**:
 
@@ -430,24 +436,28 @@ approach → P rises above 0.5 → logical origin → escalate.
 origin. The approach is correct or at worst mis-aimed. R2 keeps the same tool sequence and
 tightens parameters: narrower query, more precise path, different search terms.
 - `blocked_tools`: none (tools are working, just not perfectly)
+- `blocked_targets`: **accumulated** failed query strings / commands / paths from all rounds so far
 - Rationale shows: `"Loss decreasing (∇L=X) — on the right track"` or `"Environmental issue (P≤0.5) — adjust path"`
 
 **`change_path`** — Triggered by plateau with environmental origin (P ≤ 0.5). The approach is
-sound but something about the specific path is wrong (file moved, search returned nothing, API
+sound but something about the specific path is wrong (domain blocked, file moved, API
 returned empty). Same tool class, different target or parameters.
-- `blocked_tools`: none
+- `blocked_tools`: none (the tool class is correct — only the specific target is blocked)
+- `blocked_targets`: **accumulated** failed query strings / commands / paths from all rounds so far
 - Rationale shows: `"Plateau (|∇L|<ε, D>δ). Environmental origin (P=X). Same approach, different target/parameters."`
 
 **`break_symmetry`** — Triggered by plateau with logical origin (P > 0.5). The approach itself is
 fundamentally wrong — the same tools keep being called with the same logic and keep failing.
 Must escape the local minimum by switching to a completely different tool class.
 - `blocked_tools`: **all tools used in failing subtasks** (populated by GGS, enforced by R2's plan validator)
+- `blocked_targets`: none (the tool class is wrong — switching tools makes prior targets irrelevant)
 - Rationale shows: `"Local minimum (|∇L|<ε, D>δ, P=X). Block all tried tools; demand novel approach."`
 
 **`change_approach`** — Triggered by worsening gradient with logical origin (P > 0.5). Loss is
 actively increasing — not just stuck, but getting worse — and the failures are logical.
 Must escalate to an explicitly different tool class.
 - `blocked_tools`: tools from failing subtasks
+- `blocked_targets`: none (same reason as `break_symmetry`)
 - Rationale shows: `"Loss worsening (∇L=X) with logical failures (P>0.5). Use explicitly different tool class."`
 
 **`abandon`** — Triggered when Ω ≥ 0.8 regardless of gradient. Budget pressure overrides all
@@ -463,12 +473,28 @@ first failure signal without any prior loss baseline.
 
 ### Dynamic MUST NOT Injection
 
-When directive is `break_symmetry` or `change_approach`, GGS appends all tools used
-in the failing subtask(s) to `blocked_tools`. R2 adds these to its MUST NOT set for
-the next plan. The plan validator rejects any plan that uses a blocked tool.
+GGS injects two kinds of task-specific constraints into R2's MUST NOT set, one per
+failure origin:
 
-This extends the memory-sourced MUST NOT constraints (which are task-type-scoped and
-persistent) with session-scoped, task-specific MUST NOTs derived from the live gradient.
+**`blocked_tools`** (logical failures — `break_symmetry`, `change_approach`):
+When P > 0.5, the *algorithm* is wrong. GGS appends all tool *names* used in the
+failing subtask(s). R2 must not plan using those tool names in the next round.
+Granularity: tool class (e.g., `search`, `shell`).
+
+**`blocked_targets`** (environmental failures — `change_path`, `refine`):
+When P ≤ 0.5, the *target* is wrong but the tool is correct. GGS extracts the specific
+inputs that failed — query strings, commands, paths — from each failed subtask's
+`ToolCalls`. These accumulate across all replan rounds for the task (unlike `blocked_tools`,
+which is re-derived per round). R2 must not use those specific inputs again.
+Granularity: specific input value (e.g., query `"site:reuters.com trump china"`).
+
+The accumulation property of `blocked_targets` is deliberate: if round 1 blocked
+reuters.com and round 2 (after change_path) blocked bbc.com, round 3's directive carries
+both. R2 cannot re-pick already-tried domains even if they seem plausible.
+
+Both extend the memory-sourced MUST NOT constraints (task-type-scoped, persistent across
+sessions) with session-scoped, task-specific MUST NOTs derived from the live gradient.
+The combined MUST NOT set = memory MUST NOTs ∪ `blocked_tools` ∪ `blocked_targets`.
 
 **Skills**:
 - Receive `ReplanRequest` from R4b carrying full `SubTaskOutcome[]` data
@@ -502,7 +528,8 @@ PlanDirective {
   },
   "gradient":          "improving | stable | worsening | plateau",
   "directive":         "refine | change_path | change_approach | break_symmetry | abandon",
-  "blocked_tools":     ["string"],        // tools R2 must not use in next plan
+  "blocked_tools":     ["string"],        // tool names R2 must not use; populated for break_symmetry + change_approach (logical failures)
+  "blocked_targets":   ["string"],        // specific failed inputs (queries/commands/paths); populated for change_path + refine (environmental failures); accumulates across rounds
   "failed_criterion":  "string",          // primary criterion driving D
   "failure_class":     "logical | environmental | mixed",
   "budget_pressure":   "float",           // Ω for display (same as loss.Omega)
@@ -612,6 +639,8 @@ User
 | R2 plan cannot reuse an approach flagged in memory MUST NOT | R2 plan validator |
 | Memory calibration (Steps 1–3) involves no LLM call; bounded at 10 entries | R2 Go code |
 | GGS emits `abandon` when Ω ≥ 0.8 regardless of gradient signal | R7 decision table |
+| `blocked_targets` populated for environmental directives (`change_path`, `refine`) with accumulated failed tool inputs; `blocked_tools` populated for logical directives (`break_symmetry`, `change_approach`) with tool names; never cross-populated | R7 `deriveBlockedTargets` / `deriveBlockedTools` |
+| `blocked_targets` accumulates across all replan rounds for the same task — not re-derived per round | R7 `triedTargets` map, cleared on accept/abandon |
 | GGS is the sole emitter of `FinalResult` on all paths (accept and abandon); R4b never emits it directly | R7 code; R4b sends OutcomeSummary/ReplanRequest |
 | `FinalResult.Loss.D == 0.0` iff accept path; `> 0.0` iff abandon path | R7 `processAccept` sets D=0; `process()` abandon uses `computeD(outcomes) > 0` |
 
@@ -641,7 +670,7 @@ The Auditor's gap_trend data across sessions provides the signal for tuning.
 | # | Question | Blocks |
 |---|---|---|
 | Q2 | ~~Should GGS persist L_prev across sessions (in R5) or only within a single task's lifetime?~~ **RESOLVED**: L_prev lives only within a single task's lifetime. Cross-session persistence deferred to v0.8 — requires associating gradient history with recurring task types, which needs intent hashing not yet designed. | — |
-| Q3 | ~~How should `change_path` directive communicate the *new* path hint to R2?~~ **RESOLVED**: Free text in `rationale` field only. A structured `suggested_alternatives` field would require GGS to enumerate paths — outside GGS's scope (gradient math, not path synthesis). R2 reads `rationale` when formulating the next plan. | — |
+| Q3 | ~~How should `change_path` directive communicate the *new* path hint to R2?~~ **RESOLVED**: `blocked_targets` carries the specific failed inputs (query strings, commands, paths) as structured data for `change_path` and `refine` directives. GGS accumulates these across all replan rounds so R2 sees the full history of tried-and-failed targets. `rationale` provides the human-readable context. GGS does not enumerate alternatives — that remains R2's synthesis domain. | — |
 | Q4 | ~~When multiple subtasks fail with different failure_classes, how does GGS pick the dominant class?~~ **RESOLVED**: `computeP` counts logical and environmental `CriteriaVerdicts.FailureClass` across all failed outcomes. P = logical / (logical + environmental). Majority by count; no tie-breaking needed — P=0.5 (tie) maps to `change_path` or neutral directive naturally. `computeFailureClass` derived from P: P>0.5 → "logical", P<0.5 → "environmental", P=0.5 → "mixed". | — |
 | Q5 | ~~Should the `abandon` directive from GGS be distinguishable from the `maxReplans` abandon in R4b?~~ **RESOLVED**: GGS is the sole emitter of `FinalResult` on all paths. R4b sends `ReplanRequest` (with `recommendation: abandon`) to R7; GGS decides based on Ω. Consistent abandonment path achieved. | — |
 | Q6 | ~~How does R2's plan validator check `blocked_tools`?~~ **RESOLVED**: Exact string match on tool name prefix. R3's `ToolCalls` entries carry `"toolname: ..."` format; `deriveBlockedTools` strips at the first `:` to get the bare tool name. R2's prompt instructs it to exclude listed tool names from its plan — no keyword matching needed. | — |

@@ -158,7 +158,8 @@ type PlanDirective struct {
 	Loss            LossBreakdown `json:"loss"`
 	Gradient        string        `json:"gradient"`          // "improving" | "stable" | "worsening" | "plateau"
 	Directive       string        `json:"directive"`         // "refine" | "change_path" | "change_approach" | "break_symmetry" | "abandon"
-	BlockedTools    []string      `json:"blocked_tools"`     // tools R2 must not use in next plan
+	BlockedTools    []string      `json:"blocked_tools"`     // tool names R2 must not use; populated for break_symmetry + change_approach (logical)
+	BlockedTargets  []string      `json:"blocked_targets"`   // specific failed inputs (queries/commands/paths); populated for change_path + refine (environmental); accumulates across rounds
 	FailedCriterion string        `json:"failed_criterion"`  // primary criterion driving D
 	FailureClass    string        `json:"failure_class"`     // "logical" | "environmental" | "mixed"
 	BudgetPressure  float64       `json:"budget_pressure"`   // Ω value for display

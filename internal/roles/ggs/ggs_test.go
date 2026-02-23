@@ -397,6 +397,82 @@ func TestDeriveBlockedTools_ExtractsToolNamesForBreakSymmetry(t *testing.T) {
 	}
 }
 
+// ── deriveBlockedTargets ─────────────────────────────────────────────────────
+
+func TestDeriveBlockedTargets_NilForBreakSymmetryDirective(t *testing.T) {
+	// Returns nil for directives other than "change_path" and "refine"
+	outcomes := []types.SubTaskOutcome{
+		{Status: "failed", ToolCalls: []string{`search: {"query":"reuters trump"} → results`}},
+	}
+	got := deriveBlockedTargets(outcomes, "break_symmetry")
+	if got != nil {
+		t.Errorf("expected nil for break_symmetry, got %v", got)
+	}
+}
+
+func TestDeriveBlockedTargets_NilForNonFailedOutcomes(t *testing.T) {
+	// Returns nil when no outcomes are failed
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched", ToolCalls: []string{`search: {"query":"reuters trump"} → results`}},
+	}
+	got := deriveBlockedTargets(outcomes, "change_path")
+	if got != nil {
+		t.Errorf("expected nil when outcome is matched, got %v", got)
+	}
+}
+
+func TestDeriveBlockedTargets_ExtractsQueryFromSearchToolCall(t *testing.T) {
+	// Extracts "query" field from search tool calls in failed outcomes
+	outcomes := []types.SubTaskOutcome{
+		{Status: "failed", ToolCalls: []string{`search: {"query":"trump china visit reuters.com"} → 451 error`}},
+	}
+	got := deriveBlockedTargets(outcomes, "change_path")
+	if len(got) != 1 || got[0] != "trump china visit reuters.com" {
+		t.Errorf("expected [trump china visit reuters.com], got %v", got)
+	}
+}
+
+func TestDeriveBlockedTargets_ExtractsCommandFromShellToolCall(t *testing.T) {
+	// Extracts "command" field from shell tool calls in failed outcomes
+	outcomes := []types.SubTaskOutcome{
+		{Status: "failed", ToolCalls: []string{`shell: {"command":"curl https://api.reuters.com/data"} → connection refused`}},
+	}
+	got := deriveBlockedTargets(outcomes, "refine")
+	if len(got) != 1 || got[0] != "curl https://api.reuters.com/data" {
+		t.Errorf("expected [curl https://api.reuters.com/data], got %v", got)
+	}
+}
+
+func TestDeriveBlockedTargets_DeduplicatesAcrossMultipleCalls(t *testing.T) {
+	// Returns deduplicated list when the same query appears in multiple failed tool calls
+	outcomes := []types.SubTaskOutcome{
+		{Status: "failed", ToolCalls: []string{
+			`search: {"query":"trump china reuters"} → 451`,
+			`search: {"query":"trump china reuters"} → 451`,
+			`search: {"query":"trump china bbc"} → blocked`,
+		}},
+	}
+	got := deriveBlockedTargets(outcomes, "change_path")
+	if len(got) != 2 {
+		t.Errorf("expected 2 unique targets, got %d: %v", len(got), got)
+	}
+}
+
+// ── appendDeduped ─────────────────────────────────────────────────────────────
+
+func TestAppendDeduped_AddsNewItemsOnly(t *testing.T) {
+	// appendDeduped only adds items not already in existing
+	existing := []string{"reuters.com", "bbc.com"}
+	newItems := []string{"bbc.com", "cnn.com"}
+	got := appendDeduped(existing, newItems)
+	if len(got) != 3 {
+		t.Errorf("expected 3 items (reuters.com, bbc.com, cnn.com), got %d: %v", len(got), got)
+	}
+	if got[2] != "cnn.com" {
+		t.Errorf("expected last item to be cnn.com, got %s", got[2])
+	}
+}
+
 // ── primaryFailedCriterion ───────────────────────────────────────────────────
 
 func TestPrimaryFailedCriterion_EmptyWhenNoFailures(t *testing.T) {
