@@ -1899,3 +1899,33 @@ Updated the corresponding expectation comment and test assertion.
 Files changed:
 - `internal/roles/planner/planner.go`
 - `internal/roles/planner/planner_test.go`
+
+---
+
+## Issue #75 — Result section shows no context about what was asked
+
+**Symptom**
+The `📋 Result` section displayed the answer with no reminder of the original question.
+In REPL sessions with multiple tasks, it was easy to lose track of which answer
+corresponded to which input, especially after a long pipeline run.
+
+**Root cause**
+`printResult()` in `cmd/agsh/main.go` printed only the result header and output.
+The original user input was available at both call sites but never passed or displayed.
+
+**Fix**
+Added a dim `  › <question>` line immediately below `📋 Result`:
+- `ClipQuestion(s string) string` added to `internal/ui/display.go`: takes only the
+  first line of multi-line input, truncates at the first sentence-ending punctuation
+  (`.?!。？！`) found after rune 15 (to skip abbreviations like "e.g."), falls back
+  to a hard clip at 80 runes with "…".
+- `printResult()` signature changed to `printResult(result types.FinalResult, rawInput string)`;
+  both call sites in `runTask()` and `runREPL()` updated to pass `input`.
+- 4 new tests in `internal/ui/display_test.go`:
+  `ShortInputUnchanged`, `MultilineUsesFirstLine`, `TruncatesAtSentenceEnd`,
+  `FallsBackToHardClipAt80Runes`.
+
+Files changed:
+- `internal/ui/display.go`
+- `internal/ui/display_test.go`
+- `cmd/agsh/main.go`
