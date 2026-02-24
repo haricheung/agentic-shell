@@ -62,7 +62,7 @@ R6 Auditor  — read-only bus tap; reports anomalies to operator
 | `shell` | General bash — counting, aggregation, ffmpeg, etc. |
 | `applescript` | Control macOS apps (Mail, Calendar, Reminders, Music…) |
 | `shortcuts` | Run a named Apple Shortcut |
-| `search` | Web search via LangSearch API (opt-in; requires `LANGSEARCH_API_KEY`) |
+| `search` | Web search via DuckDuckGo (always available, no API key required) |
 
 ---
 
@@ -106,12 +106,6 @@ BRAIN_MODEL="deepseek-reasoner"
 
 # Execution tier: R3 Executor, R4a AgentValidator
 TOOL_MODEL="..."
-```
-
-**Optional: web search**
-
-```bash
-LANGSEARCH_API_KEY="..."   # https://langsearch.com — when unset, search tool is absent
 ```
 
 **Optional: custom data directory**

@@ -29,7 +29,7 @@ Copy one of the pre-configured env files to `.env` before running:
 - `.env` — Volcengine/Ark endpoint (`ark.cn-beijing.volces.com`)
 - `.env.ds` — DeepSeek API (`api.deepseek.com`)
 
-`LANGSEARCH_API_KEY` enables the `search` tool (LangSearch web search API). When unset the tool is absent from R3's prompt entirely. Optional `LANGSEARCH_BASE_URL` overrides the endpoint (default: `https://api.langsearch.com/v1/web-search`).
+The `search` tool uses DuckDuckGo web search (no API key required) and is always available.
 
 All use the OpenAI-compatible convention: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` as shared fallbacks.
 
@@ -52,7 +52,7 @@ OPENAI_MODEL="..."
 
 Leave both tier sections unset to use a single model for all roles.
 
-The `search` tool uses LangSearch web search API (requires `LANGSEARCH_API_KEY`; tool is absent from R3's prompt when key is unset).
+The `search` tool uses DuckDuckGo web search (no API key required; always available).
 
 ## Architecture
 
@@ -116,7 +116,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `applescript` | `script` | Control macOS apps (Mail, Calendar, Reminders, Messages, Music…); Calendar/Reminders sync to iPhone/iPad/Watch via iCloud |
 | `shortcuts` | `name`, `input` | Run a named Apple Shortcut (iCloud-synced; can trigger iPhone/Watch automations) |
 | `shell` | `command` | General bash; counting/aggregation (`wc -l`), not file discovery |
-| `search` | `query` | LangSearch web search API (opt-in: requires `LANGSEARCH_API_KEY`; absent from prompt when unset) |
+| `search` | `query` | DuckDuckGo web search (always available, no API key required) |
 
 **File search hierarchy**: `mdfind` for anything outside the project (user personal files) → `glob` for project files → `shell` only for operations neither handles.
 

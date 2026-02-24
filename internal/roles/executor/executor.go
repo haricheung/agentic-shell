@@ -39,9 +39,9 @@ Tool selection — use the FIRST tool that fits; do not skip down the list:
    NEVER use "find" to locate personal files — use mdfind (tool #1) instead.
    Never include ~/Music/Music or ~/Library in shell paths.`
 
-const systemPromptSearch = `8. search — web search. Input: {"action":"tool","tool":"search","query":"..."}`
-
 const systemPromptTail = `
+8. search — web search (DuckDuckGo). Input: {"action":"tool","tool":"search","query":"..."}
+
 Execution rules:
 - Read intent, success_criteria, and context before acting. Context may contain prior-step outputs — use them directly.
 - One tool call per turn; wait for the result before the next.
@@ -55,12 +55,7 @@ Output format:
 Tool call:    {"action":"tool","tool":"<name>","<param>":"<value>",...}
 Final result: {"action":"result","subtask_id":"...","status":"completed|uncertain|failed","output":"<result text>","uncertainty":null,"tool_calls":["<tool: input → output summary>",...]}`
 
-// buildSystemPrompt returns the executor system prompt. Item #8 (search) is
-// included only when LANGSEARCH_API_KEY is set in the environment.
 func buildSystemPrompt() string {
-	if tools.SearchAvailable() {
-		return systemPromptBase + "\n" + systemPromptSearch + "\n" + systemPromptTail
-	}
 	return systemPromptBase + "\n" + systemPromptTail
 }
 

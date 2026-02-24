@@ -117,6 +117,33 @@ type chatResponse struct {
 	} `json:"error,omitempty"`
 }
 
+// Validate checks that the client has the minimum required configuration
+// (base URL, API key, model). Returns a non-nil error describing what is missing.
+//
+// Expectations:
+//   - Returns nil when all three fields (baseURL, apiKey, model) are non-empty
+//   - Returns error listing "base URL" when baseURL is empty
+//   - Returns error listing "API key" when apiKey is empty
+//   - Returns error listing "model" when model is empty
+//   - Returns error listing all missing fields comma-separated when multiple are empty
+//   - Error message includes the tier label
+func (c *Client) Validate() error {
+	var missing []string
+	if c.baseURL == "" {
+		missing = append(missing, "base URL")
+	}
+	if c.apiKey == "" {
+		missing = append(missing, "API key")
+	}
+	if c.model == "" {
+		missing = append(missing, "model")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s tier: missing %s", c.label, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // Chat sends a system + user prompt and returns the assistant's text response and token usage.
 func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, error) {
 	log.Printf("[%s] ── SYSTEM PROMPT ──────────────────────────────\n%s\n── END SYSTEM ──────────────────────────────────", c.label, system)

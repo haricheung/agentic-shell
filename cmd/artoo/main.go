@@ -70,6 +70,15 @@ func main() {
 	brainClient := llm.NewTier("BRAIN") // R2 Planner only — needs reasoning/thinking
 	toolClient := llm.NewTier("TOOL")   // R1 Perceiver, R3 Executor, R4a AgentVal, R4b MetaVal
 
+	if err := toolClient.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "\033[31merror: %v\033[0m\n", err)
+		fmt.Fprintf(os.Stderr, "\033[2mCopy .env.example to .env and fill in your API credentials.\033[0m\n")
+		os.Exit(1)
+	}
+	if err := brainClient.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "\033[33mwarning: %v (will fall back to TOOL tier)\033[0m\n", err)
+	}
+
 	// Infrastructure roles
 	mem := memory.New(b, filepath.Join(cacheDir, "memory.json"))
 	aud := auditor.New(b, b.NewTap(),

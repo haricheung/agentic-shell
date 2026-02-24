@@ -144,3 +144,77 @@ func TestStripThinkBlocks_NoTagReturnedUnchanged(t *testing.T) {
 		t.Errorf("expected unchanged, got %q", got)
 	}
 }
+
+// ── Validate ─────────────────────────────────────────────────────────────────
+
+func TestValidate_NilWhenAllFieldsPresent(t *testing.T) {
+	// Returns nil when all three fields (baseURL, apiKey, model) are non-empty
+	c := &Client{baseURL: "https://api.example.com", apiKey: "sk-key", model: "gpt-4o", label: "TEST"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+}
+
+func TestValidate_ErrorListsBaseURL(t *testing.T) {
+	// Returns error listing "base URL" when baseURL is empty
+	c := &Client{baseURL: "", apiKey: "sk-key", model: "gpt-4o", label: "TEST"}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "base URL") {
+		t.Errorf("expected 'base URL' in error, got %q", err.Error())
+	}
+}
+
+func TestValidate_ErrorListsAPIKey(t *testing.T) {
+	// Returns error listing "API key" when apiKey is empty
+	c := &Client{baseURL: "https://api.example.com", apiKey: "", model: "gpt-4o", label: "TEST"}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "API key") {
+		t.Errorf("expected 'API key' in error, got %q", err.Error())
+	}
+}
+
+func TestValidate_ErrorListsModel(t *testing.T) {
+	// Returns error listing "model" when model is empty
+	c := &Client{baseURL: "https://api.example.com", apiKey: "sk-key", model: "", label: "TEST"}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "model") {
+		t.Errorf("expected 'model' in error, got %q", err.Error())
+	}
+}
+
+func TestValidate_ErrorListsAllMissingFieldsCommaSeparated(t *testing.T) {
+	// Returns error listing all missing fields comma-separated when multiple are empty
+	c := &Client{baseURL: "", apiKey: "", model: "", label: "TEST"}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "base URL") || !strings.Contains(msg, "API key") || !strings.Contains(msg, "model") {
+		t.Errorf("expected all three fields listed, got %q", msg)
+	}
+	if !strings.Contains(msg, ", ") {
+		t.Errorf("expected comma-separated list, got %q", msg)
+	}
+}
+
+func TestValidate_ErrorIncludesTierLabel(t *testing.T) {
+	// Error message includes the tier label
+	c := &Client{baseURL: "", apiKey: "sk-key", model: "gpt-4o", label: "BRAIN"}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "BRAIN") {
+		t.Errorf("expected tier label 'BRAIN' in error, got %q", err.Error())
+	}
+}

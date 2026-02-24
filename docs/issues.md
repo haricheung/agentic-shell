@@ -1902,6 +1902,62 @@ Files changed:
 
 ---
 
+## Issue #77 — Search tool requires LANGSEARCH_API_KEY; unusable without paid API
+
+**Symptom**
+The `search` tool was backed by the LangSearch web search API, gated behind
+`LANGSEARCH_API_KEY`. Without the key the tool was completely absent from R3's
+prompt, making web search impossible for users who didn't have a LangSearch account.
+
+**Root cause**
+`SearchAvailable()` returned `false` when `LANGSEARCH_API_KEY` was unset.
+`buildSystemPrompt()` conditionally excluded item #8 (search) from the executor system prompt.
+
+**Fix**
+Replaced the LangSearch backend with DuckDuckGo HTML scraping (no API key required):
+- `websearch.go`: rewrote `Search()` to POST to `https://html.duckduckgo.com/html/`,
+  parse organic results via regex, filter ads (href containing `duckduckgo.com/y.js`),
+  strip inline HTML tags, and unescape HTML entities.
+- `SearchAvailable()` now always returns `true`.
+- `buildSystemPrompt()` unconditionally includes the search tool (item #8).
+- Added `parseDDGResults()`, `stripHTMLTags()` with full Expectations blocks and 1:1 tests.
+- Removed all `LANGSEARCH_API_KEY` / `LANGSEARCH_BASE_URL` references from `.env.example`,
+  `CLAUDE.md`, and `README.md`.
+
+Files changed:
+- `internal/tools/websearch.go`
+- `internal/tools/websearch_test.go`
+- `internal/roles/executor/executor.go`
+- `.env.example`
+- `CLAUDE.md`
+- `README.md`
+
+## Issue #76 — No warning when .env is missing or API credentials are unset
+
+**Symptom**
+Running `artoo` without a `.env` file (or with empty `OPENAI_*` vars) silently started
+the REPL. The first task then failed with a cryptic HTTP connection error
+(`dial tcp [::1]:...: connect: connection refused`) that gave no hint about the
+missing configuration.
+
+**Root cause**
+`llm.NewTier()` created a `Client` with empty `baseURL` / `apiKey` / `model` without
+any validation. `main()` did not check whether the clients were usable before starting
+the bus, roles, and REPL.
+
+**Fix**
+- Added `Validate()` to `llm.Client` with 6 Expectations and 6 matching tests.
+  Returns a descriptive error listing which fields (base URL, API key, model) are missing,
+  including the tier label.
+- `main()` calls `toolClient.Validate()` immediately after creating the LLM clients.
+  If validation fails, prints a red error with guidance to copy `.env.example` and exits.
+  `brainClient.Validate()` failure prints a yellow warning (BRAIN falls back to OPENAI_*).
+
+Files changed:
+- `internal/llm/client.go`
+- `internal/llm/client_test.go`
+- `cmd/artoo/main.go`
+
 ## Issue #75 — Result section shows no context about what was asked
 
 **Symptom**
