@@ -6,6 +6,8 @@
 **Scope**: Eight roles. Goal Gradient Solver (GGS) promoted from deferred to implemented.
 Dreamer deferred to v0.8.
 
+[toc]
+
 ---
 
 ## Changelog from v0.6
