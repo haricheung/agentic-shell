@@ -5,508 +5,6 @@ Bugs discovered and fixed during the first end-to-end test session (2026-02-19).
 
 ---
 
-## Issue #71 — REPL: CJK fullwidth punctuation causes line repetition; no multi-line input
-
-**Symptom**:
-1. Pasting Chinese text containing fullwidth punctuation (，。：！？【】 etc.) caused the
-   same line to be repeated many times in the readline display — stale previous renders
-   were not properly erased.
-2. Pasting a multi-paragraph block was impossible: each embedded newline submitted the
-   current buffer as a separate (incomplete) task, fragmenting the input.
-
-**Root cause**:
-1. `readline_compat/runes.go` `Width()` only counted characters in `unicode.Han`,
-   `unicode.Hangul`, `unicode.Hiragana`, `unicode.Katakana` as double-wide. Fullwidth
-   forms (U+FF01-U+FF60, e.g. ，。：) and other East Asian wide characters outside
-   those tables were counted as width 1. The resulting undercount of visual columns made
-   `idxLine` return too-small a value, so `cleanOutput` went up too few terminal lines on
-   each `Refresh`, leaving stale rendered text visible.
-2. No multi-line input path existed; readline submitted on every `\n`.
-
-**Fix**:
-- `internal/readline_compat/runes.go`: Added `wideExtra` `*unicode.RangeTable` covering
-  U+1100-U+115F (Hangul Jamo), U+2E80-U+303E (CJK Radicals + Symbols & Punct — includes
-  、。〈〉《》【】), U+FE10-U+FE19 (Vertical Forms), U+FE30-U+FE6B (CJK Compat Forms),
-  U+FF01-U+FF60 (Fullwidth Forms ，。：！？), U+FFE0-U+FFE6 (Fullwidth Signs). Added
-  `wideExtra` to `doubleWidth` slice so `Width()` returns 2 for all East Asian wide chars.
-- `cmd/agsh/main.go`: Multi-line input via `"""` sentinel — typing `"""` alone enters
-  accumulation mode (prompt changes to `... `); subsequent lines are collected; closing
-  `"""` joins them with `\n` and submits as a single task; Ctrl+C cancels accumulation.
-
-Files changed:
-- `internal/readline_compat/runes.go` (5 new expectations + `wideExtra` table)
-- `internal/readline_compat/runebuf_cjk_test.go` (+5 tests for fullwidth chars)
-- `cmd/agsh/main.go` (multi-line `"""` sentinel in `runREPL`)
-
----
-
-## Issue #70 — Agent-generated files land in project root, polluting VCS
-
-**Symptom**: Files created by the agent as task output (Python scripts, Markdown reports,
-generated data) were written relative to CWD (the project root), appearing as untracked
-VCS noise and requiring manual cleanup.
-
-**Root cause**: `write_file` resolved relative paths against the process working directory.
-No designated output directory existed; the executor prompt gave no guidance on where
-to place generated files.
-
-**Fix**:
-- `internal/tools/workspace.go` (new): `WorkspaceDir()` returns `$AGSH_WORKSPACE` or
-  `~/agsh_workspace`; `ExpandHome()` expands `~/`; `ResolveOutputPath()` redirects bare
-  filenames (no directory component) and `./`-prefixed paths to the workspace; `EnsureWorkspace()`
-  creates the directory.
-- `internal/roles/executor/executor.go`: in `write_file` handler, expand `~` then call
-  `ResolveOutputPath`; logs redirect. Executor system prompt updated: output files MUST
-  use `~/agsh_workspace/` as base.
-- `cmd/agsh/main.go`: calls `tools.EnsureWorkspace()` at startup.
-- `CLAUDE.md`: updated `write_file` tool table row.
-
-Files changed:
-- `internal/tools/workspace.go` (new, +8 tests in `workspace_test.go`)
-- `internal/roles/executor/executor.go`
-- `cmd/agsh/main.go`
-- `CLAUDE.md`
-
----
-
-## Issue #69 — No per-role LLM cost/time reporting after task completion
-
-**Symptom**: After each task the user had no visibility into how many tokens each role consumed or how long each LLM call took. The task log captured per-call token counts but the data was never surfaced to the terminal.
-
-**Root cause**:
-1. `llm.Usage` had no `ElapsedMs` field; HTTP round-trip time was measured but discarded.
-2. `tasklog.LLMCall` accumulated tokens globally but had no per-role breakdown.
-3. `tasklog.Registry.Close` discarded role stats on close.
-4. `perceiver.Process` ignored the `llm.Usage` returned by `Chat`; no way for `main.go` to track perceiver cost.
-
-**Fix**:
-- `internal/llm/client.go`: added `ElapsedMs int64` to `Usage`; timer wraps `httpClient.Do` + `io.ReadAll`.
-- `internal/tasklog/tasklog.go`: added `RoleStat` (exported) + `roleStat` accumulator inside `TaskLog`; `LLMCall` signature gains `elapsedMs int64` (before `iterIndex`); new `RoleStats() []RoleStat` sorted by canonical order; `Registry` gains `cache map[string][]RoleStat`; `Close` saves stats to cache; new `GetStats(taskID)` returns and deletes cache entry.
-- `internal/roles/perceiver/perceiver.go`: `Process` now returns `(string, llm.Usage, error)`; `perceive` returns `llm.Usage`; usage accumulated across clarification rounds.
-- `internal/roles/planner/planner.go`, `executor/executor.go`, `agentval/agentval.go`, `metaval/metaval.go`: pass `usage.ElapsedMs` to `LLMCall`.
-- `cmd/agsh/main.go`: capture `perceiverUsage` from `p.Process()`; new `printCostStats(perceiverUsage, roleStats)` prints a `📊 Cost` table with per-role call count, token count, and LLM time; called after `printResult` in both one-shot and REPL modes.
-
-Files changed:
-- `internal/llm/client.go`
-- `internal/tasklog/tasklog.go` (+6 new tests in `tasklog_test.go`)
-- `internal/roles/perceiver/perceiver.go`
-- `internal/roles/planner/planner.go`
-- `internal/roles/executor/executor.go`
-- `internal/roles/agentval/agentval.go`
-- `internal/roles/metaval/metaval.go`
-- `cmd/agsh/main.go`
-
----
-
-## Issue #68 — Batch B: Law 0 misattribution, Law 2 prompt gap, Law 3 context cap
-
-**Symptom**:
-- **B1 (Law 0)**: R4a LLM misattributes failure_class (e.g., calls "permission denied" logical); deterministic environmental patterns were left to LLM discretion.
-- **B2 (Law 2)**: `planDirectivePrompt` described directive labels but never told R2 what `failure_class` means for replanning strategy; R2 often repeated the same approach even when signalled "environmental".
-- **B3 (Law 3)**: `toolResultsCtx` accumulated unbounded across up to 10 tool calls (up to 40 KB); only per-result truncation existed; the total context injected into each LLM turn was uncapped.
-
-**Root cause**: Three spec items that were marked "pending implementation" in ARCHITECTURE.md.
-
-**Fix**:
-- **B1** (`internal/roles/agentval/agentval.go`): added `classifyEnvironmental(evidence, toolCalls)` using compiled case-insensitive regex against: `permission denied`, `no such file`, `not found`, `not exist`, `connection refused`, `timeout`, `network error`, `command not found`, `executable file not found`, `[LAW1]`. After LLM verdict is parsed, post-processes each failed `criterionResult`: promotes to `"environmental"` if pattern matches; never demotes existing `"environmental"`. (+5 tests)
-- **B2** (`internal/roles/planner/planner.go`): appended failure_class guidance block to `planDirectivePrompt` explaining that `"environmental"` → change path/parameters, `"logical"` → change tool class/method, `"mixed"` → fix environmental blockers first.
-- **B3** (`internal/roles/executor/executor.go`): applied `headTail(toolResultsCtx.String(), 8000)` before appending accumulated context to prompt; keeps first ~2667 chars and last ~5333 chars. (+2 headTail tests)
-
-Files changed:
-- `internal/roles/agentval/agentval.go` (+5 tests in `agentval_test.go`)
-- `internal/roles/planner/planner.go`
-- `internal/roles/executor/executor.go` (+2 tests in `executor_test.go`)
-
----
-
-## Issue #67 — Safety-net abandon emits FinalResult with D=0.0; UI shows green (false success)
-
-**Symptom**: After the Law 1 gate forced the agent to exhaust its replan budget, the
-pipeline display rendered the final FinalResult line in green (`D=0.00`) instead of red,
-because the `endTask(success=false)` rule triggers on `FinalResult.Loss.D > 0`.
-
-**Root cause**: The metaval safety-net abandon path (triggered after `maxReplans=3` rounds
-in `triggerReplan`) published `FinalResult` with a zero-value `Loss` struct, leaving
-`Loss.D = 0.0`. GGS is bypassed on this path so it never computed D from the outcomes.
-
-**Fix**: Added `safetyNetLoss(outcomes []types.SubTaskOutcome) types.LossBreakdown` helper
-that computes D as `failed / total`; falls back to D=1.0 when outcomes is empty or all
-matched (the invariant is that if the safety net fired, the task failed). The safety-net
-`FinalResult` now carries `Loss: safetyNetLoss(outcomes)` and `Replans: replanCount` so the
-UI abort-detection rule (`D > 0`) fires correctly and the replan count appears in the flow
-line. Five tests added for `safetyNetLoss`.
-
----
-
-## Issue #66 — Law 1 bypass: `rm` embedded in for-loop body not detected
-
-**Symptom**: Second manual test of "delete all .log files in /tmp" showed that after both `rm -v` and `find -delete` were blocked (correct), the planner replanned and the model issued `for file in ...; do if [ -f "$file" ]; then rm "$file"; fi; done` — a for-loop with `rm` in the `then` branch. The loop body starts with `if`, not `rm`, so `isIrreversibleShell` did not detect it.
-
-**Root cause**: `isIrreversibleShell` checked only the full command string against prefix patterns. Compound commands produced by loops (`for`/`while`), conditionals (`if/then/else`), and pipelines (`| xargs rm`) embed the destructive sub-command after separators (`;`, `&&`, `|`) and shell keywords (`then`, `do`), making it invisible to prefix matching.
-
-**Fix**: Refactored `isIrreversibleShell` into two helpers: `splitShellFragments` splits the command on `&&`, `||`, `;`, `|`, and `\n`, then strips leading shell keywords (`then`, `do`, `else`, `{`, `(`); `isIrreversibleFragment` applies the prefix/pattern checks to a single normalized fragment. `isIrreversibleShell` now iterates all fragments and returns true on the first destructive one. Also added `xargs rm` and `xargs /bin/rm` as prefix patterns to catch `find ... | xargs rm` pipes. Tests added: `ReturnsTrueForForLoopWithRm`, `ReturnsTrueForAndAndRm`, `ReturnsTrueForXargsRm`, `ReturnsFalseForReadOnlyPipeline`, and six `splitShellFragments` unit tests.
-
----
-
-## Issue #65 — Law 1 bypass: model uses `find -delete` after `rm` is blocked
-
-**Symptom**: Manual test of "delete all .log files in /tmp" showed that after `rm -v /tmp/*.log` was blocked by Law 1 (correct), the planner replanned and the model issued `find /tmp -maxdepth 1 ... -delete`, which bypassed the Law 1 gate and deleted files.
-
-**Root cause**: `isIrreversibleShell` only checked prefix patterns (`rm `, `rmdir`, etc.). `find ... -delete` and `find ... -exec rm` are equally destructive but start with `find `, which is otherwise read-only.
-
-**Fix**: Added two additional checks in `isIrreversibleShell` for `find` commands: (1) contains ` -delete` → blocked; (2) contains `-exec rm` or `-exec /bin/rm` → blocked. Added three tests: `ReturnsTrueForFindDelete`, `ReturnsTrueForFindExecRm`, `ReturnsFalseForFindWithoutDelete`.
-
----
-
-## Issue #64 — Laws 1, 2, 3 from ARCHITECTURE.md not implemented
-
-**Symptom**: Laws 1, 2, 3 from ARCHITECTURE.md marked "not yet implemented". Executor would execute destructive shell commands (rm -rf, mkfs, etc.) and overwrite existing files without any gate. GGS had no kill-switch for consecutive worsening replans. Procedural `MemoryEntry` had no `failure_class` field — future tasks could not filter memory by failure type.
-
-**Root cause**: No irreversible-action gate in executor; no consecutive-worsening kill-switch in GGS; procedural `MemoryEntry` derived `failure_class` from free-text `gap_summary` keywords instead of structured `CriteriaVerdicts`.
-
-**Fix**:
-- Law 1 — `isIrreversibleShell` + `isIrreversibleWriteFile` in `executor.go:runTool`; both return a `[LAW1]` prefixed string on block (no error, treated as a tool result); R4a prompt adds "Law 1 safety rule" — `[LAW1]` output → immediate `failed` verdict with `failure_class=environmental`.
-- Law 2 — `worseningCount map[string]int` added to GGS struct; `process()` increments count on `worsening` gradient and resets on non-worsening; after 2 consecutive worsening gradients the directive is overridden to `abandon` with a `[R7] LAW2 KILL-SWITCH` log line; `worseningCount` cleaned up on both abandon and accept exit paths.
-- Law 3 — `aggregateFailureClassFromOutcomes` helper in `metaval.go` counts `fail`-verdict `CriteriaVerdicts` across failed outcomes; `failureLesson` struct gains `FailureClass` field; procedural `MemoryEntry` carries structured `failure_class` and a `failure_class:<value>` tag for R2 memory queries.
-
----
-
-## Issue #63 — Spec-vs-code gaps: criterion-level D/P, structured failure_class, GGS thrashing detection
-
-**Symptom**: GGS computes D at subtask granularity (failed subtasks / total subtasks) and P via keyword heuristics on `FailureReason` strings. Spec defines criterion-level D (`failed_criteria / total_criteria`) and structured `failure_class`-based P. R4a had no `failure_class` field in its criterion output, so GGS had no structured signal. Auditor lacked GGS thrashing detection (consecutive `break_symmetry` without D decreasing). Abandon-path summary was a single inline format string with no enumeration of completed/failed intents.
-
-**Root cause**: `CriteriaVerdict` type was absent from `types.go`; `SubTaskOutcome` had no `CriteriaVerdicts` field; `GapTrajectoryPoint` had no `FailureClass`; `CorrectionSignal` had no `FailedCriterion`/`FailureClass`. R4a prompt did not instruct the LLM to classify `failure_class`. `computeD` counted subtasks, not criteria. `computeP` had no structured path, only keywords. Auditor had no `breakSymCount`/`lastBreakSymD` state.
-
-**Fix**:
-- `types.go`: Added `CriteriaVerdict` struct; added `CriteriaVerdicts []CriteriaVerdict` to `SubTaskOutcome`; added `FailureClass` to `GapTrajectoryPoint`; added `FailedCriterion` and `FailureClass` to `CorrectionSignal`.
-- `agentval.go`: Added `FailureClass` to `criterionResult`; updated system prompt to request `failure_class` on failed criteria; added `aggregateFailureClass` and `toCriteriaVerdicts` helpers; trajectory building now sets `GapTrajectoryPoint.FailureClass`; `outcome()` now accepts and forwards `criteriaVerdicts`; `CorrectionSignal` building now populates `FailedCriterion`/`FailureClass`.
-- `ggs.go`: `computeD` rewritten to use `CriteriaVerdicts` when present (criterion-level), with subtask-level fallback; old `computeP` renamed to `computePKeyword`; new `computeP` uses structured `FailureClass` from `CriteriaVerdicts`, falls back to `computePKeyword`; added `buildAbandonSummary` enumerating completed/failed intents; abandon path uses `buildAbandonSummary` instead of inline string.
-- `auditor.go`: Added `breakSymCount`/`lastBreakSymD` maps; GGS thrashing detection block in `MsgPlanDirective` handler — fires `ggs_thrashing` anomaly after 2+ consecutive `break_symmetry` without D decreasing; resets counter on non-`break_symmetry` directive.
-- `agentval_test.go` (new): Tests for `aggregateFailureClass` (5 cases) and `toCriteriaVerdicts` (6 cases).
-- `ggs_test.go`: Added `TestComputeD_CriterionLevelHigherThanSubtaskLevel`, `TestComputeD_FallsBackToSubtaskLevelWhenNoCriteriaVerdicts`, `TestComputeP_AllLogicalCriteriaReturnsOne`, `TestComputeP_AllEnvironmentalCriteriaReturnsZero`, `TestComputeP_FallsBackToKeywordWhenNoStructuredClass`.
-- `auditor_test.go` (new): `TestDetectGGSThrashing_FiredAfterTwoConsecutiveWithNoDDecrease`, `TestDetectGGSThrashing_NotFiredWhenDDecreases`, `TestDetectGGSThrashing_ResetOnNonBreakSymmetryDirective`.
-
----
-
-## Issue #62 — Trajectory checkpoints missing from pipeline display
-
-**Symptom**: The pipeline flow lines for `SubTaskOutcome`, `ReplanRequest`, and `FinalResult` showed only minimal detail. `SubTaskOutcome` failed only showed the unmet criterion (no R4a score). `ReplanRequest` showed only the gap summary (no "N/M failed" count). `FinalResult` had no flow line at all — only the `endTask` footer appeared. GGS integration path (R4b → R7 → R2) had no bus-level tests.
-
-**Root cause**: (1) `SubTaskOutcome` detail didn't include `GapTrajectoryPoint.Score`. (2) `ReplanRequest` detail didn't compute failed/total from `Outcomes`. (3) `printFlow` skipped `FinalResult` entirely (comment said "surfaced via endTask"). (4) `FinalResult` type had no loss fields — GGS computed D/P/Ω/∇L but discarded them after logging. (5) No integration tests verified the R4b→R7→R2 bus flow.
-
-**Fix**:
-- `types.go`: Added `Loss LossBreakdown`, `GradL float64`, `Replans int` to `FinalResult`.
-- `ggs.go`: Set `Loss`, `GradL`, `Replans` on `FinalResult` in both `processAccept` and the abandon path of `process()`.
-- `display.go msgDetail`: `SubTaskOutcome` failed → `"failed | score=X.XX | unmet: criterion"`; `ReplanRequest` → `"N/M failed | gap_summary"`; new `FinalResult` case → `"D=X.XX ∇L=±X.XX Ω=X%"` (+ `| N replan(s)` when replans > 0).
-- `display.go printFlow`: Removed early return for `MsgFinalResult` so the trajectory checkpoint is always shown.
-- `display.go Run`: Detects abandon (Loss.D > 0) to pass `success=false` to `endTask`.
-- `display.go dynamicStatus`: Added `MsgReplanRequest` case → `"📊 N/M subtasks failed — computing gradient..."`.
-- `display_test.go`: Updated `TestMsgDetail_SubTaskOutcome_FailedWithUnmetCriteria`; added 5 new tests.
-- `ggs_integration_test.go`: 5 bus-level integration tests (change_path, break_symmetry, refine/improving, abandon→FinalResult, accept→FinalResult with D=0).
-
----
-
-## Issue #61 — Reasoning model `<think>` blocks cause JSON parse failure in Executor
-
-**Symptom**: Task abandoned with "Infrastructure/executor error: LLM output contained malformed JSON with stray `</think>` token between tool calls." R4a classifies this as an infrastructure error and marks the subtask failed immediately — no retry is attempted.
-
-**Root cause**: Reasoning models (e.g. `deepseek-reasoner`) emit `<think>...</think>` blocks in raw response content before (or occasionally between) JSON objects. `StripFences` only removes ` ``` ` code fences; `<think>` tags passed through to `json.Unmarshal`, which fails with `invalid character '<'`. The error propagated from `execute()` → `RunSubTask()` → R4a as a synthetic failed `ExecutionResult` whose output is the raw error string.
-
-**Fix**: Added `StripThinkBlocks(s string) string` to `internal/llm/client.go`. Iteratively removes all `<think>...</think>` blocks; truncates at an unclosed `<think>` tag. `StripFences` now calls `StripThinkBlocks` as its first step, so all callers (executor, planner, perceiver, agentval) are protected automatically. 4 new tests in `client_test.go`.
-
----
-
-## Issue #60 — cc-as-brain removed; LLM restored as sole R2 brain
-
-**Symptom**: cc-brain mode (`R2_BRAIN=cc`) failed in two ways: (1) `cc --print` rejected inside Claude Code sessions due to the `CLAUDECODE` env var; (2) even after stripping that var, cc prepended reasoning prose before the JSON, defeating the `StripFences`-then-parse pipeline.
-
-**Root cause**: cc is a conversational assistant that cannot reliably be constrained to pure JSON output when called as a subprocess. The `cc` alias also cannot be invoked via `exec.Command` (it is a shell alias, not a binary).
-
-**Fix**: Removed all cc-related code entirely — `ccEnviron`, `runCC`, `dispatchViaCCBrain`, `SetBrainMode`, `BrainMode`, `brainMode` field, `mu` mutex, `maxCCCalls` constant, `MsgCCCall`/`MsgCCResponse` message types, `CCCall`/`CCResponse` payload structs, `RoleCC`, `PlannerBrain`/`CCCalls` manifest fields, `/brain` REPL command, cc sections in `display.go` and `auditor.go`. `dispatch()` is a single plain LLM call again.
-
----
-
-## Issue #59 — DDG search routed through CC internal proxy (port 26560), connection fails
-
-**Symptom**
-`search` tool always errors: `websearch: http request: Post "https://html.duckduckgo.com/html/": read tcp ...:55573->...:26560: connection reset by peer`. Port 26560 is Claude Code's internal proxy.
-
-**Root cause**
-`websearch.go` used `http.DefaultClient`, which inherits `HTTPS_PROXY` from the process environment. When `agsh` runs inside a Claude Code session, CC injects its own proxy into the environment. DDG must be reached directly; CC's proxy does not forward external traffic.
-
-**Fix**
-Replace `http.DefaultClient` with a package-level `ddgClient` that sets `Transport.Proxy` to a no-op function (`func(*http.Request) (*url.URL, error) { return nil, nil }`). This bypasses all proxy env vars for DDG requests only; the LLM client (which legitimately needs the proxy to reach the API) is unaffected.
-
-Files changed:
-- `internal/tools/websearch.go` — dedicated `ddgClient` with proxy disabled
-
----
-
-## Issue #58 — R3 LLM brain loops on identical tool call when DuckDuckGo returns no results
-
-**Symptom**
-R3 called `search("Google Spring Festival 2026 announcement")` 10 times in a row with identical parameters, producing identical empty/error results each iteration. Budget was exhausted without progress; task abandoned with D=1.000, Ω=0.864.
-
-**Root cause**
-When a tool call returns no usable results (DDG connection reset, empty response), the LLM re-plans with the same call because nothing in its context indicates the call was already tried. There is no guard against consecutive identical calls.
-
-**Fix**
-Added loop detection in `executor.go` `Run()` method. Before executing each tool call, compute `currentSig = tool + ":" + firstN(params, 60)`. If `currentSig` matches the immediately preceding call signature, block execution and inject a `⚠️ DUPLICATE CALL BLOCKED` warning into `toolResultsCtx`. The warning explicitly instructs the LLM to either emit a final result from existing data or try a completely different approach. The blocked call is not appended to `ToolCalls` (no evidence fabricated).
-
-Files changed:
-- `internal/roles/executor/executor.go` — consecutive duplicate call detection and blocking
-
----
-
-## Issue #57 — R1 and R2 resolve relative dates incorrectly without knowing current date
-
-**Symptom**
-Input: `今年春节期间重要的科技新闻` ("important tech news during this year's Spring Festival").
-Today is 2026-02-22. R1 resolved "今年春节" as "2025年春节期间（1月28日-2月4日）" — wrong year (2025 vs 2026), same root cause as issue #50 but in R1 instead of R4a.
-
-**Root cause**
-R1 and R2 had no `Today's date` injection. Without knowing the current date, temporal references like "今年" (this year), "最近" (recently), "上周" (last week) are resolved from training data, which may lag by months or years.
-
-**Fix**
-Two-part fix that respects the R1/R2 role boundary:
-
-- **R1**: add a "temporal reference rule" to the system prompt — R1 must NOT resolve relative time words (今年/this year, 最近/recently, 上周/last week, etc.) into specific dates. Preserve them verbatim in `intent`. This is architecturally correct: R1 is a receiver, not a resolver; R2 owns temporal interpretation.
-
-- **R2**: inject `Today's date: YYYY-MM-DD` into the user prompt in `plan()` and `replanWithDirective()`. R2 needs the concrete date to write falsifiable `task_criteria` (e.g. "output contains news from Spring Festival 2026, Jan 28–Feb 4"). This is the same mechanism as R4a (issue #50) and is general, not badcase-specific.
-
-Files changed:
-- `internal/roles/perceiver/perceiver.go` — temporal reference rule added to system prompt; date injection removed
-- `internal/roles/planner/planner.go` — `Today's date` prepended in `plan()` and `replanWithDirective()`
-
----
-
-## Issue #56 — Gradient direction invisible in pipeline display
-
-**Symptom**
-The `PlanDirective` pipeline line showed `directive | ∇L=gradient Ω=N%` — the gradient label was present but the direction was not visually distinct from surrounding text. Users familiar with the GGS design could not see at a glance whether the solver was converging.
-
-**Root cause**
-`msgDetail` for `MsgPlanDirective` used a plain string with no directional symbol or color differentiation.
-
-**Fix**
-Updated `msgDetail` in `display.go` to prepend a colored directional arrow before the gradient label:
-- `↑` green — improving (loss decreasing)
-- `↓` red — worsening (loss increasing)
-- `⊥` yellow — plateau (stuck in local minimum)
-- `→` no color — stable
-
-After the colored arrow, `ansiReset + ansiYellow` restores the message-type color so the rest of the label renders correctly within the bracket.
-
-Files changed:
-- `internal/ui/display.go` — `MsgPlanDirective` case in `msgDetail`
-
----
-
-## Issue #55 — R1 owned success_criteria; mixed perception with planning
-
-**Symptom**
-R1 (Perceiver) wrote `success_criteria` in the `TaskSpec`. R2 (Planner) then wrote subtask-level criteria. This means the same semantic boundary ("what counts as success") was split across two roles with different vantage points — R1 doesn't know how R2 will decompose the task, so its criteria were often intent echoes rather than testable assertions against concrete tool output.
-
-**Root cause**
-Architectural: R1's mission is perception (translate raw input into structured intent). Criteria specification requires knowledge of the execution plan, which belongs to R2.
-
-**Fix**
-- R1 no longer outputs `success_criteria`. Its output format is reduced to `{task_id, intent, constraints, raw_input}`.
-- R2 now outputs a JSON wrapper `{"task_criteria":[...],"subtasks":[...]}` instead of a raw subtask array. `task_criteria` are assertions about the COMBINED output of ALL subtasks — same quality bar as subtask-level criteria (concrete, falsifiable).
-- `DispatchManifest` gains `TaskCriteria []string`; R2 sets it in `emitSubTasks` by parsing the wrapper.
-- `emitSubTasks` tries wrapper parse first; falls back to raw array for backward compatibility.
-- R4b's `evaluate()` now passes `manifest.TaskCriteria` to the LLM instead of `TaskSpec.SuccessCriteria`.
-- R4b system prompt updated: it evaluates `task_criteria` from R2, not subtask criteria from R4a.
-
-Files changed:
-- `internal/roles/perceiver/perceiver.go` — remove `success_criteria` from prompt + output format
-- `internal/roles/planner/planner.go` — wrapper output format; `emitSubTasks` parses wrapper; `TaskCriteria` set in manifest
-- `internal/roles/metaval/metaval.go` — system prompt + `evaluate()` user prompt use `task_criteria`
-- `internal/types/types.go` — `DispatchManifest.TaskCriteria []string` field added
-
----
-
-## Issue #54 — R4a spuriously retries correct search results because ToolCalls snippet misses leading content
-
-**Symptom**: R4a returns `retry` for a correct, detailed search result (e.g. Trump China visit dates from Reuters/Al Jazeera). All criteria marked `met:false` with evidence "no extractable content about confirmed dates".
-
-**Root cause**: The ToolCalls snippet was built with `lastN(result, 120)` — the last 120 chars of search output. For web search results, the useful content (article titles, dates, snippets) appears at the **beginning** of the output; the tail is typically URL metadata or closing JSON. R4a only sees the tail and correctly concludes there is no evidence.
-
-**Fix**: Changed `lastN(result, 120)` to `firstN(result, 200)`. Nearly all tool outputs (search titles/snippets, file paths, shell results) put the relevant content at the **start**, not the end. `lastN` was only correct for ffmpeg-style commands with banners before results — and those are already handled by `headTail` in the executor's 4000-char context window. The ToolCalls evidence snippet only needs the leading content.
-
----
-
-## Issue #53 — cc subprocess invocation fails inside a Claude Code session
-
-**Symptom**: `R2_BRAIN=cc` always errors with `[cc error: exit status 1]`; R2 cannot plan.
-
-**Root cause (two bugs)**:
-1. `CLAUDECODE` env var is set when agsh runs inside a Claude Code session; cc detects this and refuses to launch nested sessions.
-2. `cc` is a zsh alias (`https_proxy=… claude`), not a binary. `exec.Command("cc")` resolves to the system C compiler (`clang`), which rejects `--print` as an unknown flag.
-
-**Fix**:
-- `ccEnviron()` helper strips `CLAUDECODE` from the subprocess environment.
-- Both `runCC()` and `dispatchViaCCBrain()` now invoke `zsh -i -c 'cc --print "$AGSH_PROMPT"'` so shell aliases are loaded. Prompt is passed via `AGSH_PROMPT` env var to avoid shell injection.
-
----
-
-## Issue #52 — No way to enforce cc as R2's brain model or switch at runtime
-
-**Symptom**: cc can only be an optional consultation tool called by the LLM brain; there is no way to make cc the primary planning engine, nor to switch between engines without restarting.
-
-**Root cause**: `Planner` struct had no `brainMode` concept — `dispatch()` always called `p.llm.Chat()`.
-
-**Fix**:
-- Added `brainMode string` + `sync.RWMutex` to `Planner`.
-- `New(... brainMode string)` — pass `"cc"` or `"llm"` (default); reads `R2_BRAIN` env var in `main.go`.
-- `SetBrainMode(mode string)` / `BrainMode() string` — thread-safe runtime switch.
-- `dispatch()` branches: `brainMode=="cc"` → `dispatchViaCCBrain()` (cc is primary, 120 s timeout); otherwise → `dispatchViaLLM()` (existing loop with optional cc consultation).
-- `DispatchManifest.PlannerBrain` field propagated to UI: "via brain", "via brain + cc (N)", or "via cc (brain)".
-- `/brain [cc|llm]` REPL command shows or switches the engine at runtime.
-
----
-
-## Issue #51 — No UI visibility into whether R2 used brain model or cc for planning
-
-**Symptom**: `DispatchManifest` line in pipeline always reads "N subtasks" — no indication of whether R2 called cc or planned with the brain model directly.
-
-**Root cause**: `DispatchManifest` carried no `cc_calls` field; `display.go` had no logic to distinguish the two paths.
-
-**Fix**:
-- Added `CCCalls int` field to `types.DispatchManifest` (0 = brain only; >0 = cc consulted N times).
-- `emitSubTasks(spec, raw, ccCalls int)` now accepts and sets `CCCalls` in the manifest.
-- `display.go` DispatchManifest detail renders `"N subtasks | via brain"` or `"N subtasks | via cc (N call)"`.
-
----
-
-## Issue #50 — R4a has no current date in context; cannot resolve relative dates
-
-**Symptom**: R4a fails criterion "at least one source is within the last 6 months" when search results show relative dates ("13 days ago", "5 months ago"), even though the dates clearly resolve to within 6 months.
-
-**Root cause**: No current date in R4a's context — it cannot resolve relative dates to absolute dates. The LLM either refuses to evaluate or defaults to a stale training date.
-
-**Fix**: Injected `Today's date: YYYY-MM-DD` into every R4a user prompt via `time.Now().UTC().Format("2006-01-02")`. This is a general mechanism — R4a already has the intelligence to resolve relative dates once it knows the current date; no domain-specific rules were added to the system prompt.
-
----
-
-## Issue #49 — No UI visibility into whether R2 used cc or the brain model for planning
-
-**Symptom**: When R2 calls `cc`, the pipeline UI shows nothing — only the debug log reveals whether cc was consulted.
-
-**Root cause**: `MsgCCCall` / `MsgCCResponse` message types didn't exist. `runCC()` called the CLI and fed the result back silently with only `log.Printf`.
-
-**Fix**:
-- Added `MsgCCCall` and `MsgCCResponse` message types and `RoleCC = "cc"` role to `types.go`.
-- Added `CCCall` and `CCResponse` payload structs (task_id, call_n, max_n, prompt, chars, response preview).
-- `dispatch()` in `planner.go` now publishes `MsgCCCall` (R2 → cc) before `runCC()` and `MsgCCResponse` (cc → R2) after, carrying the 300-char response preview.
-- `display.go`: added `🤖` emoji for `RoleCC`; cyan color for both cc message types; spinner labels "🤖 consulting cc..." / "📐 planning with cc insight..."; detail lines show `call N/M: <prompt>` and `<chars> chars: <response preview>`.
-- `auditor.go`: added `MsgCCCall → {R2, cc}` and `MsgCCResponse → {cc, R2}` to `allowedPaths`.
-
----
-
-## Issue #48 — R2 has no way to consult a stronger model for complex planning
-
-**Symptom**: Brain model (deepseek-v3.2) must plan blindly — it cannot inspect the codebase, verify tool availability, or ask Claude for architectural insight before decomposing a task.
-
-**Root cause**: R2's `dispatch()` made a single LLM call and parsed the result directly as a SubTask JSON array. No mechanism existed for the brain to call an external tool before finalising the plan.
-
-**Fix**: Added an optional `cc` (Claude Code CLI) tool loop to R2's `dispatch()`:
-- Brain LLM may output `{"action":"call_cc","prompt":"..."}` before the final SubTask array.
-- `runCC(ctx, prompt)` shells out to `cc --print <prompt>` (60 s timeout, 4000 char truncation).
-- R2 appends the response to the context and calls the brain LLM again for the final plan.
-- Hard-capped at `maxCCCalls=2` per planning session to prevent loops.
-- Direct `[...]` array output bypasses the tool loop entirely (backward compatible).
-- System prompt updated with `OPTIONAL TOOL — cc` section describing when and how to call it.
-- 5 new tests in `planner_test.go` covering cc detection, array bypass, and constant guards.
-
----
-
-## Issue #47 — Abandon message shows only subtask ID, not failure reason
-
-**Symptom**: `❌ Task abandoned after 3 failed attempts. 1 subtask(s) failed: [a7b8c9d0-...]` — the user sees a UUID, not why it failed.
-
-**Root cause**: The hard-gate replan path in `metaval.go` built `gapSummary` as `"N subtask(s) failed: [<ids>]"` — the `SubTaskOutcome.FailureReason` field (populated by R4a) was never extracted. The abandon message therefore showed only the opaque subtask ID.
-
-**Fix**: At the hard-gate call site, iterate failed outcomes and join their `FailureReason` strings into `gapSummary`. Inside `triggerReplan`, do the same when composing the user-facing abandon message. Both GGS (via `ReplanRequest.GapSummary`) and the final displayed message now show the actual R4a failure reason.
-
----
-
-## Issue #46 — GGS timeBudgetMs too tight; tasks abandoned at 91% Ω due to LLM latency
-
-**Symptom**: Tasks that ultimately succeed are abandoned mid-run with "budget pressure=91%". The abandon was triggered by the time sub-component of Ω alone: at elapsed=211 s with one replan, `Ω = 0.6*(1/3) + 0.4*(211845/120000) = 0.906 ≥ 0.8`.
-
-**Root cause**: `timeBudgetMs = 120_000` (2 min) doesn't account for real-world LLM call latency. With kimi-k2.5 / deepseek taking 5–15 s per call, a single subtask (5–6 executor tool calls + agentval + metaval + one replan cycle) routinely takes 3–5 minutes. The gradient calculation is correct; the budget constant was calibrated for a local model.
-
-**Fix**: Raised `timeBudgetMs` from `120_000` to `300_000` (5 min) in `internal/roles/ggs/ggs.go`.
-
----
-
-## Issue #45 — All roles shared one LLM model; reasoning roles outperformed by cheaper execution models
-
-**Symptom**
-Reasoning roles (R1/R2/R4b) and execution roles (R3/R4a) all used a single `OPENAI_MODEL`. On tasks requiring
-current knowledge (e.g. "today's top tech news"), R2 (planner) produced outdated results because the model
-lacked the capability for time-sensitive reasoning — yet the same model was used for tool invocation where
-capability matters less than speed and cost.
-
-**Root cause**
-`llm.New()` read a single `OPENAI_MODEL` env variable. All five LLM-backed roles received the same client
-instance. There was no mechanism to assign a smarter model to reasoning roles and a faster/cheaper model to
-execution roles.
-
-**Fix**
-- `llm.NewTier(prefix string)`: reads `{prefix}_API_KEY`, `{prefix}_BASE_URL`, `{prefix}_MODEL`;
-  falls back to `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` for any unset var.
-  `New()` is kept as a backward-compatible wrapper (`NewTier("")`).
-- `main.go`: replaced single `llmClient` with `brainClient = NewTier("BRAIN")` (R1/R2/R4b)
-  and `toolClient = NewTier("TOOL")` (R3/R4a).
-- `.env` two-section layout: `[brain-model]` uses `BRAIN_API_KEY` / `BRAIN_BASE_URL` / `BRAIN_MODEL`;
-  `[tool-model]` uses `TOOL_MODEL`; shared `OPENAI_*` vars as fallback.
-- `CLAUDE.md`: documented the model tier split.
-- 3 new tests in `client_test.go` covering `NewTier` expectations.
-
----
-
-## Issue #44 — GGS idle on happy path: medium loop open on task acceptance
-
-**Symptom**
-On successful task completion (all subtasks matched), GGS (R7) was completely bypassed. R4b published `MsgFinalResult` directly to the user and called `outputFn` itself. The pipeline showed no R7 activity on the happy path, violating the "medium loop is complete" invariant from the v0.7 spec.
-
-**Root cause**
-`metaval.go` accept case (verdict="accept") published `MsgFinalResult` to `RoleUser` and called `outputFn`. GGS only ran when R4b's hard gate triggered a `ReplanRequest` (i.e., only on failure). A proper closed-loop controller computes the error signal on every cycle including when the error is zero (D=0).
-
-**Fix**
-- New `types.MsgOutcomeSummary` + `types.OutcomeSummary` struct. R4b sends this to R7 instead of publishing FinalResult directly.
-- R4b accept case: writes episodic memory (unchanged), then publishes `MsgOutcomeSummary` to GGS. No longer calls `outputFn` or publishes `MsgFinalResult`. Also fixed missing cleanup of `taskStart` and `replanCounts` on accept.
-- GGS `Run()`: subscribes to both `MsgReplanRequest` (failure path) and `MsgOutcomeSummary` (accept path).
-- GGS `processAccept()`: computes D=0, P=0.5, Ω from elapsed time + prior replans, logs final L/∇L, emits `MsgFinalResult` + calls `outputFn`. GGS is the sole emitter of FinalResult for both accept and abandon — consistent exit path.
-- Auditor: `MsgOutcomeSummary → {R4b, R7}` added to allowedPaths.
-- UI: `MsgOutcomeSummary` shown in pipeline flow (R4b ──[OutcomeSummary]──► R7) with green colour.
-- 4 new tests for `processAccept` in `ggs_test.go`.
-
----
-
-## Issue #43 — v0.7 GGS spec not implemented
-
-**Symptom**
-Medium loop lacked a controller: R4b sent plain "retry" signals to R2 with no directional content. R2 had no way to know whether to change tools, change paths, or give up. The gradient was never computed.
-
-**Root cause**
-R7 (Goal Gradient Solver) was deferred in v0.6. The loss function (D, P, Ω, L, ∇L) was designed but not implemented. R4b computed a naive `gap_trend` from failed-subtask count deltas; R2 self-directed replanning without gradient guidance.
-
-**Fix**
-Implemented the full v0.7 GGS spec:
-- New `internal/roles/ggs/` package (R7): subscribes to `MsgReplanRequest` (from R4b), computes D/P/Ω/L/∇L, selects directive from decision table, emits `MsgPlanDirective` to R2. Handles `abandon` (Ω ≥ 0.8) directly with FinalResult.
-- New `types.PlanDirective` + `types.LossBreakdown`; `types.ReplanRequest` updated (removed `GapTrend`, added `Outcomes []SubTaskOutcome`, `ElapsedMs int64`).
-- `SubTaskOutcome` gains `ToolCalls []string` so GGS can derive `blocked_tools` for `break_symmetry`/`change_approach` directives.
-- R4b (`metaval`): tracks task start time, sends `ReplanRequest` to R7 (not R2), includes full outcomes + elapsed_ms. Removed `computeGapTrend()` and `prevFailedCounts`. `maxReplans` kept as safety net.
-- R2 (`planner`): subscribes to `MsgPlanDirective` instead of `MsgReplanRequest`. Merges GGS `blocked_tools` with memory-sourced MUST NOT constraints. New `replanWithDirective()` replaces old `replan()`.
-- Auditor: `allowedPaths` updated (R4b→R7 for ReplanRequest, R7→R2 for PlanDirective). Reads gradient from PlanDirective instead of `ReplanRequest.GapTrend`.
-- UI: R7 emoji (📈), `MsgPlanDirective` color/label/detail added.
-- `tasklog.Replan()` signature simplified (removed `gapTrend` param).
-- 36 new tests in `ggs_test.go` covering all loss/gradient computation functions.
-
----
 
 ## Issue #1 — Executor returns wrong result: "No .go files found"
 
@@ -540,6 +38,7 @@ The project clearly has 17 `.go` files. The answer was factually wrong.
 
 ---
 
+
 ## Issue #2 — Tasks are too slow (5–7 minutes for a trivial query)
 
 **Symptom**
@@ -568,6 +67,7 @@ Counting or listing files took 5–7 minutes. Every simple task generated ~18 LL
 
 ---
 
+
 ## Issue #3 — Memory not written for failed tasks
 
 **Symptom**
@@ -595,6 +95,7 @@ This gives the Planner context on what failed and why before it replans.
 
 ---
 
+
 ## Issue #4 — `MemoryQuery.Query` field silently ignored
 
 **Symptom**
@@ -614,6 +115,7 @@ to `Store.Query()`.
 - Updated `Run` handler to pass `query.Query` through.
 
 ---
+
 
 ## Issue #5 — Memory entry lost on one-shot exit
 
@@ -638,6 +140,7 @@ to exit. The memory store's goroutine never got CPU time to dequeue and process 
 
 ---
 
+
 ## Issue #6 — Memory tags are useless for retrieval
 
 **Symptom**
@@ -654,6 +157,7 @@ keep words ≥4 chars. The `"accept"` entry gets `["success", taskID, <intent ke
 `"replan"` entry gets `["failure", "replan", taskID, <gap_summary keywords>...]`.
 
 ---
+
 
 ## Issue #7 — REPL has no session context; follow-up inputs fail
 
@@ -689,6 +193,7 @@ Total line count: 2581          ← correct; reused prior context
 
 ---
 
+
 ## Issue #8 — REPL UX: raw log spam, no visual pipeline feedback
 
 **Symptom**
@@ -710,6 +215,7 @@ All `[R1]`, `[R3]` debug log lines printed to the same terminal as user output, 
 
 ---
 
+
 ## Issue #9 — Infinite replan loop on macOS file-search tasks
 
 **Symptom** (screenshot)
@@ -728,6 +234,7 @@ Searching for movie/music files looped: R4b kept sending ReplanRequest despite t
 - **`executor.go` `normalizeFindCmd()`**: Code-level guardrail — automatically appends `2>/dev/null` to any `find` command that doesn't already have it, so permission errors never cause exit status 1 or hide stdout results.
 
 ---
+
 
 ## Issue #10 — REPL input: backspace broken, arrow keys show codes, Chinese unsupported
 
@@ -754,6 +261,7 @@ Replaced `bufio.Scanner` in `runREPL` with `github.com/chzyer/readline`:
 
 ---
 
+
 ## Issue #11 — Ctrl+C abort: second press exits program; executor keeps running after abort
 
 **Symptom** (screenshot)
@@ -771,6 +279,7 @@ Replaced `bufio.Scanner` in `runREPL` with `github.com/chzyer/readline`:
 - **Signal handler no longer exits on second Ctrl+C**: when `taskCancel == nil` (idle), the handler does nothing. Exiting is exclusively via readline's `ErrInterrupt` → two-press confirmation, or typing `exit`/`Ctrl+D`. This eliminates the accidental-exit race.
 
 ---
+
 
 ## Issue #12 — `glob` with `root:"."` finds no user personal files
 
@@ -800,6 +309,7 @@ Searching for a file in the user's Downloads or home directory returned nothing.
 
 ---
 
+
 ## Issue #13 — Stale ExecutionResult published after Ctrl+C reopens pipeline box
 
 **Symptom** (screenshot)
@@ -816,6 +326,7 @@ After aborting a task (⚠️ task aborted / ❌ box closed), a new pipeline box
 - **`main.go`**: `disp.Resume()` called at the top of each new REPL task (before `perceiver.Process()`), lifting the suppression exactly when the user submits a new query.
 
 ---
+
 
 ## Issue #14 — Personal file search takes 6 minutes (find ~ / glob root:"~" both scan entire home)
 
@@ -839,6 +350,7 @@ Added `mdfind` as a first-class executor tool backed by macOS Spotlight:
 
 ---
 
+
 ## Issue #15 — `glob` silently returns 0 results for globstar patterns (`**/*.go`)
 
 **Symptom**
@@ -852,6 +364,7 @@ LLMs routinely emit patterns like `**/*.go` or `*/*.json` (shell globstar style)
 - **Executor system prompt**: example changed from `"pattern":"*.go"` to `"pattern":"*.json"`; added note *"Pattern matches the FILENAME ONLY — do NOT include '/'"*.
 
 ---
+
 
 ## Issue #16 — Result output shows literal `\n` instead of rendered newlines
 
@@ -872,6 +385,7 @@ Newlines in the output string were displayed as the two-character sequence `\n` 
 4. Suppresses the output block when it duplicates the summary.
 
 ---
+
 
 ## Issue #17 — Subtask B fails because it ran in parallel with subtask A that locates its input
 
@@ -910,6 +424,7 @@ sequence=2: extract audio (context includes "prior step output: /Users/.../三�
 ```
 
 ---
+
 
 ## Issue #18 — LLM hallucinates ffmpeg failure; task abandoned despite success
 
@@ -967,6 +482,7 @@ that caused the full cascade despite the executor correctly reporting `completed
 
 ---
 
+
 ## Issue #19 — R4a rejects completed subtasks: ToolCalls carries no output evidence
 
 **Symptom**
@@ -1016,6 +532,7 @@ End-to-end test: "find 三个代表.mp4 and extract its audio to mp3"
 
 ---
 
+
 ## Issue #20 — Spinner line-wrap floods the terminal with identical retry lines
 
 **Symptom**
@@ -1045,6 +562,7 @@ The status text for corrections was built as:
   line is now ≤ 54 visible cols, safely within any terminal ≥ 60 cols — no wrapping possible.
 
 ---
+
 
 ## Issue #21 — Model repeatedly uses `find /Users/...` instead of `mdfind`
 
@@ -1086,6 +604,7 @@ Routing rules:
 - `find /tmp -name "*.log"` → unchanged (system path)
 
 ---
+
 
 ## Issue #22 — `/audit` always shows zeros on process restart
 
@@ -1140,6 +659,7 @@ persisted, so restarting again shows tasks=0 with the new `window_start`.
 
 ---
 
+
 ## Issue #23 — Clarification question printed dozens of times before user types anything
 
 **Symptom**
@@ -1180,6 +700,7 @@ The same clarification question appeared ~12 times before the user had typed any
 
 ---
 
+
 ## Issue #24 — `❯` prompt not shown after task completes
 
 **Symptom**
@@ -1215,6 +736,7 @@ Order after fix (deterministic):
 2. REPL: `WaitTaskClose` returns → `printResult()` → `rl.Readline()` draws `❯`
 
 ---
+
 
 ## Issue #25 — Clarification question reprinted on every readline internal redraw
 
@@ -1252,6 +774,7 @@ The question is now printed exactly once; readline only manages its own `❯ ` l
 
 ---
 
+
 ## Issue #26 — `/audit` opens a pipeline box that never closes; REPL appears stuck
 
 **Symptom**
@@ -1279,6 +802,7 @@ if msg.Type == types.MsgAuditQuery || msg.Type == types.MsgAuditReport {
 ```
 
 ---
+
 
 ## Issue #27 — Planner generates fake, repeated subtask UUIDs
 
@@ -1320,6 +844,7 @@ should call `uuid.NewString()` and inject IDs before publishing.
 
 ---
 
+
 ## Issue #28 — R4b accepts tasks with failed subtasks (1 matched + 1 failed = accept)
 
 **Symptom** (debug log)
@@ -1357,6 +882,7 @@ Tests added in `metaval_test.go` covering all `computeGapTrend` expectations.
 
 ---
 
+
 ## Issue #29 — Memory system is structurally bypassed; effectively write-only
 
 **Symptom**
@@ -1390,6 +916,7 @@ the previously recorded failure approach.
 
 ---
 
+
 ## Issue #30 — Validators evaluate holistically; per-criterion enforcement is absent
 
 **Symptom**
@@ -1422,6 +949,7 @@ concludes about the overall result.
 
 ---
 
+
 ## Issue #31 — LLM output parser fails on trailing prose after JSON
 
 **Symptom**
@@ -1445,6 +973,7 @@ After `StripFences()`, truncate the string at the first `}` that closes the top-
 JSON object before attempting `json.Unmarshal`.
 
 ---
+
 
 ## Issue #32 — `redirectPersonalFind` discards `-path` filter; mdfind rejects glob patterns
 
@@ -1473,6 +1002,7 @@ extension in Go code if needed. Alternatively, when `-path` is present, consider
 using `shell find` within the specific subdirectory rather than redirecting to mdfind.
 
 ---
+
 
 ## Issue #33 — Memory entries treated as advisory; calibration not code-enforced
 
@@ -1522,6 +1052,7 @@ No extra LLM call is needed for calibration; all logic is deterministic Go code.
 
 ---
 
+
 ## Issue #34 — Validator criteria invisible in pipeline display
 
 **Symptom**
@@ -1553,6 +1084,7 @@ Updated `msgDetail()`:
 
 ---
 
+
 ## Issue #35 — Model switch fails: doubled `/chat/completions` path in URL
 
 **Symptom**
@@ -1580,6 +1112,7 @@ base = strings.TrimSuffix(base, "/chat/completions")
 ```
 
 ---
+
 
 ## Issue #36 — Left-arrow / Home cursor movement broken with CJK input
 
@@ -1610,6 +1143,7 @@ Changed `getBackspaceSequence()` in `runebuf.go`:
    `col/r.width < (col+w)/r.width` to detect line-wrap boundary crossings.
 
 ---
+
 
 ## Issue #37 — R4b check logic had no criteria to evaluate against
 
@@ -1645,6 +1179,7 @@ all — guessing from intent text alone.
 
 ---
 
+
 ## Issue #38 — success_criteria were intent echoes, not assertions
 
 **Symptom**
@@ -1669,6 +1204,7 @@ Updated the JSON schema placeholder to `"<assertion checkable against tool
 output>"`.
 
 ---
+
 
 ## Issue #39 — Holding forward-delete (DEL) key exits the shell
 
@@ -1698,6 +1234,7 @@ Files changed in `internal/readline_compat/`:
 - `fwddel_test.go` — 3 tests (constants distinct, mapping correct, no CharDelete)
 
 ---
+
 
 ## Issue #40 — Spinner repeats on same line when correction signal contains CJK text
 
@@ -1732,6 +1269,7 @@ Files changed:
 - `internal/ui/display_test.go` — 8 new tests covering `runeWidth`, `clipCols`, and `dynamicStatus` CJK case
 
 ---
+
 
 ## Issue #41 — LLM token usage discarded; no per-task structured log for gradient computation
 
@@ -1775,6 +1313,7 @@ Files changed:
 
 ---
 
+
 ## Issue #42 — `search` tool always fails: DuckDuckGo API unreachable from mainland China
 
 **Symptom**
@@ -1802,6 +1341,539 @@ Files changed:
 - `CLAUDE.md` — updated tool table and env config section
 
 ---
+
+
+## Issue #43 — v0.7 GGS spec not implemented
+
+**Symptom**
+Medium loop lacked a controller: R4b sent plain "retry" signals to R2 with no directional content. R2 had no way to know whether to change tools, change paths, or give up. The gradient was never computed.
+
+**Root cause**
+R7 (Goal Gradient Solver) was deferred in v0.6. The loss function (D, P, Ω, L, ∇L) was designed but not implemented. R4b computed a naive `gap_trend` from failed-subtask count deltas; R2 self-directed replanning without gradient guidance.
+
+**Fix**
+Implemented the full v0.7 GGS spec:
+- New `internal/roles/ggs/` package (R7): subscribes to `MsgReplanRequest` (from R4b), computes D/P/Ω/L/∇L, selects directive from decision table, emits `MsgPlanDirective` to R2. Handles `abandon` (Ω ≥ 0.8) directly with FinalResult.
+- New `types.PlanDirective` + `types.LossBreakdown`; `types.ReplanRequest` updated (removed `GapTrend`, added `Outcomes []SubTaskOutcome`, `ElapsedMs int64`).
+- `SubTaskOutcome` gains `ToolCalls []string` so GGS can derive `blocked_tools` for `break_symmetry`/`change_approach` directives.
+- R4b (`metaval`): tracks task start time, sends `ReplanRequest` to R7 (not R2), includes full outcomes + elapsed_ms. Removed `computeGapTrend()` and `prevFailedCounts`. `maxReplans` kept as safety net.
+- R2 (`planner`): subscribes to `MsgPlanDirective` instead of `MsgReplanRequest`. Merges GGS `blocked_tools` with memory-sourced MUST NOT constraints. New `replanWithDirective()` replaces old `replan()`.
+- Auditor: `allowedPaths` updated (R4b→R7 for ReplanRequest, R7→R2 for PlanDirective). Reads gradient from PlanDirective instead of `ReplanRequest.GapTrend`.
+- UI: R7 emoji (📈), `MsgPlanDirective` color/label/detail added.
+- `tasklog.Replan()` signature simplified (removed `gapTrend` param).
+- 36 new tests in `ggs_test.go` covering all loss/gradient computation functions.
+
+---
+
+
+## Issue #44 — GGS idle on happy path: medium loop open on task acceptance
+
+**Symptom**
+On successful task completion (all subtasks matched), GGS (R7) was completely bypassed. R4b published `MsgFinalResult` directly to the user and called `outputFn` itself. The pipeline showed no R7 activity on the happy path, violating the "medium loop is complete" invariant from the v0.7 spec.
+
+**Root cause**
+`metaval.go` accept case (verdict="accept") published `MsgFinalResult` to `RoleUser` and called `outputFn`. GGS only ran when R4b's hard gate triggered a `ReplanRequest` (i.e., only on failure). A proper closed-loop controller computes the error signal on every cycle including when the error is zero (D=0).
+
+**Fix**
+- New `types.MsgOutcomeSummary` + `types.OutcomeSummary` struct. R4b sends this to R7 instead of publishing FinalResult directly.
+- R4b accept case: writes episodic memory (unchanged), then publishes `MsgOutcomeSummary` to GGS. No longer calls `outputFn` or publishes `MsgFinalResult`. Also fixed missing cleanup of `taskStart` and `replanCounts` on accept.
+- GGS `Run()`: subscribes to both `MsgReplanRequest` (failure path) and `MsgOutcomeSummary` (accept path).
+- GGS `processAccept()`: computes D=0, P=0.5, Ω from elapsed time + prior replans, logs final L/∇L, emits `MsgFinalResult` + calls `outputFn`. GGS is the sole emitter of FinalResult for both accept and abandon — consistent exit path.
+- Auditor: `MsgOutcomeSummary → {R4b, R7}` added to allowedPaths.
+- UI: `MsgOutcomeSummary` shown in pipeline flow (R4b ──[OutcomeSummary]──► R7) with green colour.
+- 4 new tests for `processAccept` in `ggs_test.go`.
+
+---
+
+
+## Issue #45 — All roles shared one LLM model; reasoning roles outperformed by cheaper execution models
+
+**Symptom**
+Reasoning roles (R1/R2/R4b) and execution roles (R3/R4a) all used a single `OPENAI_MODEL`. On tasks requiring
+current knowledge (e.g. "today's top tech news"), R2 (planner) produced outdated results because the model
+lacked the capability for time-sensitive reasoning — yet the same model was used for tool invocation where
+capability matters less than speed and cost.
+
+**Root cause**
+`llm.New()` read a single `OPENAI_MODEL` env variable. All five LLM-backed roles received the same client
+instance. There was no mechanism to assign a smarter model to reasoning roles and a faster/cheaper model to
+execution roles.
+
+**Fix**
+- `llm.NewTier(prefix string)`: reads `{prefix}_API_KEY`, `{prefix}_BASE_URL`, `{prefix}_MODEL`;
+  falls back to `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` for any unset var.
+  `New()` is kept as a backward-compatible wrapper (`NewTier("")`).
+- `main.go`: replaced single `llmClient` with `brainClient = NewTier("BRAIN")` (R1/R2/R4b)
+  and `toolClient = NewTier("TOOL")` (R3/R4a).
+- `.env` two-section layout: `[brain-model]` uses `BRAIN_API_KEY` / `BRAIN_BASE_URL` / `BRAIN_MODEL`;
+  `[tool-model]` uses `TOOL_MODEL`; shared `OPENAI_*` vars as fallback.
+- `CLAUDE.md`: documented the model tier split.
+- 3 new tests in `client_test.go` covering `NewTier` expectations.
+
+---
+
+
+## Issue #46 — GGS timeBudgetMs too tight; tasks abandoned at 91% Ω due to LLM latency
+
+**Symptom**: Tasks that ultimately succeed are abandoned mid-run with "budget pressure=91%". The abandon was triggered by the time sub-component of Ω alone: at elapsed=211 s with one replan, `Ω = 0.6*(1/3) + 0.4*(211845/120000) = 0.906 ≥ 0.8`.
+
+**Root cause**: `timeBudgetMs = 120_000` (2 min) doesn't account for real-world LLM call latency. With kimi-k2.5 / deepseek taking 5–15 s per call, a single subtask (5–6 executor tool calls + agentval + metaval + one replan cycle) routinely takes 3–5 minutes. The gradient calculation is correct; the budget constant was calibrated for a local model.
+
+**Fix**: Raised `timeBudgetMs` from `120_000` to `300_000` (5 min) in `internal/roles/ggs/ggs.go`.
+
+---
+
+
+## Issue #47 — Abandon message shows only subtask ID, not failure reason
+
+**Symptom**: `❌ Task abandoned after 3 failed attempts. 1 subtask(s) failed: [a7b8c9d0-...]` — the user sees a UUID, not why it failed.
+
+**Root cause**: The hard-gate replan path in `metaval.go` built `gapSummary` as `"N subtask(s) failed: [<ids>]"` — the `SubTaskOutcome.FailureReason` field (populated by R4a) was never extracted. The abandon message therefore showed only the opaque subtask ID.
+
+**Fix**: At the hard-gate call site, iterate failed outcomes and join their `FailureReason` strings into `gapSummary`. Inside `triggerReplan`, do the same when composing the user-facing abandon message. Both GGS (via `ReplanRequest.GapSummary`) and the final displayed message now show the actual R4a failure reason.
+
+---
+
+
+## Issue #48 — R2 has no way to consult a stronger model for complex planning
+
+**Symptom**: Brain model (deepseek-v3.2) must plan blindly — it cannot inspect the codebase, verify tool availability, or ask Claude for architectural insight before decomposing a task.
+
+**Root cause**: R2's `dispatch()` made a single LLM call and parsed the result directly as a SubTask JSON array. No mechanism existed for the brain to call an external tool before finalising the plan.
+
+**Fix**: Added an optional `cc` (Claude Code CLI) tool loop to R2's `dispatch()`:
+- Brain LLM may output `{"action":"call_cc","prompt":"..."}` before the final SubTask array.
+- `runCC(ctx, prompt)` shells out to `cc --print <prompt>` (60 s timeout, 4000 char truncation).
+- R2 appends the response to the context and calls the brain LLM again for the final plan.
+- Hard-capped at `maxCCCalls=2` per planning session to prevent loops.
+- Direct `[...]` array output bypasses the tool loop entirely (backward compatible).
+- System prompt updated with `OPTIONAL TOOL — cc` section describing when and how to call it.
+- 5 new tests in `planner_test.go` covering cc detection, array bypass, and constant guards.
+
+---
+
+
+## Issue #49 — No UI visibility into whether R2 used cc or the brain model for planning
+
+**Symptom**: When R2 calls `cc`, the pipeline UI shows nothing — only the debug log reveals whether cc was consulted.
+
+**Root cause**: `MsgCCCall` / `MsgCCResponse` message types didn't exist. `runCC()` called the CLI and fed the result back silently with only `log.Printf`.
+
+**Fix**:
+- Added `MsgCCCall` and `MsgCCResponse` message types and `RoleCC = "cc"` role to `types.go`.
+- Added `CCCall` and `CCResponse` payload structs (task_id, call_n, max_n, prompt, chars, response preview).
+- `dispatch()` in `planner.go` now publishes `MsgCCCall` (R2 → cc) before `runCC()` and `MsgCCResponse` (cc → R2) after, carrying the 300-char response preview.
+- `display.go`: added `🤖` emoji for `RoleCC`; cyan color for both cc message types; spinner labels "🤖 consulting cc..." / "📐 planning with cc insight..."; detail lines show `call N/M: <prompt>` and `<chars> chars: <response preview>`.
+- `auditor.go`: added `MsgCCCall → {R2, cc}` and `MsgCCResponse → {cc, R2}` to `allowedPaths`.
+
+---
+
+
+## Issue #50 — R4a has no current date in context; cannot resolve relative dates
+
+**Symptom**: R4a fails criterion "at least one source is within the last 6 months" when search results show relative dates ("13 days ago", "5 months ago"), even though the dates clearly resolve to within 6 months.
+
+**Root cause**: No current date in R4a's context — it cannot resolve relative dates to absolute dates. The LLM either refuses to evaluate or defaults to a stale training date.
+
+**Fix**: Injected `Today's date: YYYY-MM-DD` into every R4a user prompt via `time.Now().UTC().Format("2006-01-02")`. This is a general mechanism — R4a already has the intelligence to resolve relative dates once it knows the current date; no domain-specific rules were added to the system prompt.
+
+---
+
+
+## Issue #51 — No UI visibility into whether R2 used brain model or cc for planning
+
+**Symptom**: `DispatchManifest` line in pipeline always reads "N subtasks" — no indication of whether R2 called cc or planned with the brain model directly.
+
+**Root cause**: `DispatchManifest` carried no `cc_calls` field; `display.go` had no logic to distinguish the two paths.
+
+**Fix**:
+- Added `CCCalls int` field to `types.DispatchManifest` (0 = brain only; >0 = cc consulted N times).
+- `emitSubTasks(spec, raw, ccCalls int)` now accepts and sets `CCCalls` in the manifest.
+- `display.go` DispatchManifest detail renders `"N subtasks | via brain"` or `"N subtasks | via cc (N call)"`.
+
+---
+
+
+## Issue #52 — No way to enforce cc as R2's brain model or switch at runtime
+
+**Symptom**: cc can only be an optional consultation tool called by the LLM brain; there is no way to make cc the primary planning engine, nor to switch between engines without restarting.
+
+**Root cause**: `Planner` struct had no `brainMode` concept — `dispatch()` always called `p.llm.Chat()`.
+
+**Fix**:
+- Added `brainMode string` + `sync.RWMutex` to `Planner`.
+- `New(... brainMode string)` — pass `"cc"` or `"llm"` (default); reads `R2_BRAIN` env var in `main.go`.
+- `SetBrainMode(mode string)` / `BrainMode() string` — thread-safe runtime switch.
+- `dispatch()` branches: `brainMode=="cc"` → `dispatchViaCCBrain()` (cc is primary, 120 s timeout); otherwise → `dispatchViaLLM()` (existing loop with optional cc consultation).
+- `DispatchManifest.PlannerBrain` field propagated to UI: "via brain", "via brain + cc (N)", or "via cc (brain)".
+- `/brain [cc|llm]` REPL command shows or switches the engine at runtime.
+
+---
+
+
+## Issue #53 — cc subprocess invocation fails inside a Claude Code session
+
+**Symptom**: `R2_BRAIN=cc` always errors with `[cc error: exit status 1]`; R2 cannot plan.
+
+**Root cause (two bugs)**:
+1. `CLAUDECODE` env var is set when agsh runs inside a Claude Code session; cc detects this and refuses to launch nested sessions.
+2. `cc` is a zsh alias (`https_proxy=… claude`), not a binary. `exec.Command("cc")` resolves to the system C compiler (`clang`), which rejects `--print` as an unknown flag.
+
+**Fix**:
+- `ccEnviron()` helper strips `CLAUDECODE` from the subprocess environment.
+- Both `runCC()` and `dispatchViaCCBrain()` now invoke `zsh -i -c 'cc --print "$AGSH_PROMPT"'` so shell aliases are loaded. Prompt is passed via `AGSH_PROMPT` env var to avoid shell injection.
+
+---
+
+
+## Issue #54 — R4a spuriously retries correct search results because ToolCalls snippet misses leading content
+
+**Symptom**: R4a returns `retry` for a correct, detailed search result (e.g. Trump China visit dates from Reuters/Al Jazeera). All criteria marked `met:false` with evidence "no extractable content about confirmed dates".
+
+**Root cause**: The ToolCalls snippet was built with `lastN(result, 120)` — the last 120 chars of search output. For web search results, the useful content (article titles, dates, snippets) appears at the **beginning** of the output; the tail is typically URL metadata or closing JSON. R4a only sees the tail and correctly concludes there is no evidence.
+
+**Fix**: Changed `lastN(result, 120)` to `firstN(result, 200)`. Nearly all tool outputs (search titles/snippets, file paths, shell results) put the relevant content at the **start**, not the end. `lastN` was only correct for ffmpeg-style commands with banners before results — and those are already handled by `headTail` in the executor's 4000-char context window. The ToolCalls evidence snippet only needs the leading content.
+
+---
+
+
+## Issue #55 — R1 owned success_criteria; mixed perception with planning
+
+**Symptom**
+R1 (Perceiver) wrote `success_criteria` in the `TaskSpec`. R2 (Planner) then wrote subtask-level criteria. This means the same semantic boundary ("what counts as success") was split across two roles with different vantage points — R1 doesn't know how R2 will decompose the task, so its criteria were often intent echoes rather than testable assertions against concrete tool output.
+
+**Root cause**
+Architectural: R1's mission is perception (translate raw input into structured intent). Criteria specification requires knowledge of the execution plan, which belongs to R2.
+
+**Fix**
+- R1 no longer outputs `success_criteria`. Its output format is reduced to `{task_id, intent, constraints, raw_input}`.
+- R2 now outputs a JSON wrapper `{"task_criteria":[...],"subtasks":[...]}` instead of a raw subtask array. `task_criteria` are assertions about the COMBINED output of ALL subtasks — same quality bar as subtask-level criteria (concrete, falsifiable).
+- `DispatchManifest` gains `TaskCriteria []string`; R2 sets it in `emitSubTasks` by parsing the wrapper.
+- `emitSubTasks` tries wrapper parse first; falls back to raw array for backward compatibility.
+- R4b's `evaluate()` now passes `manifest.TaskCriteria` to the LLM instead of `TaskSpec.SuccessCriteria`.
+- R4b system prompt updated: it evaluates `task_criteria` from R2, not subtask criteria from R4a.
+
+Files changed:
+- `internal/roles/perceiver/perceiver.go` — remove `success_criteria` from prompt + output format
+- `internal/roles/planner/planner.go` — wrapper output format; `emitSubTasks` parses wrapper; `TaskCriteria` set in manifest
+- `internal/roles/metaval/metaval.go` — system prompt + `evaluate()` user prompt use `task_criteria`
+- `internal/types/types.go` — `DispatchManifest.TaskCriteria []string` field added
+
+---
+
+
+## Issue #56 — Gradient direction invisible in pipeline display
+
+**Symptom**
+The `PlanDirective` pipeline line showed `directive | ∇L=gradient Ω=N%` — the gradient label was present but the direction was not visually distinct from surrounding text. Users familiar with the GGS design could not see at a glance whether the solver was converging.
+
+**Root cause**
+`msgDetail` for `MsgPlanDirective` used a plain string with no directional symbol or color differentiation.
+
+**Fix**
+Updated `msgDetail` in `display.go` to prepend a colored directional arrow before the gradient label:
+- `↑` green — improving (loss decreasing)
+- `↓` red — worsening (loss increasing)
+- `⊥` yellow — plateau (stuck in local minimum)
+- `→` no color — stable
+
+After the colored arrow, `ansiReset + ansiYellow` restores the message-type color so the rest of the label renders correctly within the bracket.
+
+Files changed:
+- `internal/ui/display.go` — `MsgPlanDirective` case in `msgDetail`
+
+---
+
+
+## Issue #57 — R1 and R2 resolve relative dates incorrectly without knowing current date
+
+**Symptom**
+Input: `今年春节期间重要的科技新闻` ("important tech news during this year's Spring Festival").
+Today is 2026-02-22. R1 resolved "今年春节" as "2025年春节期间（1月28日-2月4日）" — wrong year (2025 vs 2026), same root cause as issue #50 but in R1 instead of R4a.
+
+**Root cause**
+R1 and R2 had no `Today's date` injection. Without knowing the current date, temporal references like "今年" (this year), "最近" (recently), "上周" (last week) are resolved from training data, which may lag by months or years.
+
+**Fix**
+Two-part fix that respects the R1/R2 role boundary:
+
+- **R1**: add a "temporal reference rule" to the system prompt — R1 must NOT resolve relative time words (今年/this year, 最近/recently, 上周/last week, etc.) into specific dates. Preserve them verbatim in `intent`. This is architecturally correct: R1 is a receiver, not a resolver; R2 owns temporal interpretation.
+
+- **R2**: inject `Today's date: YYYY-MM-DD` into the user prompt in `plan()` and `replanWithDirective()`. R2 needs the concrete date to write falsifiable `task_criteria` (e.g. "output contains news from Spring Festival 2026, Jan 28–Feb 4"). This is the same mechanism as R4a (issue #50) and is general, not badcase-specific.
+
+Files changed:
+- `internal/roles/perceiver/perceiver.go` — temporal reference rule added to system prompt; date injection removed
+- `internal/roles/planner/planner.go` — `Today's date` prepended in `plan()` and `replanWithDirective()`
+
+---
+
+
+## Issue #58 — R3 LLM brain loops on identical tool call when DuckDuckGo returns no results
+
+**Symptom**
+R3 called `search("Google Spring Festival 2026 announcement")` 10 times in a row with identical parameters, producing identical empty/error results each iteration. Budget was exhausted without progress; task abandoned with D=1.000, Ω=0.864.
+
+**Root cause**
+When a tool call returns no usable results (DDG connection reset, empty response), the LLM re-plans with the same call because nothing in its context indicates the call was already tried. There is no guard against consecutive identical calls.
+
+**Fix**
+Added loop detection in `executor.go` `Run()` method. Before executing each tool call, compute `currentSig = tool + ":" + firstN(params, 60)`. If `currentSig` matches the immediately preceding call signature, block execution and inject a `⚠️ DUPLICATE CALL BLOCKED` warning into `toolResultsCtx`. The warning explicitly instructs the LLM to either emit a final result from existing data or try a completely different approach. The blocked call is not appended to `ToolCalls` (no evidence fabricated).
+
+Files changed:
+- `internal/roles/executor/executor.go` — consecutive duplicate call detection and blocking
+
+---
+
+
+## Issue #59 — DDG search routed through CC internal proxy (port 26560), connection fails
+
+**Symptom**
+`search` tool always errors: `websearch: http request: Post "https://html.duckduckgo.com/html/": read tcp ...:55573->...:26560: connection reset by peer`. Port 26560 is Claude Code's internal proxy.
+
+**Root cause**
+`websearch.go` used `http.DefaultClient`, which inherits `HTTPS_PROXY` from the process environment. When `agsh` runs inside a Claude Code session, CC injects its own proxy into the environment. DDG must be reached directly; CC's proxy does not forward external traffic.
+
+**Fix**
+Replace `http.DefaultClient` with a package-level `ddgClient` that sets `Transport.Proxy` to a no-op function (`func(*http.Request) (*url.URL, error) { return nil, nil }`). This bypasses all proxy env vars for DDG requests only; the LLM client (which legitimately needs the proxy to reach the API) is unaffected.
+
+Files changed:
+- `internal/tools/websearch.go` — dedicated `ddgClient` with proxy disabled
+
+---
+
+
+## Issue #60 — cc-as-brain removed; LLM restored as sole R2 brain
+
+**Symptom**: cc-brain mode (`R2_BRAIN=cc`) failed in two ways: (1) `cc --print` rejected inside Claude Code sessions due to the `CLAUDECODE` env var; (2) even after stripping that var, cc prepended reasoning prose before the JSON, defeating the `StripFences`-then-parse pipeline.
+
+**Root cause**: cc is a conversational assistant that cannot reliably be constrained to pure JSON output when called as a subprocess. The `cc` alias also cannot be invoked via `exec.Command` (it is a shell alias, not a binary).
+
+**Fix**: Removed all cc-related code entirely — `ccEnviron`, `runCC`, `dispatchViaCCBrain`, `SetBrainMode`, `BrainMode`, `brainMode` field, `mu` mutex, `maxCCCalls` constant, `MsgCCCall`/`MsgCCResponse` message types, `CCCall`/`CCResponse` payload structs, `RoleCC`, `PlannerBrain`/`CCCalls` manifest fields, `/brain` REPL command, cc sections in `display.go` and `auditor.go`. `dispatch()` is a single plain LLM call again.
+
+---
+
+
+## Issue #61 — Reasoning model `<think>` blocks cause JSON parse failure in Executor
+
+**Symptom**: Task abandoned with "Infrastructure/executor error: LLM output contained malformed JSON with stray `</think>` token between tool calls." R4a classifies this as an infrastructure error and marks the subtask failed immediately — no retry is attempted.
+
+**Root cause**: Reasoning models (e.g. `deepseek-reasoner`) emit `<think>...</think>` blocks in raw response content before (or occasionally between) JSON objects. `StripFences` only removes ` ``` ` code fences; `<think>` tags passed through to `json.Unmarshal`, which fails with `invalid character '<'`. The error propagated from `execute()` → `RunSubTask()` → R4a as a synthetic failed `ExecutionResult` whose output is the raw error string.
+
+**Fix**: Added `StripThinkBlocks(s string) string` to `internal/llm/client.go`. Iteratively removes all `<think>...</think>` blocks; truncates at an unclosed `<think>` tag. `StripFences` now calls `StripThinkBlocks` as its first step, so all callers (executor, planner, perceiver, agentval) are protected automatically. 4 new tests in `client_test.go`.
+
+---
+
+
+## Issue #62 — Trajectory checkpoints missing from pipeline display
+
+**Symptom**: The pipeline flow lines for `SubTaskOutcome`, `ReplanRequest`, and `FinalResult` showed only minimal detail. `SubTaskOutcome` failed only showed the unmet criterion (no R4a score). `ReplanRequest` showed only the gap summary (no "N/M failed" count). `FinalResult` had no flow line at all — only the `endTask` footer appeared. GGS integration path (R4b → R7 → R2) had no bus-level tests.
+
+**Root cause**: (1) `SubTaskOutcome` detail didn't include `GapTrajectoryPoint.Score`. (2) `ReplanRequest` detail didn't compute failed/total from `Outcomes`. (3) `printFlow` skipped `FinalResult` entirely (comment said "surfaced via endTask"). (4) `FinalResult` type had no loss fields — GGS computed D/P/Ω/∇L but discarded them after logging. (5) No integration tests verified the R4b→R7→R2 bus flow.
+
+**Fix**:
+- `types.go`: Added `Loss LossBreakdown`, `GradL float64`, `Replans int` to `FinalResult`.
+- `ggs.go`: Set `Loss`, `GradL`, `Replans` on `FinalResult` in both `processAccept` and the abandon path of `process()`.
+- `display.go msgDetail`: `SubTaskOutcome` failed → `"failed | score=X.XX | unmet: criterion"`; `ReplanRequest` → `"N/M failed | gap_summary"`; new `FinalResult` case → `"D=X.XX ∇L=±X.XX Ω=X%"` (+ `| N replan(s)` when replans > 0).
+- `display.go printFlow`: Removed early return for `MsgFinalResult` so the trajectory checkpoint is always shown.
+- `display.go Run`: Detects abandon (Loss.D > 0) to pass `success=false` to `endTask`.
+- `display.go dynamicStatus`: Added `MsgReplanRequest` case → `"📊 N/M subtasks failed — computing gradient..."`.
+- `display_test.go`: Updated `TestMsgDetail_SubTaskOutcome_FailedWithUnmetCriteria`; added 5 new tests.
+- `ggs_integration_test.go`: 5 bus-level integration tests (change_path, break_symmetry, refine/improving, abandon→FinalResult, accept→FinalResult with D=0).
+
+---
+
+
+## Issue #63 — Spec-vs-code gaps: criterion-level D/P, structured failure_class, GGS thrashing detection
+
+**Symptom**: GGS computes D at subtask granularity (failed subtasks / total subtasks) and P via keyword heuristics on `FailureReason` strings. Spec defines criterion-level D (`failed_criteria / total_criteria`) and structured `failure_class`-based P. R4a had no `failure_class` field in its criterion output, so GGS had no structured signal. Auditor lacked GGS thrashing detection (consecutive `break_symmetry` without D decreasing). Abandon-path summary was a single inline format string with no enumeration of completed/failed intents.
+
+**Root cause**: `CriteriaVerdict` type was absent from `types.go`; `SubTaskOutcome` had no `CriteriaVerdicts` field; `GapTrajectoryPoint` had no `FailureClass`; `CorrectionSignal` had no `FailedCriterion`/`FailureClass`. R4a prompt did not instruct the LLM to classify `failure_class`. `computeD` counted subtasks, not criteria. `computeP` had no structured path, only keywords. Auditor had no `breakSymCount`/`lastBreakSymD` state.
+
+**Fix**:
+- `types.go`: Added `CriteriaVerdict` struct; added `CriteriaVerdicts []CriteriaVerdict` to `SubTaskOutcome`; added `FailureClass` to `GapTrajectoryPoint`; added `FailedCriterion` and `FailureClass` to `CorrectionSignal`.
+- `agentval.go`: Added `FailureClass` to `criterionResult`; updated system prompt to request `failure_class` on failed criteria; added `aggregateFailureClass` and `toCriteriaVerdicts` helpers; trajectory building now sets `GapTrajectoryPoint.FailureClass`; `outcome()` now accepts and forwards `criteriaVerdicts`; `CorrectionSignal` building now populates `FailedCriterion`/`FailureClass`.
+- `ggs.go`: `computeD` rewritten to use `CriteriaVerdicts` when present (criterion-level), with subtask-level fallback; old `computeP` renamed to `computePKeyword`; new `computeP` uses structured `FailureClass` from `CriteriaVerdicts`, falls back to `computePKeyword`; added `buildAbandonSummary` enumerating completed/failed intents; abandon path uses `buildAbandonSummary` instead of inline string.
+- `auditor.go`: Added `breakSymCount`/`lastBreakSymD` maps; GGS thrashing detection block in `MsgPlanDirective` handler — fires `ggs_thrashing` anomaly after 2+ consecutive `break_symmetry` without D decreasing; resets counter on non-`break_symmetry` directive.
+- `agentval_test.go` (new): Tests for `aggregateFailureClass` (5 cases) and `toCriteriaVerdicts` (6 cases).
+- `ggs_test.go`: Added `TestComputeD_CriterionLevelHigherThanSubtaskLevel`, `TestComputeD_FallsBackToSubtaskLevelWhenNoCriteriaVerdicts`, `TestComputeP_AllLogicalCriteriaReturnsOne`, `TestComputeP_AllEnvironmentalCriteriaReturnsZero`, `TestComputeP_FallsBackToKeywordWhenNoStructuredClass`.
+- `auditor_test.go` (new): `TestDetectGGSThrashing_FiredAfterTwoConsecutiveWithNoDDecrease`, `TestDetectGGSThrashing_NotFiredWhenDDecreases`, `TestDetectGGSThrashing_ResetOnNonBreakSymmetryDirective`.
+
+---
+
+
+## Issue #64 — Laws 1, 2, 3 from ARCHITECTURE.md not implemented
+
+**Symptom**: Laws 1, 2, 3 from ARCHITECTURE.md marked "not yet implemented". Executor would execute destructive shell commands (rm -rf, mkfs, etc.) and overwrite existing files without any gate. GGS had no kill-switch for consecutive worsening replans. Procedural `MemoryEntry` had no `failure_class` field — future tasks could not filter memory by failure type.
+
+**Root cause**: No irreversible-action gate in executor; no consecutive-worsening kill-switch in GGS; procedural `MemoryEntry` derived `failure_class` from free-text `gap_summary` keywords instead of structured `CriteriaVerdicts`.
+
+**Fix**:
+- Law 1 — `isIrreversibleShell` + `isIrreversibleWriteFile` in `executor.go:runTool`; both return a `[LAW1]` prefixed string on block (no error, treated as a tool result); R4a prompt adds "Law 1 safety rule" — `[LAW1]` output → immediate `failed` verdict with `failure_class=environmental`.
+- Law 2 — `worseningCount map[string]int` added to GGS struct; `process()` increments count on `worsening` gradient and resets on non-worsening; after 2 consecutive worsening gradients the directive is overridden to `abandon` with a `[R7] LAW2 KILL-SWITCH` log line; `worseningCount` cleaned up on both abandon and accept exit paths.
+- Law 3 — `aggregateFailureClassFromOutcomes` helper in `metaval.go` counts `fail`-verdict `CriteriaVerdicts` across failed outcomes; `failureLesson` struct gains `FailureClass` field; procedural `MemoryEntry` carries structured `failure_class` and a `failure_class:<value>` tag for R2 memory queries.
+
+---
+
+
+## Issue #65 — Law 1 bypass: model uses `find -delete` after `rm` is blocked
+
+**Symptom**: Manual test of "delete all .log files in /tmp" showed that after `rm -v /tmp/*.log` was blocked by Law 1 (correct), the planner replanned and the model issued `find /tmp -maxdepth 1 ... -delete`, which bypassed the Law 1 gate and deleted files.
+
+**Root cause**: `isIrreversibleShell` only checked prefix patterns (`rm `, `rmdir`, etc.). `find ... -delete` and `find ... -exec rm` are equally destructive but start with `find `, which is otherwise read-only.
+
+**Fix**: Added two additional checks in `isIrreversibleShell` for `find` commands: (1) contains ` -delete` → blocked; (2) contains `-exec rm` or `-exec /bin/rm` → blocked. Added three tests: `ReturnsTrueForFindDelete`, `ReturnsTrueForFindExecRm`, `ReturnsFalseForFindWithoutDelete`.
+
+---
+
+
+## Issue #66 — Law 1 bypass: `rm` embedded in for-loop body not detected
+
+**Symptom**: Second manual test of "delete all .log files in /tmp" showed that after both `rm -v` and `find -delete` were blocked (correct), the planner replanned and the model issued `for file in ...; do if [ -f "$file" ]; then rm "$file"; fi; done` — a for-loop with `rm` in the `then` branch. The loop body starts with `if`, not `rm`, so `isIrreversibleShell` did not detect it.
+
+**Root cause**: `isIrreversibleShell` checked only the full command string against prefix patterns. Compound commands produced by loops (`for`/`while`), conditionals (`if/then/else`), and pipelines (`| xargs rm`) embed the destructive sub-command after separators (`;`, `&&`, `|`) and shell keywords (`then`, `do`), making it invisible to prefix matching.
+
+**Fix**: Refactored `isIrreversibleShell` into two helpers: `splitShellFragments` splits the command on `&&`, `||`, `;`, `|`, and `\n`, then strips leading shell keywords (`then`, `do`, `else`, `{`, `(`); `isIrreversibleFragment` applies the prefix/pattern checks to a single normalized fragment. `isIrreversibleShell` now iterates all fragments and returns true on the first destructive one. Also added `xargs rm` and `xargs /bin/rm` as prefix patterns to catch `find ... | xargs rm` pipes. Tests added: `ReturnsTrueForForLoopWithRm`, `ReturnsTrueForAndAndRm`, `ReturnsTrueForXargsRm`, `ReturnsFalseForReadOnlyPipeline`, and six `splitShellFragments` unit tests.
+
+---
+
+
+## Issue #67 — Safety-net abandon emits FinalResult with D=0.0; UI shows green (false success)
+
+**Symptom**: After the Law 1 gate forced the agent to exhaust its replan budget, the
+pipeline display rendered the final FinalResult line in green (`D=0.00`) instead of red,
+because the `endTask(success=false)` rule triggers on `FinalResult.Loss.D > 0`.
+
+**Root cause**: The metaval safety-net abandon path (triggered after `maxReplans=3` rounds
+in `triggerReplan`) published `FinalResult` with a zero-value `Loss` struct, leaving
+`Loss.D = 0.0`. GGS is bypassed on this path so it never computed D from the outcomes.
+
+**Fix**: Added `safetyNetLoss(outcomes []types.SubTaskOutcome) types.LossBreakdown` helper
+that computes D as `failed / total`; falls back to D=1.0 when outcomes is empty or all
+matched (the invariant is that if the safety net fired, the task failed). The safety-net
+`FinalResult` now carries `Loss: safetyNetLoss(outcomes)` and `Replans: replanCount` so the
+UI abort-detection rule (`D > 0`) fires correctly and the replan count appears in the flow
+line. Five tests added for `safetyNetLoss`.
+
+---
+
+
+## Issue #68 — Batch B: Law 0 misattribution, Law 2 prompt gap, Law 3 context cap
+
+**Symptom**:
+- **B1 (Law 0)**: R4a LLM misattributes failure_class (e.g., calls "permission denied" logical); deterministic environmental patterns were left to LLM discretion.
+- **B2 (Law 2)**: `planDirectivePrompt` described directive labels but never told R2 what `failure_class` means for replanning strategy; R2 often repeated the same approach even when signalled "environmental".
+- **B3 (Law 3)**: `toolResultsCtx` accumulated unbounded across up to 10 tool calls (up to 40 KB); only per-result truncation existed; the total context injected into each LLM turn was uncapped.
+
+**Root cause**: Three spec items that were marked "pending implementation" in ARCHITECTURE.md.
+
+**Fix**:
+- **B1** (`internal/roles/agentval/agentval.go`): added `classifyEnvironmental(evidence, toolCalls)` using compiled case-insensitive regex against: `permission denied`, `no such file`, `not found`, `not exist`, `connection refused`, `timeout`, `network error`, `command not found`, `executable file not found`, `[LAW1]`. After LLM verdict is parsed, post-processes each failed `criterionResult`: promotes to `"environmental"` if pattern matches; never demotes existing `"environmental"`. (+5 tests)
+- **B2** (`internal/roles/planner/planner.go`): appended failure_class guidance block to `planDirectivePrompt` explaining that `"environmental"` → change path/parameters, `"logical"` → change tool class/method, `"mixed"` → fix environmental blockers first.
+- **B3** (`internal/roles/executor/executor.go`): applied `headTail(toolResultsCtx.String(), 8000)` before appending accumulated context to prompt; keeps first ~2667 chars and last ~5333 chars. (+2 headTail tests)
+
+Files changed:
+- `internal/roles/agentval/agentval.go` (+5 tests in `agentval_test.go`)
+- `internal/roles/planner/planner.go`
+- `internal/roles/executor/executor.go` (+2 tests in `executor_test.go`)
+
+---
+
+
+## Issue #69 — No per-role LLM cost/time reporting after task completion
+
+**Symptom**: After each task the user had no visibility into how many tokens each role consumed or how long each LLM call took. The task log captured per-call token counts but the data was never surfaced to the terminal.
+
+**Root cause**:
+1. `llm.Usage` had no `ElapsedMs` field; HTTP round-trip time was measured but discarded.
+2. `tasklog.LLMCall` accumulated tokens globally but had no per-role breakdown.
+3. `tasklog.Registry.Close` discarded role stats on close.
+4. `perceiver.Process` ignored the `llm.Usage` returned by `Chat`; no way for `main.go` to track perceiver cost.
+
+**Fix**:
+- `internal/llm/client.go`: added `ElapsedMs int64` to `Usage`; timer wraps `httpClient.Do` + `io.ReadAll`.
+- `internal/tasklog/tasklog.go`: added `RoleStat` (exported) + `roleStat` accumulator inside `TaskLog`; `LLMCall` signature gains `elapsedMs int64` (before `iterIndex`); new `RoleStats() []RoleStat` sorted by canonical order; `Registry` gains `cache map[string][]RoleStat`; `Close` saves stats to cache; new `GetStats(taskID)` returns and deletes cache entry.
+- `internal/roles/perceiver/perceiver.go`: `Process` now returns `(string, llm.Usage, error)`; `perceive` returns `llm.Usage`; usage accumulated across clarification rounds.
+- `internal/roles/planner/planner.go`, `executor/executor.go`, `agentval/agentval.go`, `metaval/metaval.go`: pass `usage.ElapsedMs` to `LLMCall`.
+- `cmd/agsh/main.go`: capture `perceiverUsage` from `p.Process()`; new `printCostStats(perceiverUsage, roleStats)` prints a `📊 Cost` table with per-role call count, token count, and LLM time; called after `printResult` in both one-shot and REPL modes.
+
+Files changed:
+- `internal/llm/client.go`
+- `internal/tasklog/tasklog.go` (+6 new tests in `tasklog_test.go`)
+- `internal/roles/perceiver/perceiver.go`
+- `internal/roles/planner/planner.go`
+- `internal/roles/executor/executor.go`
+- `internal/roles/agentval/agentval.go`
+- `internal/roles/metaval/metaval.go`
+- `cmd/agsh/main.go`
+
+---
+
+
+## Issue #70 — Agent-generated files land in project root, polluting VCS
+
+**Symptom**: Files created by the agent as task output (Python scripts, Markdown reports,
+generated data) were written relative to CWD (the project root), appearing as untracked
+VCS noise and requiring manual cleanup.
+
+**Root cause**: `write_file` resolved relative paths against the process working directory.
+No designated output directory existed; the executor prompt gave no guidance on where
+to place generated files.
+
+**Fix**:
+- `internal/tools/workspace.go` (new): `WorkspaceDir()` returns `$AGSH_WORKSPACE` or
+  `~/agsh_workspace`; `ExpandHome()` expands `~/`; `ResolveOutputPath()` redirects bare
+  filenames (no directory component) and `./`-prefixed paths to the workspace; `EnsureWorkspace()`
+  creates the directory.
+- `internal/roles/executor/executor.go`: in `write_file` handler, expand `~` then call
+  `ResolveOutputPath`; logs redirect. Executor system prompt updated: output files MUST
+  use `~/agsh_workspace/` as base.
+- `cmd/agsh/main.go`: calls `tools.EnsureWorkspace()` at startup.
+- `CLAUDE.md`: updated `write_file` tool table row.
+
+Files changed:
+- `internal/tools/workspace.go` (new, +8 tests in `workspace_test.go`)
+- `internal/roles/executor/executor.go`
+- `cmd/agsh/main.go`
+- `CLAUDE.md`
+
+---
+
+
+## Issue #71 — REPL: CJK fullwidth punctuation causes line repetition; no multi-line input
+
+**Symptom**:
+1. Pasting Chinese text containing fullwidth punctuation (，。：！？【】 etc.) caused the
+   same line to be repeated many times in the readline display — stale previous renders
+   were not properly erased.
+2. Pasting a multi-paragraph block was impossible: each embedded newline submitted the
+   current buffer as a separate (incomplete) task, fragmenting the input.
+
+**Root cause**:
+1. `readline_compat/runes.go` `Width()` only counted characters in `unicode.Han`,
+   `unicode.Hangul`, `unicode.Hiragana`, `unicode.Katakana` as double-wide. Fullwidth
+   forms (U+FF01-U+FF60, e.g. ，。：) and other East Asian wide characters outside
+   those tables were counted as width 1. The resulting undercount of visual columns made
+   `idxLine` return too-small a value, so `cleanOutput` went up too few terminal lines on
+   each `Refresh`, leaving stale rendered text visible.
+2. No multi-line input path existed; readline submitted on every `\n`.
+
+**Fix**:
+- `internal/readline_compat/runes.go`: Added `wideExtra` `*unicode.RangeTable` covering
+  U+1100-U+115F (Hangul Jamo), U+2E80-U+303E (CJK Radicals + Symbols & Punct — includes
+  、。〈〉《》【】), U+FE10-U+FE19 (Vertical Forms), U+FE30-U+FE6B (CJK Compat Forms),
+  U+FF01-U+FF60 (Fullwidth Forms ，。：！？), U+FFE0-U+FFE6 (Fullwidth Signs). Added
+  `wideExtra` to `doubleWidth` slice so `Width()` returns 2 for all East Asian wide chars.
+- `cmd/agsh/main.go`: Multi-line input via `"""` sentinel — typing `"""` alone enters
+  accumulation mode (prompt changes to `... `); subsequent lines are collected; closing
+  `"""` joins them with `\n` and submits as a single task; Ctrl+C cancels accumulation.
+
+Files changed:
+- `internal/readline_compat/runes.go` (5 new expectations + `wideExtra` table)
+- `internal/readline_compat/runebuf_cjk_test.go` (+5 tests for fullwidth chars)
+- `cmd/agsh/main.go` (multi-line `"""` sentinel in `runREPL`)
+
+---
+
 
 ## Issue #72 — Three cost-tracking gaps: tool timing, task_end stats, episodic cost
 
@@ -1832,6 +1904,7 @@ Files changed:
 - `internal/tasklog/tasklog_test.go`
 
 ---
+
 
 ## Issue #73 — GGS has no mechanism to pass failed targets to R2 for environmental failures
 
@@ -1879,6 +1952,7 @@ Files changed:
 
 ---
 
+
 ## Issue #74 — Memory constraint content truncated at 180 chars, hiding key lessons from R2
 
 **Symptom**
@@ -1901,6 +1975,63 @@ Files changed:
 - `internal/roles/planner/planner_test.go`
 
 ---
+
+
+## Issue #75 — Result section shows no context about what was asked
+
+**Symptom**
+The `📋 Result` section displayed the answer with no reminder of the original question.
+In REPL sessions with multiple tasks, it was easy to lose track of which answer
+corresponded to which input, especially after a long pipeline run.
+
+**Root cause**
+`printResult()` in `cmd/agsh/main.go` printed only the result header and output.
+The original user input was available at both call sites but never passed or displayed.
+
+**Fix**
+Added a dim `  › <question>` line immediately below `📋 Result`:
+- `ClipQuestion(s string) string` added to `internal/ui/display.go`: takes only the
+  first line of multi-line input, truncates at the first sentence-ending punctuation
+  (`.?!。？！`) found after rune 15 (to skip abbreviations like "e.g."), falls back
+  to a hard clip at 80 runes with "…".
+- `printResult()` signature changed to `printResult(result types.FinalResult, rawInput string)`;
+  both call sites in `runTask()` and `runREPL()` updated to pass `input`.
+- 4 new tests in `internal/ui/display_test.go`:
+  `ShortInputUnchanged`, `MultilineUsesFirstLine`, `TruncatesAtSentenceEnd`,
+  `FallsBackToHardClipAt80Runes`.
+
+Files changed:
+- `internal/ui/display.go`
+- `internal/ui/display_test.go`
+- `cmd/agsh/main.go`
+
+
+## Issue #76 — No warning when .env is missing or API credentials are unset
+
+**Symptom**
+Running `artoo` without a `.env` file (or with empty `OPENAI_*` vars) silently started
+the REPL. The first task then failed with a cryptic HTTP connection error
+(`dial tcp [::1]:...: connect: connection refused`) that gave no hint about the
+missing configuration.
+
+**Root cause**
+`llm.NewTier()` created a `Client` with empty `baseURL` / `apiKey` / `model` without
+any validation. `main()` did not check whether the clients were usable before starting
+the bus, roles, and REPL.
+
+**Fix**
+- Added `Validate()` to `llm.Client` with 6 Expectations and 6 matching tests.
+  Returns a descriptive error listing which fields (base URL, API key, model) are missing,
+  including the tier label.
+- `main()` calls `toolClient.Validate()` immediately after creating the LLM clients.
+  If validation fails, prints a red error with guidance to copy `.env.example` and exits.
+  `brainClient.Validate()` failure prints a yellow warning (BRAIN falls back to OPENAI_*).
+
+Files changed:
+- `internal/llm/client.go`
+- `internal/llm/client_test.go`
+- `cmd/artoo/main.go`
+
 
 ## Issue #77 — Search tool requires LANGSEARCH_API_KEY; unusable without paid API
 
@@ -1931,57 +2062,3 @@ Files changed:
 - `.env.example`
 - `CLAUDE.md`
 - `README.md`
-
-## Issue #76 — No warning when .env is missing or API credentials are unset
-
-**Symptom**
-Running `artoo` without a `.env` file (or with empty `OPENAI_*` vars) silently started
-the REPL. The first task then failed with a cryptic HTTP connection error
-(`dial tcp [::1]:...: connect: connection refused`) that gave no hint about the
-missing configuration.
-
-**Root cause**
-`llm.NewTier()` created a `Client` with empty `baseURL` / `apiKey` / `model` without
-any validation. `main()` did not check whether the clients were usable before starting
-the bus, roles, and REPL.
-
-**Fix**
-- Added `Validate()` to `llm.Client` with 6 Expectations and 6 matching tests.
-  Returns a descriptive error listing which fields (base URL, API key, model) are missing,
-  including the tier label.
-- `main()` calls `toolClient.Validate()` immediately after creating the LLM clients.
-  If validation fails, prints a red error with guidance to copy `.env.example` and exits.
-  `brainClient.Validate()` failure prints a yellow warning (BRAIN falls back to OPENAI_*).
-
-Files changed:
-- `internal/llm/client.go`
-- `internal/llm/client_test.go`
-- `cmd/artoo/main.go`
-
-## Issue #75 — Result section shows no context about what was asked
-
-**Symptom**
-The `📋 Result` section displayed the answer with no reminder of the original question.
-In REPL sessions with multiple tasks, it was easy to lose track of which answer
-corresponded to which input, especially after a long pipeline run.
-
-**Root cause**
-`printResult()` in `cmd/agsh/main.go` printed only the result header and output.
-The original user input was available at both call sites but never passed or displayed.
-
-**Fix**
-Added a dim `  › <question>` line immediately below `📋 Result`:
-- `ClipQuestion(s string) string` added to `internal/ui/display.go`: takes only the
-  first line of multi-line input, truncates at the first sentence-ending punctuation
-  (`.?!。？！`) found after rune 15 (to skip abbreviations like "e.g."), falls back
-  to a hard clip at 80 runes with "…".
-- `printResult()` signature changed to `printResult(result types.FinalResult, rawInput string)`;
-  both call sites in `runTask()` and `runREPL()` updated to pass `input`.
-- 4 new tests in `internal/ui/display_test.go`:
-  `ShortInputUnchanged`, `MultilineUsesFirstLine`, `TruncatesAtSentenceEnd`,
-  `FallsBackToHardClipAt80Runes`.
-
-Files changed:
-- `internal/ui/display.go`
-- `internal/ui/display_test.go`
-- `cmd/agsh/main.go`
