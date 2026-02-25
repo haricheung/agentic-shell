@@ -521,6 +521,32 @@ C/T-level entries have k=0.0 (timeless until Trust Bankruptcy).
 
 ### 6d. Dual-Channel Convolution Potentials
 
+**Flow: same Megram set, two independent convolution channels**
+
+```
+  Megrams tagged (space, entity)
+  ┌──────────────────────────────────────────────────────┐
+  │  ⟨f₁, σ₁, k₁, Δt₁⟩   ⟨f₂, σ₂, k₂, Δt₂⟩   …     │
+  └────────────────┬──────────────────┬─────────────────┘
+                   │                  │
+                   ▼                  ▼
+         Channel A                  Channel B
+         Attention                  Decision
+  ───────────────────────    ────────────────────────────
+  Σ |fᵢ| · e^(−kᵢ · Δt)    Σ σᵢ · fᵢ · e^(−kᵢ · Δt)
+  unsigned energy            signed preference (±)
+                   │                  │
+                   ▼                  ▼
+             M_attention          M_decision
+             "relevant?"          "good or bad?"
+                   │                  │
+                   └────────┬─────────┘
+                            ▼
+                      Action Decision
+```
+
+**Formulas** (Δt in days):
+
 ```
 M_attention(space, entity) = Σ |f_i| · exp(−k_i · Δt_days)
 M_decision(space, entity)  = Σ  σ_i · f_i · exp(−k_i · Δt_days)
@@ -534,6 +560,23 @@ Derived action:
 | M_att ≥ 0.5 AND M_dec > 0.2 | Exploit |
 | M_att ≥ 0.5 AND M_dec < -0.2 | Avoid |
 | M_att ≥ 0.5 AND \|M_dec\| ≤ 0.2 | Caution |
+
+**Action decision plane** (essence of the dual-channel convolution):
+
+```
+  M_decision
+      ▲
+ +1.0 ┤           │
+      │           │   EXPLOIT    ← SHOULD PREFER this approach
+ +0.2 ┤  IGNORE   ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+      │           │   CAUTION    ← confirm / sandbox
+ -0.2 ┤           ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+      │           │   AVOID      ← MUST NOT use
+ -1.0 ┤           │
+      └───────────┼──────────────────────────────────► M_attention
+                 0.5
+          not salient          salient (on the system's radar)
+```
 
 ### 6e. Dreamer — Offline Consolidation Engine
 
