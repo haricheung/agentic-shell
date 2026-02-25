@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -454,6 +455,378 @@ func TestRecordNegativeFeedback_CancelsPositivePotential(t *testing.T) {
 	pots2, _ := s.QueryMK(context.Background(), "intent:good_sop", "env:local")
 	if math.Abs(pots2.Decision) > 0.01 {
 		t.Errorf("expected near-zero decision after negative feedback, got %.3f", pots2.Decision)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// QuantizationMatrix tests
+// ---------------------------------------------------------------------------
+
+func TestQuantizationMatrix_AllSevenStates(t *testing.T) {
+	// Returns entries for all 7 GGS macro-states
+	qm := QuantizationMatrix()
+	for _, state := range []string{"abandon", "accept", "change_approach", "success", "break_symmetry", "change_path", "refine"} {
+		if _, ok := qm[state]; !ok {
+			t.Errorf("QuantizationMatrix missing state %q", state)
+		}
+	}
+}
+
+func TestQuantizationMatrix_AbandonValues(t *testing.T) {
+	// abandon: f=0.95, sigma=-1.0, k=0.05 (PTSD trauma — highest stimulus, hard constraint)
+	qm := QuantizationMatrix()
+	ab := qm["abandon"]
+	if math.Abs(ab.F-0.95) > 1e-9 {
+		t.Errorf("abandon.F: expected 0.95, got %.3f", ab.F)
+	}
+	if math.Abs(ab.Sigma-(-1.0)) > 1e-9 {
+		t.Errorf("abandon.Sigma: expected -1.0, got %.3f", ab.Sigma)
+	}
+	if math.Abs(ab.K-0.05) > 1e-9 {
+		t.Errorf("abandon.K: expected 0.05, got %.3f", ab.K)
+	}
+}
+
+func TestQuantizationMatrix_AcceptValues(t *testing.T) {
+	// accept: f=0.90, sigma=+1.0, k=0.05 (flawless golden path)
+	qm := QuantizationMatrix()
+	ac := qm["accept"]
+	if math.Abs(ac.F-0.90) > 1e-9 {
+		t.Errorf("accept.F: expected 0.90, got %.3f", ac.F)
+	}
+	if math.Abs(ac.Sigma-1.0) > 1e-9 {
+		t.Errorf("accept.Sigma: expected +1.0, got %.3f", ac.Sigma)
+	}
+	if math.Abs(ac.K-0.05) > 1e-9 {
+		t.Errorf("accept.K: expected 0.05, got %.3f", ac.K)
+	}
+}
+
+func TestQuantizationMatrix_RefineHasHighestK(t *testing.T) {
+	// refine has k=0.5 (fastest decay — muscle memory, fast GC)
+	qm := QuantizationMatrix()
+	if math.Abs(qm["refine"].K-0.5) > 1e-9 {
+		t.Errorf("refine.K: expected 0.5, got %.3f", qm["refine"].K)
+	}
+}
+
+func TestQuantizationMatrix_ChangePathNeutralSigma(t *testing.T) {
+	// change_path has sigma=0.0 — dead end; path avoided by GGS blocked_targets, not memory valence
+	qm := QuantizationMatrix()
+	if math.Abs(qm["change_path"].Sigma) > 1e-9 {
+		t.Errorf("change_path.Sigma: expected 0.0, got %.3f", qm["change_path"].Sigma)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// QueryMK time-decay and multi-entry tests
+// ---------------------------------------------------------------------------
+
+func TestQueryMK_DecayReducesAttentionOverTime(t *testing.T) {
+	// Attention decreases for megrams with k>0 written in the past
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	// k=0.2, 10 days old → decay = exp(-2) ≈ 0.135; att ≈ 0.9 * 0.135 ≈ 0.122
+	past := time.Now().UTC().Add(-10 * 24 * time.Hour).Format(time.RFC3339)
+	m := types.Megram{
+		ID: uuid.New().String(), Level: "M",
+		CreatedAt: past,
+		Space: "intent:decay_test", Entity: "env:local",
+		State: "accept", F: 0.9, Sigma: 1.0, K: 0.2,
+	}
+	s.persistMegram(m)
+
+	pots, err := s.QueryMK(context.Background(), "intent:decay_test", "env:local")
+	if err != nil {
+		t.Fatalf("QueryMK failed: %v", err)
+	}
+	expectedAtt := 0.9 * math.Exp(-0.2*10)
+	if math.Abs(pots.Attention-expectedAtt) > 0.01 {
+		t.Errorf("expected att≈%.4f after 10-day decay, got %.4f", expectedAtt, pots.Attention)
+	}
+	if pots.Attention >= 0.5 {
+		t.Errorf("decayed attention should be below Ignore threshold (0.5), got %.4f", pots.Attention)
+	}
+}
+
+func TestQueryMK_MultipleEntriesSumCorrectly(t *testing.T) {
+	// Convolution sums contributions from multiple megrams with the same (space, entity)
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	// pos: f=0.6, sigma=+1.0, k=0 → contribution: att=0.6, dec=+0.6
+	// neg: f=0.4, sigma=-1.0, k=0 → contribution: att=0.4, dec=-0.4
+	// sum: att=1.0, dec=0.2 → Caution (|dec|<=0.2)
+	pos := types.Megram{ID: uuid.New().String(), Level: "M", CreatedAt: now,
+		Space: "intent:multi_sum", Entity: "env:local", State: "accept", F: 0.6, Sigma: 1.0, K: 0.0}
+	neg := types.Megram{ID: uuid.New().String(), Level: "K", CreatedAt: now,
+		Space: "intent:multi_sum", Entity: "env:local", State: "change_approach", F: 0.4, Sigma: -1.0, K: 0.0}
+	s.persistMegram(pos)
+	s.persistMegram(neg)
+
+	pots, err := s.QueryMK(context.Background(), "intent:multi_sum", "env:local")
+	if err != nil {
+		t.Fatalf("QueryMK failed: %v", err)
+	}
+	if math.Abs(pots.Attention-1.0) > 1e-9 {
+		t.Errorf("expected att=1.0, got %.6f", pots.Attention)
+	}
+	if math.Abs(pots.Decision-0.2) > 1e-9 {
+		t.Errorf("expected dec=0.2, got %.6f", pots.Decision)
+	}
+	if pots.Action != "Caution" {
+		t.Errorf("expected Caution (net dec=0.2), got %q", pots.Action)
+	}
+}
+
+func TestQueryMK_RecallResetsDecayClock(t *testing.T) {
+	// QueryMK uses last_recalled_at as decay origin when it is later than created_at
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	// Megram 7 days old, k=0.2 → without recall: att = 0.9*exp(-1.4) ≈ 0.222 → Ignore
+	past := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339)
+	m := types.Megram{
+		ID: uuid.New().String(), Level: "M",
+		CreatedAt: past,
+		Space: "intent:recall_clock", Entity: "env:local",
+		State: "accept", F: 0.9, Sigma: 1.0, K: 0.2,
+	}
+	s.persistMegram(m)
+
+	// Simulate a recent QueryC recall: write last_recalled_at = now
+	_ = s.db.Put([]byte(prefixRecall+m.ID), []byte(time.Now().UTC().Format(time.RFC3339)), nil)
+
+	pots, err := s.QueryMK(context.Background(), "intent:recall_clock", "env:local")
+	if err != nil {
+		t.Fatalf("QueryMK failed: %v", err)
+	}
+	// With decay clock reset to now: att ≈ 0.9 → above Ignore threshold
+	if pots.Attention < 0.85 {
+		t.Errorf("recall should reset decay clock; expected att≈0.9, got %.4f", pots.Attention)
+	}
+	if pots.Action == "Ignore" {
+		t.Errorf("recalled megram should not be Ignore, got %q (att=%.4f)", pots.Action, pots.Attention)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// gcPass additional coverage
+// ---------------------------------------------------------------------------
+
+func TestGCPass_DeletesExpiredKLevel(t *testing.T) {
+	// gcPass deletes K-level megrams whose decayed attention < Λ_gc=0.1
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	oldTime := time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC3339)
+	m := types.Megram{
+		ID: uuid.New().String(), Level: "K",
+		CreatedAt: oldTime,
+		Space: "tool:shell", Entity: "path:old",
+		State: "change_path", F: 0.1, Sigma: 0.0, K: 0.5,
+	}
+	s.persistMegram(m)
+
+	s.gcPass()
+
+	if _, err := s.db.Get([]byte(prefixMegram+m.ID), nil); err == nil {
+		t.Error("expected expired K-level megram to be deleted by GC")
+	}
+}
+
+func TestGCPass_PreservesCLevel(t *testing.T) {
+	// gcPass never deletes C-level megrams, even when attention would fall below Λ_gc
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	// k=0.05, 365 days old → att = 0.0001 * exp(-18.25) ≈ tiny; would be GC'd if not C
+	oldTime := time.Now().UTC().Add(-365 * 24 * time.Hour).Format(time.RFC3339)
+	m := types.Megram{
+		ID: uuid.New().String(), Level: "C",
+		CreatedAt: oldTime,
+		Space: "intent:timeless_sop", Entity: "env:local",
+		State: "success", F: 0.0001, Sigma: 1.0, K: 0.05,
+	}
+	s.persistMegram(m)
+
+	s.gcPass()
+
+	if _, err := s.db.Get([]byte(prefixMegram+m.ID), nil); err != nil {
+		t.Errorf("C-level megram must be immune to GC (k=0 is not required): %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// trustBankruptcyPass additional coverage
+// ---------------------------------------------------------------------------
+
+func TestTrustBankruptcyPass_SkipsMLevel(t *testing.T) {
+	// trustBankruptcyPass does not modify M-level megrams
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	mID := uuid.New().String()
+	m := types.Megram{
+		ID: mID, Level: "M",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Space: "intent:skip_m", Entity: "env:local",
+		State: "abandon", F: 0.95, Sigma: -1.0, K: 0.0,
+	}
+	s.persistMegram(m)
+
+	s.trustBankruptcyPass()
+
+	updated, err := s.fetchMegram(mID)
+	if err != nil {
+		t.Fatalf("megram should still exist: %v", err)
+	}
+	if updated.Level != "M" {
+		t.Errorf("trust bankruptcy must not modify M-level megrams, got Level=%q", updated.Level)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RecordNegativeFeedback additional coverage
+// ---------------------------------------------------------------------------
+
+func TestRecordNegativeFeedback_NoopsOnUnknownID(t *testing.T) {
+	// RecordNegativeFeedback silently no-ops when ruleID does not exist in DB
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	// Should not panic, error, or write anything
+	s.RecordNegativeFeedback(context.Background(), "nonexistent-id-xyz", "bad content")
+	s.drainWriteQueue()
+
+	pots, err := s.QueryMK(context.Background(), "intent:nonexistent", "env:local")
+	if err != nil {
+		t.Fatalf("QueryMK failed: %v", err)
+	}
+	if pots.Action != "Ignore" {
+		t.Errorf("expected Ignore after no-op feedback, got %q", pots.Action)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Write auto-defaults tests
+// ---------------------------------------------------------------------------
+
+func TestWrite_AutoAssignsID(t *testing.T) {
+	// Write auto-assigns a UUID when ID is empty
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	m := types.Megram{
+		// ID intentionally omitted
+		Space: "intent:autoid", Entity: "env:local",
+		State: "accept", F: 0.8, Sigma: 1.0, K: 0.0,
+	}
+	s.Write(m)
+	s.drainWriteQueue()
+
+	pots, err := s.QueryMK(context.Background(), "intent:autoid", "env:local")
+	if err != nil {
+		t.Fatalf("QueryMK failed: %v", err)
+	}
+	if pots.Action == "Ignore" {
+		t.Error("megram with auto-assigned ID should be queryable (got Ignore)")
+	}
+}
+
+func TestWrite_AutoAssignsLevelM(t *testing.T) {
+	// Write assigns Level="M" when Level field is empty
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	mID := uuid.New().String()
+	m := types.Megram{
+		ID: mID,
+		// Level intentionally omitted
+		Space: "intent:autolevel", Entity: "env:local",
+		State: "accept", F: 0.8, Sigma: 1.0, K: 0.0,
+	}
+	s.Write(m)
+	s.drainWriteQueue()
+
+	stored, err := s.fetchMegram(mID)
+	if err != nil {
+		t.Fatalf("megram should be persisted: %v", err)
+	}
+	if stored.Level != "M" {
+		t.Errorf("expected auto-assigned Level=M, got %q", stored.Level)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// QueryC additional coverage
+// ---------------------------------------------------------------------------
+
+func TestQueryC_EmptyResultForNoMatch(t *testing.T) {
+	// QueryC returns empty slice (not error) when no C-level entries exist for the tag pair
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	sops, err := s.QueryC(context.Background(), "intent:nothing_here", "env:local")
+	if err != nil {
+		t.Fatalf("QueryC should not error on empty result: %v", err)
+	}
+	if len(sops) != 0 {
+		t.Errorf("expected empty slice, got %d entries", len(sops))
+	}
+}
+
+func TestQueryC_PreservesSigmaInSOPRecord(t *testing.T) {
+	// QueryC copies Megram.Sigma into SOPRecord.Sigma for constraint vs. best-practice distinction
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	m := types.Megram{
+		ID: uuid.New().String(), Level: "C",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Space: "intent:sigma_test", Entity: "env:local",
+		State: "abandon", F: 0.95, Sigma: -1.0, K: 0.0,
+		Content: "do not use this approach",
+	}
+	s.persistMegram(m)
+
+	sops, err := s.QueryC(context.Background(), "intent:sigma_test", "env:local")
+	if err != nil {
+		t.Fatalf("QueryC failed: %v", err)
+	}
+	if len(sops) != 1 {
+		t.Fatalf("expected 1 SOP, got %d", len(sops))
+	}
+	if sops[0].Sigma != -1.0 {
+		t.Errorf("expected SOPRecord.Sigma=-1.0 (constraint), got %.2f", sops[0].Sigma)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LevelDB key safety tests
+// ---------------------------------------------------------------------------
+
+func TestSafeKeyPart_ReplacesPipes(t *testing.T) {
+	// safeKeyPart replaces "|" with "_" to prevent LevelDB key ambiguity
+	result := safeKeyPart("tool:some|pipe")
+	if strings.Contains(result, "|") {
+		t.Errorf("safeKeyPart should replace '|', got %q", result)
+	}
+	if result != "tool:some_pipe" {
+		t.Errorf("expected 'tool:some_pipe', got %q", result)
+	}
+}
+
+func TestIntentSlug_NeverContainsPipe(t *testing.T) {
+	// IntentSlug output never contains "|" (safe for LevelDB key segments)
+	inputs := []string{"foo|bar intent", "a|b|c", "|leading pipe", "trailing|"}
+	for _, input := range inputs {
+		result := IntentSlug(input)
+		if strings.Contains(result, "|") {
+			t.Errorf("IntentSlug(%q) = %q contains '|'", input, result)
+		}
 	}
 }
 
