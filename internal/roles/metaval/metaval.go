@@ -31,15 +31,19 @@ merged_output rules:
 - Include concrete data (file paths, values, counts) — not process descriptions.
 - Omit intermediate steps (file discovery, etc.) unless they are the answer.
 
+JSON encoding rules (MANDATORY):
+- Output ONLY raw JSON — no markdown, no prose, no code fences.
+- Never write bare ASCII double-quote characters (") inside string values.
+  Use Unicode curly quotes (\u201c \u201d) or rephrase without quoting instead.
+- Every backslash inside a string value must be escaped as \\.
+
 Output — choose ONE:
 
 All criteria met:
 {"verdict":"accept","summary":"<one sentence for the user>","merged_output":"<combined result>"}
 
 Criteria unmet, replanning possible:
-{"verdict":"replan","gap_summary":"<which criterion failed and why>","failed_subtasks":["<subtask_id>"],"recommendation":"replan"}
-
-No markdown, no prose, no code fences.`
+{"verdict":"replan","gap_summary":"<which criterion failed and why>","failed_subtasks":["<subtask_id>"],"recommendation":"replan"}`
 
 // manifestTracker tracks incoming SubTaskOutcomes for a given dispatch manifest
 type manifestTracker struct {
@@ -204,18 +208,20 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		log.Printf("[R4b] ERROR: LLM call failed: %v", err)
 		return
 	}
-	raw = llm.StripFences(raw)
+	raw = extractJSON(llm.StripFences(raw))
 
 	var v struct {
-		Verdict        string `json:"verdict"`
-		Summary        string `json:"summary"`
-		MergedOutput   any    `json:"merged_output"`
-		GapSummary     string `json:"gap_summary"`
+		Verdict        string   `json:"verdict"`
+		Summary        string   `json:"summary"`
+		MergedOutput   any      `json:"merged_output"`
+		GapSummary     string   `json:"gap_summary"`
 		FailedSubtasks []string `json:"failed_subtasks"`
-		Recommendation string `json:"recommendation"`
+		Recommendation string   `json:"recommendation"`
 	}
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
 		log.Printf("[R4b] ERROR: parse verdict: %v (raw: %s)", err, raw)
+		m.triggerReplan(ctx, tracker, nil, totalCorrections,
+			"metaval verdict parse error: "+err.Error())
 		return
 	}
 
@@ -339,8 +345,8 @@ func aggregateFailureClassFromOutcomes(outcomes []types.SubTaskOutcome) string {
 }
 
 // safetyNetLoss computes a LossBreakdown for the safety-net abandon path.
-// GGS is bypassed on this path, so D must be computed locally so the UI's
-// endTask rule (D > 0 → failure) fires correctly.
+// GGS is bypassed on this path so D is computed locally as failed/total.
+// The UI detects failure via FinalResult.Directive == "abandon" (v0.8).
 //
 // Expectations:
 //   - Returns D = 1.0 when outcomes slice is empty (failure is the invariant)
@@ -418,10 +424,11 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 			To:        types.RoleUser,
 			Type:      types.MsgFinalResult,
 			Payload: types.FinalResult{
-				TaskID:  taskID,
-				Summary: summary,
-				Loss:    safetyNetLoss(outcomes),
-				Replans: replanCount,
+				TaskID:    taskID,
+				Summary:   summary,
+				Loss:      safetyNetLoss(outcomes),
+				Replans:   replanCount,
+				Directive: "abandon",
 			},
 		})
 		if m.outputFn != nil {
@@ -531,6 +538,52 @@ func toTaskCost(stats *tasklog.TaskStats) *types.TaskCost {
 		ToolCallCount: stats.ToolCallCount,
 		ToolElapsedMs: stats.ToolElapsedMs,
 	}
+}
+
+// extractJSON finds the first complete JSON object in s by brace-matching.
+// Returns the extracted substring or s unchanged if no complete object is found.
+// Handles nested objects and strings with escaped characters correctly.
+//
+// Expectations:
+//   - Returns s unchanged when s contains no '{'
+//   - Returns the first complete {...} object, stripping leading/trailing prose
+//   - Returns s unchanged when braces are unbalanced (no complete object)
+//   - Handles nested braces correctly
+func extractJSON(s string) string {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return s
+	}
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		b := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch b {
+		case '\\':
+			if inStr {
+				escaped = true
+			}
+		case '"':
+			inStr = !inStr
+		case '{':
+			if !inStr {
+				depth++
+			}
+		case '}':
+			if !inStr {
+				depth--
+				if depth == 0 {
+					return s[start : i+1]
+				}
+			}
+		}
+	}
+	return s
 }
 
 func toDispatchManifest(payload any) (types.DispatchManifest, error) {

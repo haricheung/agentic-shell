@@ -2065,6 +2065,72 @@ Files changed:
 
 ---
 
+## Issue #80 — MetaVal `evaluate()` silent return on JSON parse error causes infinite hang
+
+**Symptom**
+Pipeline stalls at "subtask matched — merging..." indefinitely. The auditor's 5-minute
+periodic report fires mid-task (visible in the UI), but no FinalResult is ever emitted.
+The task disappears with no result.
+
+**Root cause**
+Two related failures:
+
+1. **Parse error**: R4b's LLM response contained Chinese news text with ASCII double-quote
+   characters (`"`) inside the `merged_output` string value (e.g., `"隔夜酒不算酒驾"`).
+   JSON terminates the string at the first unescaped `"`, leaving the parser inside the
+   object where the next UTF-8 byte (`0xE9`, first byte of `隔` = U+9694) is reported as
+   the invalid rune U+00E9 = `é` — hence "invalid character 'é' after object key:value pair".
+
+2. **Silent failure**: `evaluate()` handled the parse error with a bare `return`:
+   ```go
+   if err := json.Unmarshal(...); err != nil {
+       log.Printf(...)
+       return   // no FinalResult, no replan — task hangs forever
+   }
+   ```
+
+**Fix**
+`internal/roles/metaval/metaval.go`:
+
+- `evaluate()`: replace silent `return` with `m.triggerReplan(ctx, tracker, nil,
+  totalCorrections, "metaval verdict parse error: "+err.Error())`. The task now either
+  recovers or hits the maxReplans safety net cleanly instead of hanging.
+- `extractJSON(s string) string`: new helper using brace-matching to strip leading/trailing
+  prose that `StripFences` misses. Called as `extractJSON(llm.StripFences(raw))` before
+  `json.Unmarshal`.
+- System prompt: added "JSON encoding rules (MANDATORY)" block — explicitly forbids bare
+  ASCII `"` inside string values, requiring Unicode curly quotes or rephrasing instead.
+
+**Tests added** (`internal/roles/metaval/metaval_test.go`):
+- `TestExtractJSON_PassesThroughPureJSON`
+- `TestExtractJSON_ExtractsFromLeadingProse`
+- `TestExtractJSON_ExtractsFromTrailingProse`
+- `TestExtractJSON_HandlesNestedBraces`
+- `TestExtractJSON_ReturnsUnchangedWhenNoBrace`
+- `TestEvaluate_TriggerReplanOnParseError`
+
+---
+
+## Issue #79 — MetaVal safety-net FinalResult missing `Directive: "abandon"` → UI shows ✅ on abandoned task
+
+**Symptom**
+When a task is abandoned via MetaVal's maxReplans safety net (not GGS's own abandon path),
+the pipeline footer shows `✅` even though the result summary clearly shows `❌ Task abandoned
+after N failed attempts`.
+
+**Root cause**
+`display.go` changed abandon detection from `fr.Loss.D > 0` to `fr.Directive == "abandon"` in
+issue #78 to correctly handle the v0.8 `success` macro-state (where D ≤ δ but D > 0). However,
+MetaVal's safety-net path in `triggerReplan()` (metaval.go:414) emitted `FinalResult` without
+setting `Directive`, leaving it as `""`. The GGS abort path correctly sets `Directive: "abandon"`,
+but the MetaVal safety-net did not.
+
+**Fix**
+`internal/roles/metaval/metaval.go`: Add `Directive: "abandon"` to the safety-net FinalResult
+payload. Updated `safetyNetLoss` comment to remove the stale `D > 0 → failure` UI reference.
+
+---
+
 ## Issue #78 — GGS v0.8: decision table refactored, `success` macro-state, `PrevDirective` tracking
 
 **Symptom**
