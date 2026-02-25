@@ -471,38 +471,51 @@ knowledge — without ever blocking the operational hot path.
 ### 6a. The MKCT Pyramid
 
 ```
-          Dreamer Consolidation (Λ_rule)
-                     ↑
-                    ╱╲
-                   ╱  ╲
-                  ╱ T  ╲──── Thinking         k=0.0  immutable; system prompt
-                 ╱──────╲
-                ╱   C    ╲── Common Sense     k=0.0  timeless until Λ_demote
-               ╱──────────╲
-              ╱     K      ╲─ Knowledge       k←M    task cache; Dreamer GC
-             ╱──────────────╲
-            ╱       M        ╲ Megram         k∈{0.05,0.2,0.5} ◄── GGS writes
-           ╱──────────────────╲
-                     ↓
-          Λ_gc / Λ_demote  (physical forgetting / trust bankruptcy)
-                     │
-                     │  QueryMK(space, entity)
-             ┌───────┴───────┐
-             │               │
-             ▼ Channel A     ▼ Channel B
-             Attention       Decision
-          Σ|fᵢ|·e^(−kᵢΔt)  Σσᵢ·fᵢ·e^(−kᵢΔt)
-          unsigned energy   signed preference
-             │               │
-             ▼ M_att         ▼ M_dec
-             └───────┬───────┘
-                     ▼
-  M_dec ▲
-   +0.2 ┤  IGNORE │ EXPLOIT  ← SHOULD PREFER
-    0.0 ┤         │ CAUTION  ← sandbox / confirm
-   -0.2 ┤         │ AVOID    ← MUST NOT
-        └─────────┴────────────────────► M_att
-                 0.5
+[ UPWARD FLOW ]                                               [ DOWNWARD FLOW ]
+         Async Consolidation                                  Degradation & Forgetting
+         (Dreamer Engine)                                     (Time & Dissonance)
+
+               ^                                                      |
+               |              /:::::::::::::\                         |
+               |             /    [ T ]      \                        |
+  Immutable    |            /   THINKING      \                 Immutable
+  Agent Laws   |           /___________________\                (No Demotion)
+  k = 0.0      |          /                     \                     |
+               |         /        [ C ]           \                   |
+  Promotion    |        /     COMMON SENSE         \              Demotion
+  M_att >=5.0  |       /   (SOPs & Constants)       \             M_dec < 0.0
+  |M_dec|>=3.0 |      /________________________________\          k reverts to 0.05
+  k = 0.0      |     /                                  \               |
+               |    /            [ K ]                    \             v
+  Clustering & |   /           KNOWLEDGE                   \       Time Decay
+  Lazy Eval    |  / (Task Cache & Local Context)             \     g(Δt) = e^(-k*Δt)
+  k > 0        | /______________________________________________\        |
+               |/                                                \       v
+  Generation   | /              [ M ]                             \  Garbage Collect
+  GGS State    |/             MEGRAM                               \ M_att < 0.1
+  f_i,σ_i,t_i  |/_(Atomic Events: t, s, ent, c, f, σ, k)__________\|(Hard DELETE)
+
+  =============================================================================
+  [             LEVELDB STORAGE (Append-Only Event Sourcing)                  ]
+  =============================================================================
+                                      |
+                        QueryMK(space, entity)
+              ┌─────────────────────────┴──────────────────────────┐
+              │                                                     │
+              ▼  Channel A                           ▼  Channel B
+              Attention                              Decision
+         Σ|fᵢ|·e^(−kᵢ·Δt)                  Σσᵢ·fᵢ·e^(−kᵢ·Δt)
+         unsigned energy                    signed preference
+              │                                                     │
+              ▼ M_att                                    ▼ M_dec
+              └─────────────────────────┬──────────────────────────┘
+                                        ▼
+                             M_dec ▲
+                              +0.2 ┤  IGNORE │ EXPLOIT  ← SHOULD PREFER
+                               0.0 ┤         │ CAUTION  ← sandbox / confirm
+                              -0.2 ┤         │ AVOID    ← MUST NOT
+                                   └─────────┴─────────────────────► M_att
+                                             0.5
 ```
 
 | Layer | Name | Decay k | Description |
