@@ -475,16 +475,34 @@ knowledge — without ever blocking the operational hot path.
                      ↑
                     ╱╲
                    ╱  ╲
-                  ╱ T  ╲──── Thinking         k = 0.0   immutable; system prompt
+                  ╱ T  ╲──── Thinking         k=0.0  immutable; system prompt
                  ╱──────╲
-                ╱   C    ╲── Common Sense     k = 0.0   timeless until Λ_demote
+                ╱   C    ╲── Common Sense     k=0.0  timeless until Λ_demote
                ╱──────────╲
-              ╱     K      ╲─ Knowledge       k ← M     task cache; Dreamer GC
+              ╱     K      ╲─ Knowledge       k←M    task cache; Dreamer GC
              ╱──────────────╲
-            ╱       M        ╲ Megram         k ∈ {0.05, 0.2, 0.5}   GGS-written
+            ╱       M        ╲ Megram         k∈{0.05,0.2,0.5} ◄── GGS writes
            ╱──────────────────╲
                      ↓
-          Λ_gc (forgetting) / Λ_demote (Trust Bankruptcy)
+          Λ_gc / Λ_demote  (physical forgetting / trust bankruptcy)
+                     │
+                     │  QueryMK(space, entity)
+             ┌───────┴───────┐
+             │               │
+             ▼ Channel A     ▼ Channel B
+             Attention       Decision
+          Σ|fᵢ|·e^(−kᵢΔt)  Σσᵢ·fᵢ·e^(−kᵢΔt)
+          unsigned energy   signed preference
+             │               │
+             ▼ M_att         ▼ M_dec
+             └───────┬───────┘
+                     ▼
+  M_dec ▲
+   +0.2 ┤  IGNORE │ EXPLOIT  ← SHOULD PREFER
+    0.0 ┤         │ CAUTION  ← sandbox / confirm
+   -0.2 ┤         │ AVOID    ← MUST NOT
+        └─────────┴────────────────────► M_att
+                 0.5
 ```
 
 | Layer | Name | Decay k | Description |
@@ -521,31 +539,7 @@ C/T-level entries have k=0.0 (timeless until Trust Bankruptcy).
 
 ### 6d. Dual-Channel Convolution Potentials
 
-**Flow: same Megram set, two independent convolution channels**
-
-```
-  Megrams tagged (space, entity)
-  ┌──────────────────────────────────────────────────────┐
-  │  ⟨f₁, σ₁, k₁, Δt₁⟩   ⟨f₂, σ₂, k₂, Δt₂⟩   …     │
-  └────────────────┬──────────────────┬─────────────────┘
-                   │                  │
-                   ▼                  ▼
-         Channel A                  Channel B
-         Attention                  Decision
-  ───────────────────────    ────────────────────────────
-  Σ |fᵢ| · e^(−kᵢ · Δt)    Σ σᵢ · fᵢ · e^(−kᵢ · Δt)
-  unsigned energy            signed preference (±)
-                   │                  │
-                   ▼                  ▼
-             M_attention          M_decision
-             "relevant?"          "good or bad?"
-                   │                  │
-                   └────────┬─────────┘
-                            ▼
-                      Action Decision
-```
-
-**Formulas** (Δt in days):
+Formulas (Δt in days; see §6a pyramid for the full flow):
 
 ```
 M_attention(space, entity) = Σ |f_i| · exp(−k_i · Δt_days)
@@ -560,23 +554,6 @@ Derived action:
 | M_att ≥ 0.5 AND M_dec > 0.2 | Exploit |
 | M_att ≥ 0.5 AND M_dec < -0.2 | Avoid |
 | M_att ≥ 0.5 AND \|M_dec\| ≤ 0.2 | Caution |
-
-**Action decision plane** (essence of the dual-channel convolution):
-
-```
-  M_decision
-      ▲
- +1.0 ┤           │
-      │           │   EXPLOIT    ← SHOULD PREFER this approach
- +0.2 ┤  IGNORE   ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-      │           │   CAUTION    ← confirm / sandbox
- -0.2 ┤           ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-      │           │   AVOID      ← MUST NOT use
- -1.0 ┤           │
-      └───────────┼──────────────────────────────────► M_attention
-                 0.5
-          not salient          salient (on the system's radar)
-```
 
 ### 6e. Dreamer — Offline Consolidation Engine
 
