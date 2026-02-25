@@ -2377,3 +2377,29 @@ The same label appeared in `correctionPrompt`.
 - Added explicit instructions: "Output ONLY raw JSON — no label before it" and
   "NEVER generate fake tool output or pretend a tool ran — only output a tool call
   JSON OR a final result JSON, never both in the same response."
+
+---
+
+## Issue #85 — R3 parse failure: model outputs two concatenated JSON objects
+
+**Symptom**
+After issue #84 was fixed, R3 still occasionally fails with:
+`parse LLM output: invalid character '{' after top-level value`
+
+**Root cause**
+The model complied with the "no label" instruction from #84 (outputs raw JSON now) but
+still generates two concatenated JSON objects in one response: the tool-call JSON
+immediately followed by the fake final-result JSON. E.g.:
+```
+{"action":"tool","tool":"shell","command":"find . -name '*.go' | wc -l"}
+{"action":"result","subtask_id":"...","status":"completed","output":"23604"}
+```
+`json.Unmarshal` rejects trailing content after the first valid JSON value and returns
+`invalid character '{' after top-level value`, causing the same parse failure loop.
+
+**Fix**
+`internal/roles/executor/executor.go`: replace `json.Unmarshal([]byte(raw), &v)` with
+`json.NewDecoder(strings.NewReader(raw)).Decode(&v)` for both the `finalResult` and
+`toolCall` parse attempts. `json.Decoder.Decode` reads exactly one complete JSON value
+and ignores all subsequent content — the concatenated second object is silently dropped,
+and the first (the actual tool call) is parsed correctly.

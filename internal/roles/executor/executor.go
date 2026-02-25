@@ -240,9 +240,13 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		raw = llm.StripFences(raw)
 		log.Printf("[R3] llm response (iter=%d): %s", i, firstN(raw, 200))
 
-		// Try to parse as final result first
+		// Try to parse as final result first.
+		// Use json.Decoder (not json.Unmarshal) so that a response containing multiple
+		// concatenated JSON objects — e.g. the tool-call JSON followed immediately by a
+		// hallucinated result JSON — still parses correctly: Decode reads the first
+		// complete value and stops, ignoring any trailing content (issue #85).
 		var fr finalResult
-		if err := json.Unmarshal([]byte(raw), &fr); err == nil && fr.Action == "result" {
+		if err := json.NewDecoder(strings.NewReader(raw)).Decode(&fr); err == nil && fr.Action == "result" {
 			outStr, _ := json.Marshal(fr.Output)
 			log.Printf("[R3] result subtask=%s status=%s output=%s",
 				st.SubTaskID, fr.Status, firstN(strings.TrimSpace(string(outStr)), 500))
@@ -255,9 +259,9 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			}, toolCallHistory, nil
 		}
 
-		// Parse as tool call
+		// Parse as tool call — same decoder approach for consistency.
 		var tc toolCall
-		if err := json.Unmarshal([]byte(raw), &tc); err != nil {
+		if err := json.NewDecoder(strings.NewReader(raw)).Decode(&tc); err != nil {
 			// Log the raw response to debug.log for diagnostics, but do NOT embed it in
 			// the returned error — it could contain hallucinated tool output that R4a would
 			// evaluate as evidence when scoring criteria (issue #83).
