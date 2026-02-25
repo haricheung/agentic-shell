@@ -36,6 +36,7 @@ Sequence rules (critical):
 Context field rules:
 - Always populate context with everything the executor needs beyond the intent: known file paths, format requirements, constraints, relevant memory.
 - For sequence N+1 subtasks, you do NOT need to repeat how to find a file already located in sequence N — the dispatcher will inject prior outputs.
+- Do NOT suggest third-party CLI tools (cloc, tokei, jq, ripgrep, fd, bat, etc.) — use only standard Unix commands (find, wc, grep, awk, sed, sort, du) or the executor's built-in tools (mdfind, glob, shell, search).
 
 Success criteria rules (critical):
 - Each criterion MUST be a concrete, checkable assertion about tool output — NOT a restatement of the intent.
