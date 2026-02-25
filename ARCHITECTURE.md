@@ -313,6 +313,16 @@ This trajectory-awareness is what gives the framework adaptive behavior beyond t
 
 The formal structure: GGS is the controller; Meta-Validator is the sensor producing the error signal; Planner is the actuator receiving the correction; the effector agents are the plant. This is a hierarchical closed-loop system, where the same loop structure runs at the agent level (Executor → Agent-Validator) and at the metaagent level (Planner → GGS → Meta-Validator).
 
+**v0.8 decision table** — GGS selects one of five macro-states per round:
+
+| Macro-state | Trigger | Output |
+|---|---|---|
+| `success` | D ≤ δ (0.3) | `FinalResult` (Directive="success"); bypass R2 — close enough to deliver |
+| `refine` / `change_path` / `change_approach` / `break_symmetry` | action states selected from ∇L, D, P | `PlanDirective` → R2 for replanning |
+| `abandon` | Ω ≥ 0.8, or Law 2 kill-switch (2× consecutive worsening) | `FinalResult` (Directive="abandon"); stop without recovery |
+
+The `success` macro-state is a convergence shortcut: when D has fallen below the δ threshold the task is close enough to the goal that delivering the result is better than incurring another replan. The `abandon` rule enforces Law 2 and Law 3: continuing beyond the divergence point consumes resources without a convergence signal.
+
 **Implementation model — TextGrad backward pass**: the GGS is inspired by TextGrad
 (automatic differentiation through text). Instead of numerical gradients, it computes a
 *textual gradient*: a structured description of what in the plan should change and in

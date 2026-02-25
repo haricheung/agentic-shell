@@ -102,7 +102,7 @@ AND sent via a direct channel (for routing to the paired Executor). Both are req
 | `internal/roles/metaval/` | R4b | Fan-in (sequential + parallel outcomes); merges outputs; accept or replan; maxReplans=3; closes task log via `logReg.Close()` |
 | `internal/roles/memory/` | R5 | File-backed JSON; keyword query; drains on shutdown |
 | `internal/roles/auditor/` | R6 | Active entity: taps bus read-only (passive observation) + subscribes to `MsgAuditQuery` (on-demand) + publishes `MsgAuditReport`; 5-min periodic ticker; accumulates window stats (tasks, corrections, gap trends, violations, drift alerts); resets window after each report |
-| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualiser; reads its own bus tap; `Abort()` / `Resume()` suppress stale post-abort messages; spinner uses `\r\033[K`; each message type shows a specific checkpoint detail (see **Pipeline Checkpoints** section below); `FinalResult` flow line always rendered with D/∇L/Ω; `endTask` success/failure detection via `Loss.D > 0` |
+| `internal/ui/display.go` | Terminal UI | Sci-fi pipeline visualiser; reads its own bus tap; `Abort()` / `Resume()` suppress stale post-abort messages; spinner uses `\r\033[K`; each message type shows a specific checkpoint detail (see **Pipeline Checkpoints** section below); `FinalResult` flow line always rendered with D/∇L/Ω; `endTask` success/failure detection via `Directive == "abandon"` (v0.8) |
 | `internal/tools/mdfind.go` | Tool | macOS Spotlight wrapper; `RunMdfind(ctx, query)` → `mdfind -name <query>`; if no results and query has an extension, retries with stem only and post-filters by extension (Spotlight CJK+extension quirk) |
 
 ## Tools Available to Executor
@@ -207,15 +207,17 @@ shown in the flow line and the spinner label shown while downstream roles proces
 every cycle of the medium loop is visible in the pipeline display, including the final one.
 The FinalResult flow line is always rendered (not suppressed).
 
-**Abandon detection rule**: `endTask(success=false)` fires when `FinalResult.Loss.D > 0`.
-On the accept path D is always 0.0 (all subtasks matched). On the abandon path D > 0 (at
-least one subtask failed, which is what drove Ω ≥ 0.8). This is code-driven — no text
-parsing of the summary string is required.
+**Abandon detection rule**: `endTask(success=false)` fires when `FinalResult.Directive == "abandon"` (v0.8).
+The v0.8 GGS `success` macro-state (D ≤ δ=0.3) means the accept path may have D > 0 when
+task_criteria are met but coverage is incomplete. Using `Loss.D > 0` would incorrectly flag
+these partial-coverage successes as failures. The `Directive` field is the authoritative signal:
+`"accept"` | `"success"` → task succeeded; `"abandon"` → task failed. This is code-driven —
+no text parsing of the summary string is required.
 
 ## Design Documents
 
 | File | Description |
 |---|---|
 | `ARCHITECTURE.md` | Full system architecture, philosophy, data flow, risk register |
-| `docs/mvp-roles-v0.7.md` | Role definitions v0.7 — current canonical spec |
+| `docs/mvp-roles-v0.8.md` | Role definitions v0.8 — current canonical spec |
 | `docs/issues.md` | Bug log: all issues found in first test session, root causes, fix sequences |

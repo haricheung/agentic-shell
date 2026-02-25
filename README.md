@@ -29,7 +29,7 @@ R5 Memory   — file-backed episodic + procedural store
 R6 Auditor  — read-only bus tap; reports anomalies to operator
 ```
 
-**The medium loop** is a complete closed-loop control system: R4b (sensor) → R7 GGS (controller) → R2 (actuator). When subtasks fail, GGS computes a loss gradient from the failure signal, selects a directive (`refine` / `change_path` / `change_approach` / `break_symmetry` / `abandon`), and sends a structured `PlanDirective` to R2 — telling it not just *that* replanning is needed but *what kind* of change to make and *which specific targets already failed*.
+**The medium loop** is a complete closed-loop control system: R4b (sensor) → R7 GGS (controller) → R2 (actuator). When subtasks fail, GGS computes a loss gradient from the failure signal, selects a macro-state (`success` / `refine` / `change_path` / `change_approach` / `break_symmetry` / `abandon`) — action states send a structured `PlanDirective` to R2 (telling it not just *that* replanning is needed but *what kind* of change to make and *which specific targets already failed*); terminal states (`success` when D ≤ 0.3, `abandon` when Ω ≥ 0.8) emit `FinalResult` directly.
 
 **Memory** accumulates across tasks: procedural entries record what went wrong; episodic entries record what worked. R2 calibrates its next plan against both, with code-enforced MUST NOT constraints derived from past failures.
 
@@ -164,7 +164,7 @@ The system is built on four convictions:
 4. **Independent observability** — the Auditor sits outside the operational hierarchy and cannot be instructed or suppressed by any agent
 
 Full design rationale: [`ARCHITECTURE.md`](ARCHITECTURE.md)
-Role specifications (v0.7): [`docs/mvp-roles-v0.7.md`](docs/mvp-roles-v0.7.md)
+Role specifications (v0.8): [`docs/mvp-roles-v0.8.md`](docs/mvp-roles-v0.8.md)
 Bug log: [`docs/issues.md`](docs/issues.md)
 
 ---
@@ -190,7 +190,7 @@ internal/
   types/           — shared message and data types
   ui/              — terminal pipeline visualiser
 docs/
-  mvp-roles-v0.7.md   — current role spec
+  mvp-roles-v0.8.md   — current role spec
   issues.md            — bug log
 ```
 
