@@ -2288,3 +2288,26 @@ Full rewrite of R5 and supporting roles across 11 files:
 - `TestCalibrateMKCT_CautionIncludesCaution`
 - `TestCalibrateMKCT_PositiveSigmaUnderShouldPrefer`
 - `TestCalibrateMKCT_NegativeSigmaUnderMustNot`
+
+---
+
+## Issue #82 — LevelDB startup failure is silent: `log.Fatalf` goes to debug.log instead of stderr
+
+**Symptom**
+Running artoo one-shot when another artoo process already holds the LevelDB lock produces a
+completely silent failure: blank stdout, blank stderr, exit code 1. The user has no indication
+of what went wrong or how to fix it.
+
+**Root cause**
+`main.go` redirects the `log` package's output to `~/.artoo/debug.log` at line 59-63, before
+`memory.New()` is called at line 84. When `memory.New()` fails to open LevelDB (e.g. "resource
+temporarily unavailable" from a stale REPL session holding the file lock), it calls
+`log.Fatalf(...)`, which writes to the already-redirected log file. The terminal sees nothing —
+no error, no hint, just exit code 1.
+
+**Fix**
+`internal/roles/memory/memory.go`: Replace `log.Fatalf` with `fmt.Fprintf(os.Stderr, ...)` +
+`os.Exit(1)`. Direct stderr writes bypass the `log` package's output redirection, guaranteeing
+the error is always visible on the terminal regardless of when main.go redirects the log.
+Added a second hint line: "Another artoo process may be running (LevelDB is single-writer).
+Kill it and retry."

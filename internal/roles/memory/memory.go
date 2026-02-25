@@ -5,8 +5,10 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
+	"os"
 	"strings"
 	"time"
 
@@ -56,7 +58,11 @@ type Store struct {
 func New(b *bus.Bus, dbPath string) *Store {
 	db, err := leveldb.OpenFile(dbPath, nil)
 	if err != nil {
-		log.Fatalf("[R5] FATAL: failed to open LevelDB at %s: %v", dbPath, err)
+		// Write to stderr directly — main.go redirects log to debug.log before calling New(),
+		// so log.Fatalf would be invisible to the user. fmt.Fprintf(Stderr) bypasses that.
+		fmt.Fprintf(os.Stderr, "\033[31m[R5] failed to open LevelDB at %s: %v\033[0m\n", dbPath, err)
+		fmt.Fprintf(os.Stderr, "\033[2mAnother artoo process may be running (LevelDB is single-writer). Kill it and retry.\033[0m\n")
+		os.Exit(1)
 	}
 	return &Store{
 		b:       b,
