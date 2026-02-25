@@ -2345,3 +2345,35 @@ Two compounding bugs:
 2. `internal/roles/agentval/agentval.go`: add "Executor failure rule" (highest priority)
    to `score()` system prompt: if `status` is `"failed"` → verdict `"failed"` immediately,
    do not evaluate criteria, do not retry.
+
+---
+
+## Issue #84 — R3 LLM outputs "Tool call: {json}" label, causing persistent parse failures and task abandonment
+
+**Symptom**
+After issue #83 was fixed, "count code lines of this project" abandoned after 3 replans.
+All three planner iterations produced subtasks where R3 consistently output:
+`Tool call: {"action":"tool","tool":"shell","command":"..."}` — parse fails, R4a correctly
+fails (issue #83 fix working), but the task always abandons because R3 never executes.
+
+**Root cause**
+The R3 system prompt `systemPromptTail` at line 55 showed the output format as:
+```
+Tool call:    {"action":"tool","tool":"<name>","<param>":"<value>",...}
+Final result: {"action":"result",...}
+```
+The `Tool call:` label in the format description taught the model to include that literal
+prefix in its actual output. The model then extrapolated further: it generated the full
+`Tool call: {json}\n\nTool result: {fake output}\n{final JSON}` block all in one LLM
+response — hallucinating both the tool invocation, a fake result, and the final answer
+without actually running anything.
+
+The same label appeared in `correctionPrompt`.
+
+**Fix**
+`internal/roles/executor/executor.go`:
+- Replaced `"Tool call:    {...}"` with `"To call a tool:\n{...}"` in both
+  `systemPromptTail` and `correctionPrompt` to remove the inline `Tool call:` label.
+- Added explicit instructions: "Output ONLY raw JSON — no label before it" and
+  "NEVER generate fake tool output or pretend a tool ran — only output a tool call
+  JSON OR a final result JSON, never both in the same response."

@@ -44,16 +44,21 @@ const systemPromptTail = `
 
 Execution rules:
 - Read intent, success_criteria, and context before acting. Context may contain prior-step outputs — use them directly.
-- One tool call per turn; wait for the result before the next.
+- One tool call per response; wait for the REAL tool result before proceeding.
+- NEVER generate fake tool output or pretend a tool ran — only output a tool call JSON OR a final result JSON, never both in the same response.
 - When tool output satisfies ALL success_criteria, output the final result immediately.
 - status "completed": tool ran and output clearly answers the task.
 - status "uncertain": output is genuinely ambiguous AND no further tool would resolve it.
 - status "failed": tool returned an error and retrying a different way is not possible.
-- No markdown, no prose, no code fences.
+- No markdown, no prose, no code fences. Output ONLY raw JSON — no label before it.
 
-Output format:
-Tool call:    {"action":"tool","tool":"<name>","<param>":"<value>",...}
-Final result: {"action":"result","subtask_id":"...","status":"completed|uncertain|failed","output":"<result text>","uncertainty":null,"tool_calls":["<tool: input → output summary>",...]}`
+Output format — raw JSON only, nothing before or after:
+
+To call a tool:
+{"action":"tool","tool":"<name>","<param>":"<value>",...}
+
+To report the final result:
+{"action":"result","subtask_id":"...","status":"completed|uncertain|failed","output":"<result text>","uncertainty":null,"tool_calls":["<tool: input → output summary>",...]}`
 
 func buildSystemPrompt() string {
 	return systemPromptBase + "\n" + systemPromptTail
@@ -65,9 +70,14 @@ What was wrong: %s
 What to do instead: %s
 Previous tool calls (do NOT repeat these): %s
 
-Apply the same tool selection rules and output format as before:
-- Tool call: {"action":"tool","tool":"<name>","<param>":"<value>",...}
-- Final result: {"action":"result","subtask_id":"...","status":"completed|uncertain|failed","output":"...","uncertainty":null,"tool_calls":["..."]}`
+Apply the same tool selection rules and output format as before.
+Output ONLY raw JSON — no label, no prose, no markdown:
+
+To call a tool:
+{"action":"tool","tool":"<name>","<param>":"<value>",...}
+
+To report the final result:
+{"action":"result","subtask_id":"...","status":"completed|uncertain|failed","output":"...","uncertainty":null,"tool_calls":["..."]}`
 
 // Executor is R3. It executes sub-tasks using available tools.
 type Executor struct {
