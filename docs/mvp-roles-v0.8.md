@@ -570,28 +570,31 @@ Derived action:
 
 ### 6e. Dreamer — Offline Consolidation Engine
 
-Runs as a background goroutine. Triggered: (a) after each task's FinalResult + a brief
-settle delay, and (b) optionally on a timer. Never blocks the operational path.
+Runs as a background goroutine on a 5-minute timer. Never blocks the operational path.
 
-**Upward flow (Consolidation — Λ_rule thresholds)**
+**MVP implementation (v0.8)** — downward flow only:
+- *Physical Forgetting* (Λ_gc): M/K entry where live `M_attention < 0.1` → hard DELETE from LevelDB
+- *Trust Bankruptcy* (Λ_demote): C-level entry where live `M_decision < 0.0` → strip time immunity (k reverts to 0.05; Megram demoted to K)
+
+**Upward flow (Consolidation — deferred to v0.9)**
 - Scan Megrams with identical `(space, entity)` tag pair
 - `M_attention ≥ 5.0 AND M_decision ≥ 3.0` → invoke LLM to distil Best Practice → new Megram(Level=C, k=0.0)
 - `M_attention ≥ 5.0 AND M_decision ≤ -3.0` → invoke LLM to distil Constraint → new Megram(Level=C, k=0.0)
 - Raw M-level Megrams that were consolidated may be GC'd (optional; for space reclamation)
-
-**Downward flow (Degradation + GC)**
-- *Trust Bankruptcy* (Λ_demote): C-level entry where live `M_decision < 0.0` → strip time immunity (k reverts to 0.05; Megram demoted to K)
-- *Physical Forgetting* (Λ_gc): M/K entry where live `M_attention < 0.1` → hard DELETE from LevelDB
+- FinalResult-triggered settle delay (currently only periodic timer is active)
 
 ### 6f. Storage: LevelDB (syndtr/goleveldb — pure Go, no CGO)
 
-Key schema:
+Key schema (single-char prefix + `|` separator for compact keys):
 ```
-megram:<id>               → Megram JSON (primary record)
-idx:<space>:<entity>:<id> → ""          (inverted index for tag scan)
-lvl:<level>:<id>          → ""          (level scan for Dreamer)
-recall:<id>               → RFC3339     (last_recalled_at; updated on QueryC hits)
+m|<id>                    → Megram JSON (primary record)
+x|<space>|<entity>|<id>   → ""          (inverted index for tag scan)
+l|<level>|<id>            → ""          (level scan for Dreamer)
+r|<id>                    → RFC3339     (last_recalled_at; updated on QueryC hits)
 ```
+
+`|` characters in space/entity values are replaced with `_` (`safeKeyPart`) to prevent
+ambiguous key splits during prefix scans.
 
 All Megram writes are **Append-Only**. Error correction appends a negative-σ Megram
 rather than mutating existing records. `recall:` entries are the only mutable metadata.
@@ -744,5 +747,6 @@ User
 | Structured criteria mode | `{criterion, mode}` objects distinguishing `verifiable` from `plausible`; affects D computation weighting |
 | R2 graceful failure on abandon | LLM-backed partial result + next-move suggestions (currently code-template only) |
 | T-layer slow-evolution mechanism | Phase 2: allow system persona / values to update from high-confidence C-level consolidation |
+| Dreamer upward consolidation (LLM distillation) | M_attention/M_decision thresholds trigger LLM call to distil C-level SOP/Constraint; FinalResult-triggered settle delay; `runDreamer` currently executes GC + trust bankruptcy only |
 | Dreamer Phase 2: Schema Transfer Engine | Semantic factorization on high-scoring Megrams; generation of Hypothesis Megrams to invent novel tool combinations |
 | Dreamer Phase 2: Cognitive Dissonance Megrams | Dissonance Megrams (High f, Negative σ) generated on Soft Overwrite; shatter credibility of outdated SOPs during nightly Dreamer cycle |
