@@ -209,10 +209,11 @@ func (d *Display) Run(ctx context.Context) {
 			d.printFlow(msg)
 			d.setStatus(dynamicStatus(msg))
 			if msg.Type == types.MsgFinalResult {
-				// Detect abandon path: D > 0 means task failed (GGS budget exceeded).
+				// Detect abandon path via Directive field (v0.8).
+				// Directive=="abandon" → task failed; "accept" or "success" → task succeeded.
 				success := true
 				var fr types.FinalResult
-				if remarshal(msg.Payload, &fr) == nil && fr.Loss.D > 0 {
+				if remarshal(msg.Payload, &fr) == nil && fr.Directive == "abandon" {
 					success = false
 				}
 				d.endTask(success)
@@ -397,20 +398,22 @@ func msgDetail(msg types.Message) string {
 	case types.MsgPlanDirective:
 		var pd types.PlanDirective
 		if remarshal(msg.Payload, &pd) == nil {
-			// Arrow symbol and color encode the gradient direction at a glance.
+			// Arrow encodes ∇L sign (urgency modulator in v0.8).
 			// After the colored arrow, ansiYellow restores the MsgPlanDirective message color.
-			arrow := "→"
-			arrowFmt := arrow // no extra color for stable
-			switch pd.Gradient {
-			case "improving":
-				arrowFmt = ansiGreen + "↑" + ansiReset + ansiYellow
-			case "worsening":
-				arrowFmt = ansiRed + "↓" + ansiReset + ansiYellow
-			case "plateau":
-				arrowFmt = ansiYellow + "⊥"
+			const gradEps = 0.1
+			arrowFmt := "→" // no signal
+			if pd.GradL < -gradEps {
+				arrowFmt = ansiGreen + "↑" + ansiReset + ansiYellow // improving
+			} else if pd.GradL > gradEps {
+				arrowFmt = ansiRed + "↓" + ansiReset + ansiYellow // worsening
 			}
-			return fmt.Sprintf("%s %s | %s  D=%.2f P=%.2f ∇L=%+.2f Ω=%.0f%%",
-				arrowFmt, pd.Gradient, pd.Directive,
+			// State-transfer label: prev→directive (e.g. "init→change_path")
+			transition := pd.Directive
+			if pd.PrevDirective != "" {
+				transition = pd.PrevDirective + "→" + pd.Directive
+			}
+			return fmt.Sprintf("%s %s  D=%.2f P=%.2f ∇L=%+.2f Ω=%.0f%%",
+				arrowFmt, transition,
 				pd.Loss.D, pd.Loss.P, pd.GradL, pd.BudgetPressure*100)
 		}
 	case types.MsgOutcomeSummary:

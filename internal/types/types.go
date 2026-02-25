@@ -156,8 +156,8 @@ type LossBreakdown struct {
 type PlanDirective struct {
 	TaskID          string        `json:"task_id"`
 	Loss            LossBreakdown `json:"loss"`
-	Gradient        string        `json:"gradient"`          // "improving" | "stable" | "worsening" | "plateau"
-	Directive       string        `json:"directive"`         // "refine" | "change_path" | "change_approach" | "break_symmetry" | "abandon"
+	PrevDirective   string        `json:"prev_directive"`    // macro-state from previous round; "init" on first round
+	Directive       string        `json:"directive"`         // "refine" | "change_path" | "change_approach" | "break_symmetry"
 	BlockedTools    []string      `json:"blocked_tools"`     // tool names R2 must not use; populated for break_symmetry + change_approach (logical)
 	BlockedTargets  []string      `json:"blocked_targets"`   // specific failed inputs (queries/commands/paths); populated for change_path + refine (environmental); accumulates across rounds
 	FailedCriterion string        `json:"failed_criterion"`  // primary criterion driving D
@@ -263,14 +263,16 @@ type OutcomeSummary struct {
 
 // FinalResult carries the merged result to the user.
 // Loss, GradL, and Replans are set by GGS so the UI can display the full
-// trajectory checkpoint (D, ∇L, Ω) on every path — accept and abandon.
+// trajectory checkpoint (D, ∇L, Ω) on every path — accept, success, and abandon.
 type FinalResult struct {
-	TaskID  string        `json:"task_id"`
-	Summary string        `json:"summary"`
-	Output  any           `json:"output"`
-	Loss    LossBreakdown `json:"loss"`
-	GradL   float64       `json:"grad_l,omitempty"`
-	Replans int           `json:"replans,omitempty"`
+	TaskID        string        `json:"task_id"`
+	Summary       string        `json:"summary"`
+	Output        any           `json:"output"`
+	Loss          LossBreakdown `json:"loss"`
+	GradL         float64       `json:"grad_l,omitempty"`
+	Replans       int           `json:"replans,omitempty"`
+	Directive     string        `json:"directive"`      // "accept" | "success" | "abandon"
+	PrevDirective string        `json:"prev_directive"` // macro-state from previous round; "init" on first round
 }
 
 

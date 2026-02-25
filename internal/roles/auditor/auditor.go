@@ -258,25 +258,26 @@ func (a *Auditor) process(msg types.Message) {
 	}
 
 	// 4. Track gradient and detect convergence failures from PlanDirective (R7 → R2).
-	//    In v0.7 GGS owns gradient computation; the Auditor reads it from PlanDirective.
+	//    In v0.8 the gradient label is removed from PlanDirective; trend is derived from GradL.
+	const gradLEpsilon = 0.1 // mirrors GGS epsilon constant
 	if msg.Type == types.MsgPlanDirective {
 		pd, err := toPlanDirective(msg.Payload)
 		if err == nil {
 			a.mu.Lock()
-			switch pd.Gradient {
-			case "improving":
+			switch {
+			case pd.GradL < -gradLEpsilon:
 				a.gapTrends.Improving++
-			case "worsening":
+			case pd.GradL > gradLEpsilon:
 				a.gapTrends.Worsening++
-			default: // "stable", "plateau"
+			default:
 				a.gapTrends.Stable++
 			}
 			a.mu.Unlock()
 
-			if pd.Gradient == "worsening" {
+			if pd.GradL > gradLEpsilon {
 				anomaly = "convergence_failure"
-				d := fmt.Sprintf("task %s gradient=worsening directive=%s L=%.3f",
-					pd.TaskID, pd.Directive, pd.Loss.L)
+				d := fmt.Sprintf("task %s ∇L=%.3f (worsening) directive=%s L=%.3f",
+					pd.TaskID, pd.GradL, pd.Directive, pd.Loss.L)
 				detail = &d
 				log.Printf("[AUDIT] CONVERGENCE FAILURE: %s", d)
 				a.mu.Lock()

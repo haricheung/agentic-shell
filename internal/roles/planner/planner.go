@@ -86,7 +86,7 @@ Memory + GGS Constraints (code-derived — ALL constraints are mandatory):
 %s
 
 Directive semantics:
-- "refine": tighten parameters; keep the same approach. Loss is decreasing — you are on the right track.
+- "refine": tighten parameters; keep the same approach. The approach is sound — adjust path or search terms.
 - "change_path": same tool sequence, different target/parameters. Environment blocked the path, not the logic.
 - "change_approach": use a clearly different tool class. The current approach is logically wrong.
 - "break_symmetry": the system is stuck in a local minimum. You MUST NOT reuse any tool in blocked_tools. Demand a novel approach unlike anything tried before.
@@ -186,8 +186,8 @@ func (p *Planner) Run(ctx context.Context) {
 				log.Printf("[R2] ERROR: bad PlanDirective payload: %v", err)
 				continue
 			}
-			log.Printf("[R2] received PlanDirective task_id=%s directive=%s gradient=%s Ω=%.3f",
-				pd.TaskID, pd.Directive, pd.Gradient, pd.BudgetPressure)
+			log.Printf("[R2] received PlanDirective task_id=%s directive=%s prev=%s Ω=%.3f",
+				pd.TaskID, pd.Directive, pd.PrevDirective, pd.BudgetPressure)
 
 			if currentSpec == nil {
 				log.Printf("[R2] WARNING: PlanDirective received but no current TaskSpec")

@@ -95,7 +95,7 @@ func failedOutcome(taskID, subID, reason string) types.SubTaskOutcome {
 // --- integration tests ---
 
 func TestGGSIntegration_ChangePath(t *testing.T) {
-	// First round, D > δ, P = 0.5 (no keywords → neutral) → plateau → change_path
+	// First round, D > δ, P = 0.5 (no keywords → neutral), |∇L|=0 < ε → change_path
 	b := bus.New()
 	g := ggs.New(b, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -111,16 +111,16 @@ func TestGGSIntegration_ChangePath(t *testing.T) {
 	msg := waitMsg(t, directiveCh, 2*time.Second)
 	pd := toPlanDirective(t, msg.Payload)
 	if pd.Directive != "change_path" {
-		t.Errorf("expected change_path, got %q (gradient=%s D=%.2f P=%.2f Ω=%.2f)",
-			pd.Directive, pd.Gradient, pd.Loss.D, pd.Loss.P, pd.BudgetPressure)
+		t.Errorf("expected change_path, got %q (D=%.2f P=%.2f Ω=%.2f ∇L=%.3f)",
+			pd.Directive, pd.Loss.D, pd.Loss.P, pd.BudgetPressure, pd.GradL)
 	}
-	if pd.Gradient != "plateau" {
-		t.Errorf("expected plateau gradient, got %q", pd.Gradient)
+	if pd.PrevDirective != "init" {
+		t.Errorf("expected PrevDirective=init on first round, got %q", pd.PrevDirective)
 	}
 }
 
 func TestGGSIntegration_BreakSymmetry(t *testing.T) {
-	// First round, D > δ, P > 0.5 (logical keyword) → plateau → break_symmetry
+	// First round, D > δ, P > 0.5 (logical keyword), |∇L|=0 < ε → break_symmetry
 	b := bus.New()
 	g := ggs.New(b, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,13 +136,14 @@ func TestGGSIntegration_BreakSymmetry(t *testing.T) {
 	msg := waitMsg(t, directiveCh, 2*time.Second)
 	pd := toPlanDirective(t, msg.Payload)
 	if pd.Directive != "break_symmetry" {
-		t.Errorf("expected break_symmetry, got %q (gradient=%s D=%.2f P=%.2f)",
-			pd.Directive, pd.Gradient, pd.Loss.D, pd.Loss.P)
+		t.Errorf("expected break_symmetry, got %q (D=%.2f P=%.2f ∇L=%.3f)",
+			pd.Directive, pd.Loss.D, pd.Loss.P, pd.GradL)
 	}
 }
 
 func TestGGSIntegration_Refine_ImprovingGradient(t *testing.T) {
-	// Round 1: all failed (D=1.0) → change_path; Round 2: half failed (D=0.5) → ∇L < 0 → refine
+	// Round 1: all failed (D=1.0), P=0.5 → change_path.
+	// Round 2: half failed (D=0.5), P=0.5, ∇L < 0 (|∇L| ≥ ε) → refine (has signal + environmental).
 	b := bus.New()
 	g := ggs.New(b, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -151,7 +152,7 @@ func TestGGSIntegration_Refine_ImprovingGradient(t *testing.T) {
 	go g.Run(ctx)
 	time.Sleep(20 * time.Millisecond)
 
-	// Round 1 — high D, no prior lPrev → gradL=0 → plateau → change_path
+	// Round 1 — high D, no prior lPrev → ∇L=0 → change_path
 	publishReplan(b, "task-rf", []types.SubTaskOutcome{
 		failedOutcome("task-rf", "st-1", ""),
 	}, 0)
@@ -161,7 +162,7 @@ func TestGGSIntegration_Refine_ImprovingGradient(t *testing.T) {
 		t.Fatalf("round 1: unexpected task_id %q", pd1.TaskID)
 	}
 
-	// Round 2 — D=0.5 (improvement from 1.0), L decreases → ∇L < 0 → improving → refine
+	// Round 2 — D=0.5 (improvement from 1.0), L decreases → ∇L < 0 (|∇L| ≥ ε), P=0.5 → refine
 	publishReplan(b, "task-rf", []types.SubTaskOutcome{
 		{SubTaskID: "st-1", ParentTaskID: "task-rf", Status: "matched"},
 		failedOutcome("task-rf", "st-2", ""),
@@ -169,11 +170,14 @@ func TestGGSIntegration_Refine_ImprovingGradient(t *testing.T) {
 	msg2 := waitMsg(t, directiveCh, 2*time.Second)
 	pd2 := toPlanDirective(t, msg2.Payload)
 	if pd2.Directive != "refine" {
-		t.Errorf("round 2: expected refine (improving), got %q (gradient=%s ∇L=%.3f)",
-			pd2.Directive, pd2.Gradient, pd2.GradL)
+		t.Errorf("round 2: expected refine (∇L<0, P≤ρ), got %q (∇L=%.3f P=%.2f)",
+			pd2.Directive, pd2.GradL, pd2.Loss.P)
 	}
 	if pd2.GradL >= 0 {
 		t.Errorf("round 2: expected ∇L < 0 (improving), got ∇L=%.3f", pd2.GradL)
+	}
+	if pd2.PrevDirective != "change_path" {
+		t.Errorf("round 2: expected PrevDirective=change_path, got %q", pd2.PrevDirective)
 	}
 }
 
@@ -210,6 +214,52 @@ func TestGGSIntegration_Abandon_EmitsFinalResult(t *testing.T) {
 		t.Error("expected FinalResult (abandon) but received PlanDirective")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for FinalResult on abandon path")
+	}
+}
+
+func TestGGSIntegration_SuccessPath_EmitsFinalResult(t *testing.T) {
+	// D <= delta (most criteria met) and Ω < theta → "success" macro-state → FinalResult, not PlanDirective.
+	// 4 criteria, 1 fails → D=0.25 <= delta=0.3.
+	b := bus.New()
+	g := ggs.New(b, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	directiveCh := b.Subscribe(types.MsgPlanDirective)
+	finalCh := b.Subscribe(types.MsgFinalResult)
+	go g.Run(ctx)
+	time.Sleep(20 * time.Millisecond)
+
+	publishReplan(b, "task-suc", []types.SubTaskOutcome{
+		{
+			SubTaskID: "st-1", ParentTaskID: "task-suc", Status: "failed",
+			CriteriaVerdicts: []types.CriteriaVerdict{{Criterion: "c1", Verdict: "fail", FailureClass: "environmental"}},
+		},
+		{
+			SubTaskID: "st-2", ParentTaskID: "task-suc", Status: "failed",
+			CriteriaVerdicts: []types.CriteriaVerdict{
+				{Criterion: "c2", Verdict: "pass"},
+				{Criterion: "c3", Verdict: "pass"},
+				{Criterion: "c4", Verdict: "pass"},
+			},
+		},
+	}, 1000)
+
+	select {
+	case msg := <-finalCh:
+		fr := toFinalResult(t, msg.Payload)
+		if fr.TaskID != "task-suc" {
+			t.Errorf("expected task_id task-suc, got %q", fr.TaskID)
+		}
+		if fr.Directive != "success" {
+			t.Errorf("expected Directive=success, got %q", fr.Directive)
+		}
+		if fr.Loss.D > 0.3 {
+			t.Errorf("success path: expected D <= delta=0.3, got D=%.3f", fr.Loss.D)
+		}
+	case <-directiveCh:
+		t.Error("expected FinalResult (success) but received PlanDirective")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for FinalResult on success path")
 	}
 }
 

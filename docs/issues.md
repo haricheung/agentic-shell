@@ -2062,3 +2062,45 @@ Files changed:
 - `.env.example`
 - `CLAUDE.md`
 - `README.md`
+
+---
+
+## Issue #78 — GGS v0.8: decision table refactored, `success` macro-state, `PrevDirective` tracking
+
+**Symptom**
+GGS v0.7 decision table used ∇L sign as the primary split, leading to two problems: (1) improving
+loss with a logically wrong approach returned "refine" instead of "change_approach" (case 3.3 —
+the system may be hallucinating success or criteria-gaming); (2) D = 0 was required for acceptance,
+causing wasteful replanning when the task was already "close enough".
+
+**Root cause**
+v0.7 `selectDirective` used the gradient label ("improving"/"plateau"/"worsening") as its primary
+split, conflating trajectory noise with approach quality. The `Gradient` string in `PlanDirective`
+exposed this internal label to consumers (Auditor, UI, Planner), coupling them to a noisy signal.
+No convergence threshold (δ) was checked before action directives, so D = 0.05 triggered the same
+replanning as D = 1.0.
+
+**Fix**
+Implemented spec v0.8 across 9 files:
+
+- `internal/types/types.go`: Remove `Gradient string` from `PlanDirective`; add `PrevDirective string`.
+  Add `Directive string` and `PrevDirective string` to `FinalResult`.
+- `internal/roles/ggs/ggs.go`: Rewrite `selectDirective` with v0.8 diagnostic cascade
+  (Ω → D → |∇L|+P). Add `rho` constant. Add `success` macro-state path in `process()`.
+  Add `prevDirective map[string]string` to GGS struct; populated on every action directive,
+  cleared on terminal paths. Add `buildSuccessSummary()` and `mergeMatchedOutputs()` helpers.
+  Remove `gradient` parameter from `buildRationale()`. `processAccept()` now emits
+  `Directive="accept"` and `PrevDirective` in FinalResult.
+- `internal/roles/ggs/ggs_test.go`: Updated `selectDirective` tests for new signature; added
+  tests for `success`, case 3.3 fix, `buildSuccessSummary`, `mergeMatchedOutputs`, `prevDirective`.
+- `internal/roles/ggs/ggs_integration_test.go`: Removed `pd.Gradient` assertions; added
+  `PrevDirective` checks; added `TestGGSIntegration_SuccessPath_EmitsFinalResult`.
+- `internal/ui/display.go`: Abandon detection changed from `fr.Loss.D > 0` to
+  `fr.Directive == "abandon"` (correct for the `success` path where D ≤ δ but D > 0).
+  `msgDetail` for PlanDirective: arrow now from `pd.GradL` sign; shows `prev→directive` transition.
+- `internal/ui/display_test.go`: Removed `Gradient:` from PlanDirective struct literals.
+- `internal/roles/planner/planner.go`: Log line uses `pd.PrevDirective`; updated `refine`
+  directive description to remove "Loss is decreasing" (no longer always true in v0.8).
+- `internal/roles/auditor/auditor.go`: Gap trend and convergence failure detection now uses
+  `pd.GradL` threshold (±0.1) instead of `pd.Gradient` string.
+- `internal/roles/auditor/auditor_test.go`: Removed `Gradient:` from test fixture.

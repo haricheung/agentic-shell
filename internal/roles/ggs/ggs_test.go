@@ -2,7 +2,9 @@ package ggs
 
 import (
 	"context"
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,61 +305,79 @@ func TestComputeGradient_WorseningWhenPositiveGrad(t *testing.T) {
 	}
 }
 
-// ── selectDirective ───────────────────────────────────────────────────────────
+// ── selectDirective (v0.8 cascade) ───────────────────────────────────────────
 
 func TestSelectDirective_AbandonWhenOmegaHigh(t *testing.T) {
 	// Returns "abandon" when Omega >= abandonOmega regardless of other values
-	got := selectDirective(0.0, 0.5, 0.5, abandonOmega, "stable")
+	got := selectDirective(0.0, 0.5, 0.5, abandonOmega)
 	if got != "abandon" {
 		t.Errorf("expected abandon, got %q", got)
 	}
 }
 
-func TestSelectDirective_RefineWhenImproving(t *testing.T) {
-	// Returns "refine" when gradient is "improving"
-	got := selectDirective(-0.2, 0.5, 0.3, 0.2, "improving")
-	if got != "refine" {
-		t.Errorf("expected refine, got %q", got)
+func TestSelectDirective_SuccessWhenDSmallOmegaLow(t *testing.T) {
+	// Returns "success" when D <= delta and Omega < abandonOmega (new in v0.8)
+	got := selectDirective(0.0, delta-0.05, 0.8, 0.2)
+	if got != "success" {
+		t.Errorf("expected success, got %q", got)
+	}
+}
+
+func TestSelectDirective_SuccessOverridesHighP(t *testing.T) {
+	// Returns "success" even when P is high — D <= delta takes priority over P
+	got := selectDirective(0.0, delta, 0.9, 0.1)
+	if got != "success" {
+		t.Errorf("expected success (D=%v <= delta=%v), got %q", delta, delta, got)
 	}
 }
 
 func TestSelectDirective_BreakSymmetryWhenPlateauHighP(t *testing.T) {
-	// Returns "break_symmetry" when gradient is "plateau" and P > 0.5
-	got := selectDirective(0.0, 0.5, 0.8, 0.2, "plateau")
+	// Returns "break_symmetry" when |∇L| < epsilon and P > rho (stuck + logical failure)
+	got := selectDirective(0.0, 0.5, 0.8, 0.2)
 	if got != "break_symmetry" {
 		t.Errorf("expected break_symmetry, got %q", got)
 	}
 }
 
 func TestSelectDirective_ChangePathWhenPlateauLowP(t *testing.T) {
-	// Returns "change_path" when gradient is "plateau" and P <= 0.5
-	got := selectDirective(0.0, 0.5, 0.2, 0.2, "plateau")
+	// Returns "change_path" when |∇L| < epsilon and P <= rho (stuck + environmental failure)
+	got := selectDirective(0.0, 0.5, 0.2, 0.2)
 	if got != "change_path" {
 		t.Errorf("expected change_path, got %q", got)
 	}
 }
 
-func TestSelectDirective_ChangeApproachWhenWorseningHighP(t *testing.T) {
-	// Returns "change_approach" when gradient is "worsening" and P > 0.5
-	got := selectDirective(0.2, 0.5, 0.8, 0.2, "worsening")
+func TestSelectDirective_ChangeApproachWhenHasSignalHighP(t *testing.T) {
+	// Returns "change_approach" when |∇L| >= epsilon and P > rho (has signal + logical failure)
+	// This includes the v0.7 case 3.3 fix: improving ∇L + logical failure → change_approach, not refine.
+	got := selectDirective(epsilon+0.05, 0.5, 0.8, 0.2)
 	if got != "change_approach" {
 		t.Errorf("expected change_approach, got %q", got)
 	}
 }
 
-func TestSelectDirective_RefineWhenWorseningLowP(t *testing.T) {
-	// Returns "refine" when gradient is "worsening" and P <= 0.5
-	got := selectDirective(0.2, 0.5, 0.2, 0.2, "worsening")
+func TestSelectDirective_ChangeApproachWhenImprovingHighP(t *testing.T) {
+	// v0.8 case 3.3 fix: ∇L < -ε (improving), D > δ, P > ρ → change_approach (not refine).
+	// v0.7 would have returned "refine" here (wrong — improving loss with wrong approach).
+	got := selectDirective(-(epsilon + 0.05), 0.5, 0.8, 0.2)
+	if got != "change_approach" {
+		t.Errorf("expected change_approach (v0.8 case 3.3 fix), got %q", got)
+	}
+}
+
+func TestSelectDirective_RefineWhenHasSignalLowP(t *testing.T) {
+	// Returns "refine" when |∇L| >= epsilon and P <= rho (has signal + environmental failure)
+	got := selectDirective(epsilon+0.05, 0.5, 0.2, 0.2)
 	if got != "refine" {
 		t.Errorf("expected refine, got %q", got)
 	}
 }
 
-func TestSelectDirective_RefineWhenStable(t *testing.T) {
-	// Returns "refine" for "stable" gradient (converged, minor tightening)
-	got := selectDirective(0.0, 0.1, 0.5, 0.2, "stable")
+func TestSelectDirective_RefineWhenImprovingLowP(t *testing.T) {
+	// Returns "refine" when ∇L < -epsilon and P <= rho (improving + environmental)
+	got := selectDirective(-(epsilon + 0.05), 0.5, 0.2, 0.2)
 	if got != "refine" {
-		t.Errorf("expected refine for stable, got %q", got)
+		t.Errorf("expected refine, got %q", got)
 	}
 }
 
@@ -616,6 +636,103 @@ func TestProcessAccept_OmegaUsesElapsedTimeAndPriorReplans(t *testing.T) {
 	omega := computeOmega(0, timeBudgetMs/2) // 0 replans, half budget elapsed
 	if math.Abs(omega-w2*0.5) > 1e-9 {
 		t.Errorf("expected Ω=w2*0.5=%.3f, got %.3f", w2*0.5, omega)
+	}
+}
+
+// ── buildSuccessSummary ──────────────────────────────────────────────────────
+
+func TestBuildSuccessSummary_StartsWithSuccessPrefix(t *testing.T) {
+	// Starts with a success prefix indicating convergence threshold was met
+	rr := types.ReplanRequest{TaskID: "t1", Outcomes: []types.SubTaskOutcome{{Status: "matched"}}}
+	got := buildSuccessSummary(rr)
+	if !strings.Contains(got, "✅") {
+		t.Errorf("expected success prefix in summary, got %q", got)
+	}
+}
+
+func TestBuildSuccessSummary_ListsMatchedAndFailedCounts(t *testing.T) {
+	// Lists how many subtasks matched and how many failed within threshold
+	rr := types.ReplanRequest{
+		TaskID: "t1",
+		Outcomes: []types.SubTaskOutcome{
+			{Status: "matched"},
+			{Status: "failed"},
+		},
+	}
+	got := buildSuccessSummary(rr)
+	if !strings.Contains(got, "1 subtask(s) completed") {
+		t.Errorf("expected matched count in summary, got %q", got)
+	}
+	if !strings.Contains(got, "1 subtask(s) failed") {
+		t.Errorf("expected failed count in summary, got %q", got)
+	}
+}
+
+// ── mergeMatchedOutputs ──────────────────────────────────────────────────────
+
+func TestMergeMatchedOutputs_NilWhenNoMatchedOutputs(t *testing.T) {
+	// Returns nil when no matched outcomes have non-nil output
+	outcomes := []types.SubTaskOutcome{{Status: "failed"}, {Status: "matched", Output: nil}}
+	got := mergeMatchedOutputs(outcomes)
+	if got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestMergeMatchedOutputs_SingleOutputNotWrapped(t *testing.T) {
+	// Returns the single output directly (not wrapped in a slice) when exactly one
+	outcomes := []types.SubTaskOutcome{{Status: "matched", Output: "result"}}
+	got := mergeMatchedOutputs(outcomes)
+	if got != "result" {
+		t.Errorf("expected \"result\", got %v", got)
+	}
+}
+
+func TestMergeMatchedOutputs_MultipleOutputsReturnSlice(t *testing.T) {
+	// Returns []any of all outputs when multiple matched outputs exist
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched", Output: "a"},
+		{Status: "matched", Output: "b"},
+	}
+	got := mergeMatchedOutputs(outcomes)
+	slice, ok := got.([]any)
+	if !ok {
+		t.Fatalf("expected []any, got %T", got)
+	}
+	if len(slice) != 2 {
+		t.Errorf("expected 2 outputs, got %d", len(slice))
+	}
+}
+
+// ── prevDirective tracking ────────────────────────────────────────────────────
+
+func TestProcessAccept_PrevDirectiveIsInitOnFirstTry(t *testing.T) {
+	// FinalResult.PrevDirective is "init" when no prior directive has been emitted
+	b := bus.New()
+	tap := b.NewTap()
+	gs := New(b, nil)
+
+	gs.processAccept(context.Background(), types.OutcomeSummary{TaskID: "t-init"})
+
+	timeout := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case msg := <-tap:
+			if msg.Type == types.MsgFinalResult {
+				var fr types.FinalResult
+				if b2, _ := json.Marshal(msg.Payload); json.Unmarshal(b2, &fr) == nil {
+					if fr.PrevDirective != "init" {
+						t.Errorf("expected PrevDirective=init, got %q", fr.PrevDirective)
+					}
+					if fr.Directive != "accept" {
+						t.Errorf("expected Directive=accept, got %q", fr.Directive)
+					}
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for FinalResult")
+		}
 	}
 }
 

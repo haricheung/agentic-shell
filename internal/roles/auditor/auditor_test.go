@@ -37,10 +37,10 @@ func makePlanDirectiveMsg(taskID, directive string, D float64) types.Message {
 		To:   types.RolePlanner,
 		Type: types.MsgPlanDirective,
 		Payload: types.PlanDirective{
-			TaskID:    taskID,
-			Directive: directive,
-			Gradient:  "plateau",
-			Loss:      types.LossBreakdown{D: D},
+			TaskID:        taskID,
+			Directive:     directive,
+			PrevDirective: "init",
+			Loss:          types.LossBreakdown{D: D},
 		},
 	}
 }
