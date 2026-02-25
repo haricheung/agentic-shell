@@ -2,9 +2,10 @@
 
 **Version**: 0.8
 **Status**: Draft
-**Date**: 2026-02-24
+**Date**: 2026-02-25
 **Scope**: Eight roles. GGS decision table refactored for completeness, orthogonality, and
-Dreamer readiness. Dreamer architecture deferred to v0.9.
+Dreamer readiness. MKCT memory engine (Megram/K/C/T layers, dual-channel convolution,
+LevelDB, Dreamer offline consolidation) fully specified. Implementation-ready.
 
 [toc]
 
@@ -21,6 +22,9 @@ Dreamer readiness. Dreamer architecture deferred to v0.9.
 | P threshold parameterised as ρ (default 0.5) | Preparation for Dreamer tuning — ρ will be adjustable per task type based on historical failure patterns |
 | `gradient` label removed from `PlanDirective` | v0.7 exposed "improving/stable/worsening/plateau" as a top-level label. This is no longer meaningful — the macro-state name carries the full decision. `grad_l` (raw ∇L value) is retained for observability |
 | First-round behaviour simplified | v0.7 first round always landed in plateau (∇L = 0). Under the new table, first round with D > δ: if \|∇L\| < ε (always true on round 1) → split by P into break_symmetry or change_path. Consistent with the new priority — no special-casing needed |
+| R5 Shared Memory fully redesigned: MKCT pyramid, Megram atomic tuples, dual-channel convolution potentials (M_attention / M_decision), LevelDB inverted index, Dreamer consolidation + GC engine | Keyword-scan JSON store cannot support cross-task SOP promotion, decay-weighted avoidance, or structured distinction between approach-level and path-level failures |
+| GGS is now the sole writer to R5 — writes one Megram per blocked_target on action states; one macro-state Megram on terminal states (accept / success / abandon) | Metaval previously wrote MemoryEntry on accept/fail, bypassing GGS observability and conflating task semantics with memory semantics |
+| R2 memory query now returns structured data (`[]SOPRecord`, `Potentials`) instead of formatted text; R2 formats constraints into the prompt itself | Memory-as-text-formatter made the memory layer untestable independently of R2 and violated the Data Service principle |
 
 ---
 
@@ -72,7 +76,7 @@ permitted — every message must be routable.
 | R3 | Executor | Effector Agent | Plant | If a feasible sub-task is not correctly executed, this role is responsible |
 | R4a | Agent-Validator | Effector Agent | Sensor + Controller (fast loop) | If a gap between outcome and sub-task goal goes unresolved or unreported, this role is responsible |
 | R4b | Meta-Validator | Metaagent | Sensor (medium loop) | If the merged result is accepted outside plausible range or a task is silently abandoned, this role is responsible |
-| R5 | Shared Memory | Infrastructure | State store | If valid data is lost, corrupted, or wrongly retrieved, this role is responsible |
+| R5 | Shared Memory | Infrastructure | MKCT memory engine; episodic-to-semantic consolidation via Dreamer | If valid data is lost, corrupted, or wrongly retrieved, this role is responsible |
 | R6 | Auditor | Infrastructure | Lateral observer | If systematic failures go undetected and unreported to the human operator, this role is responsible |
 | R7 | Goal Gradient Solver | Metaagent | Controller (medium loop) | If the replanning direction is wrong, too conservative, or too aggressive for the observed gradient, this role is responsible |
 
@@ -108,8 +112,27 @@ TaskSpec {
 - `PlanDirective.gradient` label removed — R2 reads the `directive` field directly
 - `PlanDirective.directive` now includes `success` (GGS may accept with D ≤ δ before reaching R2 — R2 is not invoked on success path)
 
-**Memory Calibration Protocol**: Unchanged from v0.7.
-MUST NOT set = memory-sourced constraints ∪ GGS-sourced `blocked_tools` ∪ GGS-sourced `blocked_targets`.
+**Memory Calibration Protocol** (MKCT-based):
+
+**Tag derivation** (R2 responsibility before querying):
+- Space: `"intent:<first-3-words-of-intent-lowercased-underscored>"` — e.g. `intent:db_migration_task`
+- Entity: `"env:local"` (default for all local-machine tasks)
+
+**Query sequence**:
+1. `QueryC(space, entity)` → `[]SOPRecord` — C-level SOPs/Constraints for this intent type
+2. `QueryMK(space, entity)` → `Potentials{Attention, Decision, Action}` — live convolution result
+
+**Action mapping**:
+
+| Action | Prompt effect |
+|---|---|
+| Exploit | SHOULD PREFER this approach |
+| Avoid | MUST NOT use this approach |
+| Caution | Proceed with confirmation gate / sandboxing |
+| Ignore | Omit from prompt |
+
+**Merged MUST NOT set** (unchanged priority order):
+`memory Avoid SOPs` ∪ `GGS blocked_tools` ∪ `GGS blocked_targets`
 
 **Contract**: Unchanged from v0.7.
 
@@ -129,7 +152,13 @@ MUST NOT set = memory-sourced constraints ∪ GGS-sourced `blocked_tools` ∪ GG
 
 ## R4b — Meta-Validator
 
-*(Unchanged from v0.7.)*
+*(Unchanged from v0.7, except as noted below.)*
+
+**Does NOT** (addendum to v0.7):
+- Write to Shared Memory — GGS is the sole writer to R5 on all paths.
+
+*Clarifying note*: `processAccept()` publishes `OutcomeSummary` to GGS as before; GGS
+then writes the `accept` Megram. R4b does not write any MemoryEntry.
 
 ---
 
@@ -365,6 +394,12 @@ Combined MUST NOT set = memory MUST NOTs ∪ `blocked_tools` ∪ `blocked_target
 - On **abandon** (Ω ≥ θ): emit `FinalResult` to User with failure summary
 - On **action** states: emit `PlanDirective` to R2
 - Populate `FinalResult.Loss`, `FinalResult.GradL`, `FinalResult.Replans` on every emission
+- For action states (change_path, refine, change_approach, break_symmetry): write one
+  Megram per entry in `blocked_targets` to R5; tags = `(tool:<name>, path:<target>)` parsed
+  from the blocked target string
+- For terminal states (accept, success, abandon): write one Megram to R5 with tags
+  `(intent:<task-intent-slug>, env:local)`
+- All writes are fire-and-forget (non-blocking channel send to R5 write goroutine)
 
 ### Contract
 
@@ -422,13 +457,121 @@ round for any task always shows `init` as the previous state.
 - Observe individual tool calls (that is R4a's domain)
 - Merge or verify outputs (R4b)
 - Override the fan-in gate (R4b owns that)
-- Write to Shared Memory
 
 ---
 
 ## R5 — Shared Memory
 
-*(Unchanged from v0.7.)*
+### Mission
+
+Serve as the system's durable cognitive substrate. R5 accumulates experience as
+Megrams, promotes recurring patterns into cross-task SOPs (C-level), and decays stale
+knowledge — without ever blocking the operational hot path.
+
+### 6a. The MKCT Pyramid
+
+| Layer | Name | Decay k | Description |
+|---|---|---|---|
+| M | Megram | per Quantization Matrix | Raw episodic fact; default layer on creation |
+| K | Knowledge | same as M | Task-scoped cache; pruned by Dreamer GC |
+| C | Common Sense | 0.0 (timeless) | Promoted SOP or Constraint; LLM-distilled from M clusters |
+| T | Thinking | 0.0 (timeless) | System persona / values; hardcoded in system prompt for MVP; slow-evolution mechanism deferred to Phase 2 |
+
+### 6b. Megram Base Tuple
+
+```
+Megram = ⟨ID, Level, created_at, last_recalled_at, space, entity, content, state, f, sigma, k⟩
+```
+
+Tag conventions:
+- *Micro-event* (action states): `space="tool:<name>"`, `entity="path:<target>"` — one Megram per blocked_target
+- *Macro-event* (terminal states): `space="intent:<intent-slug>"`, `entity="env:local"` — one Megram per routing decision
+
+### 6c. GGS Quantization Matrix
+
+| State | f | σ | k | Physical meaning |
+|---|---|---|---|---|
+| `abandon` | 0.95 | -1.0 | 0.05 | PTSD trauma; hard constraint |
+| `accept` (D=0) | 0.90 | +1.0 | 0.05 | Flawless golden path |
+| `change_approach` | 0.85 | -1.0 | 0.05 | Anti-pattern; blacklist tool class |
+| `success` (D≤δ) | 0.80 | +1.0 | 0.05 | Best practice SOP |
+| `break_symmetry` | 0.75 | +1.0 | 0.05 | Breakthrough; favour retry |
+| `change_path` | 0.30 | 0.0 | 0.2 | Dead end; tool unharmed; path avoided via GGS blocked_targets |
+| `refine` | 0.10 | +0.5 | 0.5 | Muscle memory; fast GC |
+
+Decay constants: k=0.05 → ~14-day half-life; k=0.2 → ~3.5-day; k=0.5 → ~1.4-day.
+C/T-level entries have k=0.0 (timeless until Trust Bankruptcy).
+
+### 6d. Dual-Channel Convolution Potentials
+
+```
+M_attention(space, entity) = Σ |f_i| · exp(−k_i · Δt_days)
+M_decision(space, entity)  = Σ  σ_i · f_i · exp(−k_i · Δt_days)
+```
+
+Derived action:
+
+| Condition | Action |
+|---|---|
+| M_att < 0.5 | Ignore |
+| M_att ≥ 0.5 AND M_dec > 0.2 | Exploit |
+| M_att ≥ 0.5 AND M_dec < -0.2 | Avoid |
+| M_att ≥ 0.5 AND \|M_dec\| ≤ 0.2 | Caution |
+
+### 6e. Dreamer — Offline Consolidation Engine
+
+Runs as a background goroutine. Triggered: (a) after each task's FinalResult + a brief
+settle delay, and (b) optionally on a timer. Never blocks the operational path.
+
+**Upward flow (Consolidation — Λ_rule thresholds)**
+- Scan Megrams with identical `(space, entity)` tag pair
+- `M_attention ≥ 5.0 AND M_decision ≥ 3.0` → invoke LLM to distil Best Practice → new Megram(Level=C, k=0.0)
+- `M_attention ≥ 5.0 AND M_decision ≤ -3.0` → invoke LLM to distil Constraint → new Megram(Level=C, k=0.0)
+- Raw M-level Megrams that were consolidated may be GC'd (optional; for space reclamation)
+
+**Downward flow (Degradation + GC)**
+- *Trust Bankruptcy* (Λ_demote): C-level entry where live `M_decision < 0.0` → strip time immunity (k reverts to 0.05; Megram demoted to K)
+- *Physical Forgetting* (Λ_gc): M/K entry where live `M_attention < 0.1` → hard DELETE from LevelDB
+
+### 6f. Storage: LevelDB (syndtr/goleveldb — pure Go, no CGO)
+
+Key schema:
+```
+megram:<id>               → Megram JSON (primary record)
+idx:<space>:<entity>:<id> → ""          (inverted index for tag scan)
+lvl:<level>:<id>          → ""          (level scan for Dreamer)
+recall:<id>               → RFC3339     (last_recalled_at; updated on QueryC hits)
+```
+
+All Megram writes are **Append-Only**. Error correction appends a negative-σ Megram
+rather than mutating existing records. `recall:` entries are the only mutable metadata.
+
+### 6g. MemoryService Interface (Go)
+
+```go
+// MemoryService is the high-level interface used by all roles.
+// Implementations: LevelDB (production), in-memory (tests).
+type MemoryService interface {
+    Write(m Megram)                                          // async, non-blocking; fire-and-forget
+    QueryC(ctx, space, entity string) ([]SOPRecord, error)  // C-level SOPs; updates last_recalled_at
+    QueryMK(ctx, space, entity string) (Potentials, error)  // live dual-channel convolution
+    RecordNegativeFeedback(ctx, ruleID, content string)     // appends negative-σ Megram for stale SOP
+    Close()                                                 // drains write queue; stops Dreamer
+}
+```
+
+### Contract
+
+| Direction | Counterparty | Format |
+|---|---|---|
+| Receives writes | GGS (R7) only | `Megram` (via async write queue) |
+| Serves C reads | Planner (R2) | `[]SOPRecord` |
+| Serves M/K reads | Planner (R2) | `Potentials{Attention, Decision, Action}` |
+
+**Does NOT**:
+- Format prompt text (R2 owns that)
+- Block the GGS hot path on writes
+- Accept writes from any role other than GGS
 
 ---
 
@@ -460,12 +603,12 @@ User
  ▼
 [R1]──TaskSpec──►[R2 Planner]◄──────────────────────────── PlanDirective ──[R7 GGS]
                   │    ▲                                        ▲    │
-      ┌───────────┤    └──── MemoryEntry[] ◄── [R5]            │    │
-      │  calibrate│                                            │    │
-      │  constrain│                                            │    ├──► FinalResult
-      │  plan     │                                            │    │    (success/abandon
-      │           │                          [R4b]──ReplanReq──┘    │     → User)
-      │  SubTask[]│                            ▲                    │
+      ┌───────────┤    └──── []SOPRecord, Potentials ◄── [R5] ──────┤
+      │  calibrate│                                            │    │ Megram writes
+      │  constrain│                                            │    │ (async, fire-and-forget)
+      │  plan     │                                            │    ├──► FinalResult
+      │           │                          [R4b]──ReplanReq──┘    │    (success/abandon
+      │  SubTask[]│                            ▲                    │     → User)
       │           │                            │ SubTaskOutcome[]   │
       │           │                            │                    │
       └───────────┴──►[R3 × N]──►[R4a × N]────┘                    │
@@ -494,8 +637,13 @@ User
 | GGS emits `success` when Ω < θ and D ≤ δ regardless of P and ∇L | R7 decision table |
 | `blocked_targets` accumulates across all replan rounds for the same task | R7 `triedTargets` map |
 | GGS is the sole emitter of `FinalResult` on all paths (accept, success, abandon) | R7 code |
-| `FinalResult.Loss.D == 0.0` iff accept/success path; `> 0.0` iff abandon path | R7 code |
 | `FinalResult.Directive` is always one of `accept`, `success`, `abandon` | R7 code |
+| GGS is the sole writer to R5 Shared Memory | R7 code; R4b no longer writes MemoryEntry |
+| One Megram per blocked_target for action states (not one per routing decision) | R7 write path |
+| Megram writes are fire-and-forget; GGS never blocks on memory I/O | R5 async write queue |
+| Memory returns structured data (`[]SOPRecord`, `Potentials`); R2 formats into prompt | R5 interface contract |
+| C-level Megrams have k=0.0 (timeless) until Trust Bankruptcy | R5 Dreamer engine |
+| Recall of a C-level SOP updates last_recalled_at (extends decay reset) | R5 QueryC implementation |
 | `PlanDirective.PrevDirective` is `init` on first round; equals prior round's directive thereafter | R7 `prevDirective` map |
 | Law 2 kill-switch: 2 consecutive worsening rounds → force abandon | R7 `worseningCount` |
 
@@ -541,10 +689,10 @@ User
 
 | Component | Design specification needed before implementation |
 |---|---|
-| Dreamer (agent-level) | Async memory consolidation after sub-task completion; wakes on P > ρ branch to assess strategy viability |
-| Dreamer (metaagent-level) | Cross-task consolidation; produces semantic entries capturing patterns across sessions |
 | GGS hyperparameter tuning | Empirical calibration of α, β, λ, w₁, w₂, ε, δ, ρ, θ from Auditor session data |
-| Semantic memory layer in R5 | Separate read API for pre-curated semantic entries (Dreamer output) |
 | ∇L sign urgency modulation | Concrete implementation of per-macro-state urgency adjustment based on ∇L sign |
 | Structured criteria mode | `{criterion, mode}` objects distinguishing `verifiable` from `plausible`; affects D computation weighting |
 | R2 graceful failure on abandon | LLM-backed partial result + next-move suggestions (currently code-template only) |
+| T-layer slow-evolution mechanism | Phase 2: allow system persona / values to update from high-confidence C-level consolidation |
+| Dreamer Phase 2: Schema Transfer Engine | Semantic factorization on high-scoring Megrams; generation of Hypothesis Megrams to invent novel tool combinations |
+| Dreamer Phase 2: Cognitive Dissonance Megrams | Dissonance Megrams (High f, Negative σ) generated on Soft Overwrite; shatter credibility of outdated SOPs during nightly Dreamer cycle |
