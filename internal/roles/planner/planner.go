@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/llm"
+	"github.com/haricheung/agentic-shell/internal/roles/memory"
 	"github.com/haricheung/agentic-shell/internal/tasklog"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
@@ -110,23 +111,21 @@ type Planner struct {
 	llm    *llm.Client
 	b      *bus.Bus
 	logReg *tasklog.Registry
+	mem    types.MemoryService // R5; may be nil (memory disabled)
 }
 
-// New creates a Planner.
-func New(b *bus.Bus, llmClient *llm.Client, logReg *tasklog.Registry) *Planner {
-	return &Planner{llm: llmClient, b: b, logReg: logReg}
+// New creates a Planner. mem may be nil to disable MKCT memory queries (e.g. in tests).
+func New(b *bus.Bus, llmClient *llm.Client, logReg *tasklog.Registry, mem types.MemoryService) *Planner {
+	return &Planner{llm: llmClient, b: b, logReg: logReg, mem: mem}
 }
 
 // Run listens for TaskSpec and PlanDirective messages.
+// Memory is queried synchronously via direct calls to R5 (no bus round-trip).
 func (p *Planner) Run(ctx context.Context) {
 	taskSpecCh := p.b.Subscribe(types.MsgTaskSpec)
 	directiveCh := p.b.Subscribe(types.MsgPlanDirective)
-	memoryCh := p.b.Subscribe(types.MsgMemoryResponse)
 
-	// pendingTaskSpecs holds the current TaskSpec awaiting planning
 	var currentSpec *types.TaskSpec
-	var memoryEntries []types.MemoryEntry
-	var awaitingMemory bool
 
 	for {
 		select {
@@ -144,38 +143,11 @@ func (p *Planner) Run(ctx context.Context) {
 			}
 			log.Printf("[R2] received TaskSpec task_id=%s", spec.TaskID)
 			currentSpec = &spec
-			memoryEntries = nil
-
-			// Query memory before planning
-			p.b.Publish(types.Message{
-				ID:        uuid.New().String(),
-				Timestamp: time.Now().UTC(),
-				From:      types.RolePlanner,
-				To:        types.RoleMemory,
-				Type:      types.MsgMemoryRead,
-				Payload: types.MemoryQuery{
-					Query: spec.Intent,
-				},
-			})
-			awaitingMemory = true
-
-		case msg, ok := <-memoryCh:
-			if !ok {
-				return
-			}
-			if !awaitingMemory || currentSpec == nil {
-				continue
-			}
-			resp, err := toMemoryResponse(msg.Payload)
-			if err != nil {
-				log.Printf("[R2] ERROR: bad MemoryResponse payload: %v", err)
-			} else {
-				memoryEntries = resp.Entries
-			}
-			awaitingMemory = false
-			if err := p.plan(ctx, *currentSpec, memoryEntries); err != nil {
-				log.Printf("[R2] ERROR: planning failed: %v", err)
-			}
+			go func(s types.TaskSpec) {
+				if err := p.plan(ctx, s); err != nil {
+					log.Printf("[R2] ERROR: planning failed: %v", err)
+				}
+			}(spec)
 
 		case msg, ok := <-directiveCh:
 			if !ok {
@@ -193,45 +165,45 @@ func (p *Planner) Run(ctx context.Context) {
 				log.Printf("[R2] WARNING: PlanDirective received but no current TaskSpec")
 				continue
 			}
-
-			if err := p.replanWithDirective(ctx, *currentSpec, pd, memoryEntries); err != nil {
-				log.Printf("[R2] ERROR: replanning failed: %v", err)
-			}
+			spec := *currentSpec
+			go func(s types.TaskSpec, directive types.PlanDirective) {
+				if err := p.replanWithDirective(ctx, s, directive); err != nil {
+					log.Printf("[R2] ERROR: replanning failed: %v", err)
+				}
+			}(spec, pd)
 		}
 	}
 }
 
-func (p *Planner) plan(ctx context.Context, spec types.TaskSpec, memory []types.MemoryEntry) error {
+func (p *Planner) plan(ctx context.Context, spec types.TaskSpec) error {
 	// Open (or retrieve existing) task log — idempotent across replan rounds.
 	tl := p.logReg.Open(spec.TaskID, spec.Intent)
 
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
-	constraints := calibrate(memory, spec.Intent)
+	constraints := p.queryMKCTConstraints(ctx, spec.Intent)
 
 	today := time.Now().UTC().Format("2006-01-02")
 	var userPrompt string
 	if constraints != "" {
-		log.Printf("[R2] calibration: injecting constraints from %d memory entries", len(memory))
 		userPrompt = fmt.Sprintf(
 			"Today's date: %s\n\nTaskSpec:\n%s\n\n--- MEMORY CONSTRAINTS (code-derived) ---\n%s--- END CONSTRAINTS ---",
 			today, specJSON, constraints)
 	} else {
-		log.Printf("[R2] calibration: no relevant memory entries")
 		userPrompt = fmt.Sprintf("Today's date: %s\n\nTaskSpec:\n%s", today, specJSON)
 	}
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
 }
 
 // replanWithDirective is called when R2 receives a PlanDirective from GGS (v0.7+).
-// It merges GGS blocked_tools and blocked_targets into the MUST NOT constraint set and applies the directive.
-func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, pd types.PlanDirective, memory []types.MemoryEntry) error {
+// It merges MKCT memory constraints with GGS blocked_tools and blocked_targets.
+func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, pd types.PlanDirective) error {
 	tl := p.logReg.Get(spec.TaskID) // log already open from initial plan()
 
 	pdJSON, _ := json.MarshalIndent(pd, "", "  ")
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
 
-	// Merge memory-sourced constraints with GGS blocked_tools and blocked_targets.
-	constraints := calibrate(memory, spec.Intent)
+	// Query MKCT memory for this intent.
+	constraints := p.queryMKCTConstraints(ctx, spec.Intent)
 
 	// blocked_tools: tool names to avoid (logical failure directives: break_symmetry, change_approach).
 	if len(pd.BlockedTools) > 0 {
@@ -267,6 +239,101 @@ func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, 
 	today := time.Now().UTC().Format("2006-01-02")
 	userPrompt := "Today's date: " + today + "\n\n" + fmt.Sprintf(planDirectivePrompt, pdJSON, specJSON, constraints)
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
+}
+
+// queryMKCTConstraints queries R5 for the given intent and returns a formatted
+// constraint string for injection into the planning prompt. Returns "" when memory
+// is disabled (mem == nil) or when no relevant entries exist.
+//
+// Expectations:
+//   - Returns "" when p.mem is nil
+//   - Returns "" when QueryC and QueryMK both return empty/Ignore results
+//   - Derives space tag as memory.IntentSlug(intent); entity as "env:local"
+//   - Includes "SHOULD PREFER" block when Action is Exploit
+//   - Includes "MUST NOT" block when Action is Avoid
+//   - Includes "CAUTION" block when Action is Caution
+//   - Appends C-level SOPs as "SHOULD PREFER" (σ>0) or "MUST NOT" (σ<0) lines
+func (p *Planner) queryMKCTConstraints(ctx context.Context, intent string) string {
+	if p.mem == nil {
+		return ""
+	}
+	space := memory.IntentSlug(intent)
+	entity := "env:local"
+
+	sops, err1 := p.mem.QueryC(ctx, space, entity)
+	pots, err2 := p.mem.QueryMK(ctx, space, entity)
+	if err1 != nil {
+		log.Printf("[R2] WARNING: QueryC failed: %v", err1)
+	}
+	if err2 != nil {
+		log.Printf("[R2] WARNING: QueryMK failed: %v", err2)
+	}
+
+	constraints := calibrateMKCT(sops, pots)
+	if constraints != "" {
+		log.Printf("[R2] MKCT calibration: %d SOPs, action=%s", len(sops), pots.Action)
+	} else {
+		log.Printf("[R2] MKCT calibration: no relevant memory (action=%s)", pots.Action)
+	}
+	return constraints
+}
+
+// calibrateMKCT builds a planning constraint string from MKCT QueryC and QueryMK results.
+// SOPs with σ>0 become SHOULD PREFER lines; SOPs with σ≤0 become MUST NOT lines.
+// Potential action (Exploit/Avoid/Caution) adds a general heuristic line.
+//
+// Expectations:
+//   - Returns "" when sops is empty and pots.Action is "Ignore"
+//   - Includes "SHOULD PREFER" block when pots.Action is "Exploit"
+//   - Includes "MUST NOT" block when pots.Action is "Avoid"
+//   - Includes "CAUTION" block when pots.Action is "Caution"
+//   - Positive-σ SOPs appear under "SHOULD PREFER (proven best practices)"
+//   - Non-positive-σ SOPs appear under "MUST NOT (proven constraints)"
+func calibrateMKCT(sops []types.SOPRecord, pots types.Potentials) string {
+	var sb strings.Builder
+
+	// General heuristic from dual-channel potentials.
+	switch pots.Action {
+	case "Exploit":
+		sb.WriteString("SHOULD PREFER (memory: this approach worked well for similar tasks):\n")
+		sb.WriteString("  - Follow the same general approach that succeeded previously.\n")
+	case "Avoid":
+		sb.WriteString("MUST NOT (memory: this approach consistently failed for similar tasks):\n")
+		sb.WriteString("  - Do not repeat the approach that failed previously.\n")
+	case "Caution":
+		sb.WriteString("CAUTION (memory: mixed results for similar tasks):\n")
+		sb.WriteString("  - Validate each step carefully before committing.\n")
+	}
+
+	// C-level SOPs: best practices (σ>0) and constraints (σ≤0).
+	var mustNots, shouldPrefers []string
+	for _, sop := range sops {
+		line := "  - " + sop.Content
+		if sop.Sigma > 0 {
+			shouldPrefers = append(shouldPrefers, line)
+		} else {
+			mustNots = append(mustNots, line)
+		}
+	}
+	if len(mustNots) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("MUST NOT (proven constraints from accumulated experience):\n")
+		for _, c := range mustNots {
+			sb.WriteString(c + "\n")
+		}
+	}
+	if len(shouldPrefers) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("SHOULD PREFER (proven best practices from accumulated experience):\n")
+		for _, c := range shouldPrefers {
+			sb.WriteString(c + "\n")
+		}
+	}
+	return sb.String()
 }
 
 // calibrate implements Steps 1–3 of the Memory Calibration Protocol.
@@ -492,11 +559,3 @@ func toPlanDirective(payload any) (types.PlanDirective, error) {
 	return pd, json.Unmarshal(b, &pd)
 }
 
-func toMemoryResponse(payload any) (types.MemoryResponse, error) {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return types.MemoryResponse{}, err
-	}
-	var r types.MemoryResponse
-	return r, json.Unmarshal(b, &r)
-}

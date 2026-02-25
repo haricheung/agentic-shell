@@ -2170,3 +2170,121 @@ Implemented spec v0.8 across 9 files:
 - `internal/roles/auditor/auditor.go`: Gap trend and convergence failure detection now uses
   `pd.GradL` threshold (±0.1) instead of `pd.Gradient` string.
 - `internal/roles/auditor/auditor_test.go`: Removed `Gradient:` from test fixture.
+
+---
+
+## Issue #81 — R5 memory: file-backed JSON store replaced with LevelDB MKCT pyramid engine
+
+**Symptom**
+The old file-backed `memory.json` store supported only keyword-scan queries over a flat list of
+episodic/procedural `MemoryEntry` objects. Cross-task SOP promotion, decay-weighted avoidance,
+structured distinction between approach-level and path-level failures, and per-tag convolution
+were not possible. Metaval was the sole writer, bypassing GGS observability, and the memory
+layer was not independently testable (it formatted prompt text internally, violating the Data
+Service principle).
+
+**Root cause**
+v0.7 R5 design lacked a memory algebra. `MemoryEntry` had no decay constant, no valence (σ),
+no frequency weight (f), and no tag-pair index — making temporal relevance and dual-channel
+convolution impossible. Metaval wrote entries on accept/replan without GGS's routing context,
+so the system could not distinguish "tool X was blocked" from "task intent Y is best-practised
+via approach Z". There was no Dreamer-style background consolidation; stale entries were never
+garbage-collected.
+
+**Fix**
+Full rewrite of R5 and supporting roles across 11 files:
+
+- `go.mod`: Added `github.com/syndtr/goleveldb v1.0.0` (pure-Go LevelDB; no CGO).
+
+- `internal/types/types.go`: Added `MsgMegram` message type (Auditor observability). Added
+  `Intent string` to `ReplanRequest` and `OutcomeSummary` (GGS terminal Megram space tag).
+  Added `Megram` struct (11 fields: ID, Level, CreatedAt, LastRecalledAt, Space, Entity,
+  Content, State, F, Sigma, K). Added `SOPRecord`, `Potentials` structs. Added `MemoryService`
+  interface (`Write`, `QueryC`, `QueryMK`, `RecordNegativeFeedback`, `Close`). Added
+  deprecation comments on `MsgMemoryWrite/Read/Response`.
+
+- `internal/roles/memory/memory.go`: Full rewrite implementing the MKCT pyramid engine:
+  - `Store` backed by LevelDB with async write queue (buffered channel; fire-and-forget).
+  - Key schema (using `|` separator): `m|<id>` (primary), `x|<space>|<entity>|<id>` (inverted
+    index), `l|<level>|<id>` (level scan), `r|<id>` (last_recalled_at).
+  - `quantizationMatrix` mapping 7 GGS states to (f, σ, k): abandon→(-1.0, 0.05),
+    accept→(+1.0, 0.05), change_approach→(-1.0, 0.05), success→(+1.0, 0.05),
+    break_symmetry→(+1.0, 0.05), change_path→(0.0, 0.2), refine→(+0.5, 0.5).
+  - `QueryC`: prefix scan on inverted index, C-level filter, updates `r|<id>` recall timestamp.
+  - `QueryMK`: dual-channel convolution `M_att=Σ|f_i|·exp(−k_i·Δt)`,
+    `M_dec=Σσ_i·f_i·exp(−k_i·Δt)` → Potentials{Attention, Decision, Action}.
+  - `deriveAction`: M_att<0.5→Ignore; M_dec>0.2→Exploit; M_dec<-0.2→Avoid; else→Caution.
+  - `Run(ctx)`: starts Dreamer goroutine + processes write queue; drains+closes DB on Done.
+  - `dreamer`: 5-min ticker calling `gcPass` (M_att<0.1 → DELETE) and
+    `trustBankruptcyPass` (C-level M_dec<0.0 → demote to K, k=0.05). LLM consolidation
+    deferred to Phase 2.
+  - Exported helpers: `IntentSlug(intent)`, `ParseToolCall(tc)`, `QuantizationMatrix()`.
+
+- `internal/roles/memory/memory_test.go` (new): 26 tests covering `deriveAction` (4),
+  `IntentSlug` (6), `ParseToolCall` (8), and LevelDB integration tests for Write+QueryMK,
+  QueryC recall update, GC pass, Trust Bankruptcy demotion, and RecordNegativeFeedback.
+
+- `internal/roles/ggs/ggs.go`: Added `mem types.MemoryService` field. Updated `New` to
+  accept mem as third argument. Added `writeTerminalMegram(intent, content, state)` — called
+  before accept/success/abandon FinalResult. Added `writeMegramsFromToolCalls(outcomes,
+  directive)` — called before action-state PlanDirective; emits one Megram per blocked_target.
+  Both helpers publish `MsgMegram` for Auditor observability.
+
+- `internal/roles/ggs/ggs_test.go` and `ggs_integration_test.go`: Updated all `New(b, nil)`
+  calls to `New(b, nil, nil)` (12 occurrences total).
+
+- `internal/roles/planner/planner.go`: Added `mem types.MemoryService` field. Updated `New`
+  to accept mem as fourth argument. Removed bus-based memory query dance (`memoryCh`,
+  `awaitingMemory`, `memoryEntries` state). Added `queryMKCTConstraints(ctx, intent) string`
+  — calls `mem.QueryC` + `mem.QueryMK` synchronously, delegates formatting to `calibrateMKCT`.
+  Added `calibrateMKCT(sops, pots) string` — maps Action to SHOULD PREFER / MUST NOT / CAUTION
+  blocks; merges positive-σ SOPs under SHOULD PREFER and negative-σ SOPs under MUST NOT.
+
+- `internal/roles/planner/planner_test.go`: Added 6 tests for `calibrateMKCT` covering empty
+  input, Exploit/Avoid/Caution action blocks, and positive/negative σ SOP routing.
+
+- `internal/roles/metaval/metaval.go`: Removed all `MsgMemoryWrite` bus publishes (episodic
+  on accept, procedural on replan). Added `Intent: tracker.spec.Intent` to `OutcomeSummary`
+  and `ReplanRequest`. Removed unused `toTaskCost()` and `failureLesson` type. GGS is now
+  the sole writer to R5 on all paths.
+
+- `cmd/artoo/main.go`: Memory path changed from `memory.json` to `memory.leveldb`. Updated
+  `planner.New` and `ggs.New` call sites with new signatures.
+
+**Tests added** (`internal/roles/memory/memory_test.go`):
+- `TestDeriveAction_BelowThresholdReturnsIgnore`
+- `TestDeriveAction_PositiveDecisionReturnsExploit`
+- `TestDeriveAction_NegativeDecisionReturnsAvoid`
+- `TestDeriveAction_NeutralDecisionReturnsCaution`
+- `TestIntentSlug_AddsPrefix`
+- `TestIntentSlug_CapAt3Words`
+- `TestIntentSlug_Lowercase`
+- `TestIntentSlug_StripNonAlnum`
+- `TestIntentSlug_EmptyInput`
+- `TestIntentSlug_FewerThan3Words`
+- `TestParseToolCall_NoColon`
+- `TestParseToolCall_ExtractsToolName`
+- `TestParseToolCall_QueryField`
+- `TestParseToolCall_CommandField`
+- `TestParseToolCall_PathField`
+- `TestParseToolCall_NoRecognizedField`
+- `TestParseToolCall_MalformedJSON`
+- `TestParseToolCall_StripsOutputSnippet`
+- `TestWriteQueryMK_NewStoreReturnsIgnore`
+- `TestWriteQueryMK_Exploit`
+- `TestWriteQueryMK_Avoid`
+- `TestQueryC_OnlyReturnsCLevel`
+- `TestQueryC_UpdatesLastRecalledAt`
+- `TestGCPass_DeletesExpiredMegrams`
+- `TestGCPass_PreservesActiveMegrams`
+- `TestWrite_FireAndForget`
+- `TestRecordNegativeFeedback_CancelsPositivePotential`
+- `TestTrustBankruptcyPass_DemotesCLevel`
+
+**Tests added** (`internal/roles/planner/planner_test.go`):
+- `TestCalibrateMKCT_EmptyReturnsEmpty`
+- `TestCalibrateMKCT_ExploitIncludesShouldPrefer`
+- `TestCalibrateMKCT_AvoidIncludesMustNot`
+- `TestCalibrateMKCT_CautionIncludesCaution`
+- `TestCalibrateMKCT_PositiveSigmaUnderShouldPrefer`
+- `TestCalibrateMKCT_NegativeSigmaUnderMustNot`

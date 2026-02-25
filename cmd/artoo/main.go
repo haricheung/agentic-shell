@@ -80,7 +80,8 @@ func main() {
 	}
 
 	// Infrastructure roles
-	mem := memory.New(b, filepath.Join(cacheDir, "memory.json"))
+	// LevelDB memory store replaces the old file-backed JSON store.
+	mem := memory.New(b, filepath.Join(cacheDir, "memory.leveldb"))
 	aud := auditor.New(b, b.NewTap(),
 		filepath.Join(cacheDir, "audit.jsonl"),
 		filepath.Join(cacheDir, "audit_stats.json"),
@@ -100,9 +101,9 @@ func main() {
 	logReg := tasklog.NewRegistry(filepath.Join(cacheDir, "tasks"))
 
 	// Logical roles
-	plan := planner.New(b, brainClient, logReg)
+	plan := planner.New(b, brainClient, logReg, mem)
 	mv := metaval.New(b, toolClient, outputFn, logReg)
-	gs := ggs.New(b, outputFn) // R7 — Goal Gradient Solver; sits between R4b and R2
+	gs := ggs.New(b, outputFn, mem) // R7 — Goal Gradient Solver; sole writer to R5
 	exec := executor.New(b, toolClient)
 	av := agentval.New(b, toolClient)
 

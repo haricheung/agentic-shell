@@ -1,6 +1,9 @@
 package types
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Role identifiers
 type Role string
@@ -28,14 +31,15 @@ const (
 	MsgCorrectionSignal MessageType = "CorrectionSignal"
 	MsgSubTaskOutcome   MessageType = "SubTaskOutcome"
 	MsgReplanRequest    MessageType = "ReplanRequest"
-	MsgMemoryWrite      MessageType = "MemoryWrite"
-	MsgMemoryRead       MessageType = "MemoryRead"
-	MsgMemoryResponse   MessageType = "MemoryResponse"
+	MsgMemoryWrite      MessageType = "MemoryWrite"   // deprecated: GGS writes directly; kept for Auditor compat
+	MsgMemoryRead       MessageType = "MemoryRead"    // deprecated: Planner queries directly
+	MsgMemoryResponse   MessageType = "MemoryResponse" // deprecated: Planner queries directly
+	MsgMegram           MessageType = "Megram"         // R7 → R5 (bus-observable Megram write for Auditor)
 	MsgFinalResult      MessageType = "FinalResult"
-	MsgAuditQuery       MessageType = "AuditQuery"    // User → R6: request an on-demand report
-	MsgAuditReport      MessageType = "AuditReport"   // R6 → User: generated report
-	MsgPlanDirective    MessageType = "PlanDirective"    // R7 → R2: gradient-directed planning instruction
-	MsgOutcomeSummary   MessageType = "OutcomeSummary"   // R4b → R7: all subtasks matched; GGS delivers final result
+	MsgAuditQuery       MessageType = "AuditQuery"      // User → R6: request an on-demand report
+	MsgAuditReport      MessageType = "AuditReport"     // R6 → User: generated report
+	MsgPlanDirective    MessageType = "PlanDirective"   // R7 → R2: gradient-directed planning instruction
+	MsgOutcomeSummary   MessageType = "OutcomeSummary"  // R4b → R7: all subtasks matched; GGS delivers final result
 )
 
 // Message is the envelope for all inter-role communication on the bus
@@ -135,6 +139,7 @@ type SubTaskOutcome struct {
 // ReplanRequest is produced by R4b and consumed by R7 (GGS). GGS owns gradient computation.
 type ReplanRequest struct {
 	TaskID          string           `json:"task_id"`
+	Intent          string           `json:"intent"`                  // task intent; GGS uses for terminal Megram space tag
 	GapSummary      string           `json:"gap_summary"`
 	FailedSubTasks  []string         `json:"failed_subtasks"`
 	CorrectionCount int              `json:"correction_count"`
@@ -255,6 +260,7 @@ type ConvergenceHealth struct {
 // This closes the medium loop on the happy path — GGS is always the decision-maker.
 type OutcomeSummary struct {
 	TaskID       string           `json:"task_id"`
+	Intent       string           `json:"intent"`        // task intent; GGS uses for terminal Megram space tag
 	Summary      string           `json:"summary"`       // one-sentence user-facing summary from R4b LLM merge
 	MergedOutput any              `json:"merged_output"` // combined user-facing result
 	ElapsedMs    int64            `json:"elapsed_ms"`    // wall-clock ms since task started; for Ω logging
@@ -276,5 +282,61 @@ type FinalResult struct {
 }
 
 
-// Ensure time import is used
+// ---------------------------------------------------------------------------
+// MKCT Memory Engine types (R5 v0.8)
+// ---------------------------------------------------------------------------
+
+// Megram is the atomic memory unit of the MKCT pyramid. Every critical event
+// routed by GGS is encapsulated as a Megram and persisted to LevelDB by R5.
+// All writes are append-only; error correction appends negative-σ Megrams.
+type Megram struct {
+	ID             string  `json:"id"`
+	Level          string  `json:"level"`                    // "M" | "K" | "C" | "T"
+	CreatedAt      string  `json:"created_at"`               // RFC3339
+	LastRecalledAt string  `json:"last_recalled_at,omitempty"` // RFC3339; updated on QueryC hit
+	Space          string  `json:"space"`                    // inverted index tag: "tool:<name>" | "intent:<slug>"
+	Entity         string  `json:"entity"`                   // inverted index tag: "path:<val>" | "env:local"
+	Content        string  `json:"content"`                  // error log, summary, or lesson
+	State          string  `json:"state"`                    // GGS macro-state: accept|success|abandon|...
+	F              float64 `json:"f"`                        // initial stimulus magnitude [0, 1]
+	Sigma          float64 `json:"sigma"`                    // valence direction [-1.0, +1.0]
+	K              float64 `json:"k"`                        // time decay rate: 0.0 | 0.05 | 0.2 | 0.5
+}
+
+// SOPRecord is a C-level memory entry (best practice or constraint) returned by QueryC.
+type SOPRecord struct {
+	ID      string  `json:"id"`
+	Space   string  `json:"space"`
+	Entity  string  `json:"entity"`
+	Content string  `json:"content"`
+	Sigma   float64 `json:"sigma"` // +1.0 = best practice; -1.0 = constraint
+}
+
+// Potentials holds the dual-channel convolution result for a (space, entity) pair.
+// R2 maps Action to a prompt constraint using the action decision plane.
+type Potentials struct {
+	Attention float64 `json:"attention"` // Σ|fᵢ|·exp(−kᵢ·Δt)
+	Decision  float64 `json:"decision"`  // Σσᵢ·fᵢ·exp(−kᵢ·Δt)
+	Action    string  `json:"action"`    // "Ignore" | "Exploit" | "Avoid" | "Caution"
+}
+
+// MemoryService is the R5 interface used by GGS (writes) and Planner (reads).
+// GGS is the sole writer; Planner queries structured data ([]SOPRecord, Potentials).
+// All writes are fire-and-forget; queries are synchronous blocking calls.
+type MemoryService interface {
+	// Write enqueues a Megram for async, non-blocking persistence to LevelDB.
+	Write(m Megram)
+	// QueryC returns C-level SOPs for the given (space, entity) tag pair.
+	// Updates last_recalled_at to reset time decay for each returned entry.
+	QueryC(ctx context.Context, space, entity string) ([]SOPRecord, error)
+	// QueryMK computes live dual-channel convolution potentials for a (space, entity) pair.
+	QueryMK(ctx context.Context, space, entity string) (Potentials, error)
+	// RecordNegativeFeedback appends a negative-σ Megram to cancel stale positive potentials.
+	RecordNegativeFeedback(ctx context.Context, ruleID, content string)
+	// Close drains the pending write queue. Called by Run() on context cancellation.
+	Close()
+}
+
+// Ensure imports are used
 var _ = time.Now
+var _ context.Context

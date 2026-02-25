@@ -9,7 +9,11 @@ require (
 	github.com/mattn/go-runewidth v0.0.20
 )
 
-require github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
+require (
+	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
+	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
+	github.com/syndtr/goleveldb v1.0.0 // indirect
+)
 
 // Patched local copy: fixes getBackspaceSequence() to emit Width(rune) backspaces
 // per character so CJK double-width chars move the cursor correctly.

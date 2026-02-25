@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/haricheung/agentic-shell/internal/bus"
+	"github.com/haricheung/agentic-shell/internal/roles/memory"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
@@ -34,8 +35,10 @@ const (
 // in the medium loop. It receives ReplanRequest from R4b, computes D, P, Ω, L, ∇L,
 // selects a macro-state from the v0.8 decision table, and either emits PlanDirective
 // to R2 (action states) or FinalResult to the user (success/abandon paths).
+// GGS is the sole writer to R5 (Shared Memory).
 type GGS struct {
 	b              *bus.Bus
+	mem            types.MemoryService // R5 — sole writer; may be nil (memory disabled)
 	outputFn       func(taskID, summary string, output any)
 	mu             sync.Mutex
 	lPrev          map[string]float64  // L_{t-1} per task_id
@@ -45,10 +48,11 @@ type GGS struct {
 	prevDirective  map[string]string   // macro-state from the previous round per task_id
 }
 
-// New creates a GGS.
-func New(b *bus.Bus, outputFn func(taskID, summary string, output any)) *GGS {
+// New creates a GGS. mem may be nil to disable memory writes (e.g. in tests).
+func New(b *bus.Bus, outputFn func(taskID, summary string, output any), mem types.MemoryService) *GGS {
 	return &GGS{
 		b:              b,
+		mem:            mem,
 		outputFn:       outputFn,
 		lPrev:          make(map[string]float64),
 		replans:        make(map[string]int),
@@ -162,6 +166,9 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		summary := buildSuccessSummary(rr)
 		output := mergeMatchedOutputs(rr.Outcomes)
 
+		// Write terminal Megram to R5 (GGS is sole writer).
+		g.writeTerminalMegram(rr.Intent, summary, "success")
+
 		g.b.Publish(types.Message{
 			ID:        uuid.New().String(),
 			Timestamp: time.Now().UTC(),
@@ -198,6 +205,9 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		log.Printf("[R7] task=%s ABANDON (Ω=%.3f ≥ %.1f)", taskID, Omega, abandonOmega)
 		summary := buildAbandonSummary(rr)
 
+		// Write terminal Megram to R5 (GGS is sole writer).
+		g.writeTerminalMegram(rr.Intent, rr.GapSummary, "abandon")
+
 		g.b.Publish(types.Message{
 			ID:        uuid.New().String(),
 			Timestamp: time.Now().UTC(),
@@ -229,6 +239,9 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 	}
 
 	// Action states: refine | change_path | change_approach | break_symmetry.
+	// Write one Megram per failed tool call to R5 (fire-and-forget).
+	g.writeMegramsFromToolCalls(rr.Outcomes, directive)
+
 	blockedTools := deriveBlockedTools(rr.Outcomes, directive)
 
 	newTargets := deriveBlockedTargets(rr.Outcomes, directive)
@@ -333,6 +346,9 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 	delete(g.triedTargets, taskID)
 	delete(g.prevDirective, taskID)
 	g.mu.Unlock()
+
+	// Write terminal Megram to R5 (GGS is sole writer).
+	g.writeTerminalMegram(os.Intent, os.Summary, "accept")
 
 	// GGS is the sole emitter of FinalResult — consistent path for accept, success, and abandon.
 	// Directive="accept"; Loss, GradL, Replans, PrevDirective for trajectory checkpoint display.
@@ -820,6 +836,118 @@ func buildRationale(directive string, D, P, Omega, gradL float64, gapSummary str
 		return fmt.Sprintf("Budget exhausted (Ω=%.3f ≥ θ=%.1f). Continued replanning cost exceeds gap cost. Gap: %s", Omega, abandonOmega, gapSummary)
 	default:
 		return gapSummary
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R5 Memory write helpers — GGS is the sole writer to Shared Memory (R5).
+// ---------------------------------------------------------------------------
+
+// writeTerminalMegram writes one Megram to R5 on terminal states (accept/success/abandon).
+// Tags: space = intent slug derived from task intent; entity = "env:local".
+// Also publishes MsgMegram to the bus for Auditor observability.
+//
+// Expectations:
+//   - No-ops when mem is nil
+//   - Uses IntentSlug to derive space tag from intent
+//   - Sets f, sigma, k from quantization matrix for the given state
+//   - Publishes MsgMegram to bus for Auditor observability
+//   - Fires Write() async (non-blocking)
+func (g *GGS) writeTerminalMegram(intent, content, state string) {
+	if g.mem == nil {
+		return
+	}
+	q, ok := memory.QuantizationMatrix()[state]
+	if !ok {
+		return
+	}
+	meg := types.Megram{
+		ID:        uuid.New().String(),
+		Level:     "M",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Space:     memory.IntentSlug(intent),
+		Entity:    "env:local",
+		Content:   content,
+		State:     state,
+		F:         q.F,
+		Sigma:     q.Sigma,
+		K:         q.K,
+	}
+	g.mem.Write(meg)
+	if g.b != nil {
+		g.b.Publish(types.Message{
+			ID:        uuid.New().String(),
+			Timestamp: time.Now().UTC(),
+			From:      types.RoleGGS,
+			To:        types.RoleMemory,
+			Type:      types.MsgMegram,
+			Payload:   meg,
+		})
+	}
+}
+
+// writeMegramsFromToolCalls writes one Megram per unique (tool, target) pair found
+// in failed subtask ToolCalls. Used for action states (refine, change_path, etc.)
+// Tags: space = "tool:<name>"; entity = "target:<value>".
+//
+// Expectations:
+//   - No-ops when mem is nil
+//   - Only processes failed outcomes
+//   - Deduplicates by (toolName, target) to avoid multiple Megrams for the same pair
+//   - Sets f, sigma, k from quantization matrix for the given directive
+//   - Skips tool calls where ParseToolCall returns an empty target
+func (g *GGS) writeMegramsFromToolCalls(outcomes []types.SubTaskOutcome, directive string) {
+	if g.mem == nil {
+		return
+	}
+	q, ok := memory.QuantizationMatrix()[directive]
+	if !ok {
+		return
+	}
+	seen := make(map[string]bool)
+	for _, o := range outcomes {
+		if o.Status != "failed" {
+			continue
+		}
+		for _, tc := range o.ToolCalls {
+			toolName, target := memory.ParseToolCall(tc)
+			if toolName == "" || target == "" {
+				continue
+			}
+			key := toolName + "|" + target
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			content := o.Intent
+			if o.FailureReason != nil && *o.FailureReason != "" {
+				content += ": " + *o.FailureReason
+			}
+			meg := types.Megram{
+				ID:        uuid.New().String(),
+				Level:     "M",
+				CreatedAt: time.Now().UTC().Format(time.RFC3339),
+				Space:     "tool:" + toolName,
+				Entity:    "target:" + target,
+				Content:   content,
+				State:     directive,
+				F:         q.F,
+				Sigma:     q.Sigma,
+				K:         q.K,
+			}
+			g.mem.Write(meg)
+			if g.b != nil {
+				g.b.Publish(types.Message{
+					ID:        uuid.New().String(),
+					Timestamp: time.Now().UTC(),
+					From:      types.RoleGGS,
+					To:        types.RoleMemory,
+					Type:      types.MsgMegram,
+					Payload:   meg,
+				})
+			}
+		}
 	}
 }
 

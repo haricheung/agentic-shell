@@ -1,209 +1,542 @@
+// Package memory implements R5 — the MKCT (Megram/Knowledge/Common-Sense/Thinking)
+// memory engine backed by LevelDB. GGS is the sole writer; Planner queries structured data.
 package memory
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
-	"os"
-	"path/filepath"
+	"math"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/util"
+
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
-// Store is a file-backed JSON memory store. Only R4b (Meta-Validator) may write.
+// LevelDB key prefix scheme — uses "|" as separator so colons in space/entity are safe.
+//
+//	m|<id>               → Megram JSON             (primary record)
+//	x|<space>|<entity>|<id> → nil                  (inverted index for tag scan)
+//	l|<level>|<id>       → nil                     (level scan for Dreamer)
+//	r|<id>               → RFC3339                 (last_recalled_at; only mutable key)
+const (
+	prefixMegram = "m|"
+	prefixIdx    = "x|"
+	prefixLevel  = "l|"
+	prefixRecall = "r|"
+)
+
+// GGS quantization matrix: maps macro-state to (f, σ, k).
+// Decay constants: k=0.05 ≈ 14-day half-life; k=0.2 ≈ 3.5-day; k=0.5 ≈ 1.4-day.
+var quantizationMatrix = map[string]struct{ f, sigma, k float64 }{
+	"abandon":         {f: 0.95, sigma: -1.0, k: 0.05},
+	"accept":          {f: 0.90, sigma: +1.0, k: 0.05},
+	"change_approach": {f: 0.85, sigma: -1.0, k: 0.05},
+	"success":         {f: 0.80, sigma: +1.0, k: 0.05},
+	"break_symmetry":  {f: 0.75, sigma: +1.0, k: 0.05},
+	"change_path":     {f: 0.30, sigma: 0.0, k: 0.20},
+	"refine":          {f: 0.10, sigma: +0.5, k: 0.50},
+}
+
+// Store is the LevelDB-backed MKCT memory engine.
+// Write() is async (fire-and-forget channel); QueryC/QueryMK are synchronous.
 type Store struct {
-	path string
-	mu   sync.RWMutex
-	data []types.MemoryEntry
-	b    *bus.Bus
+	b       *bus.Bus
+	db      *leveldb.DB
+	writeCh chan types.Megram // async write queue; buffered to avoid blocking GGS hot path
 }
 
-// New creates a Store backed by the JSON file at path.
-func New(b *bus.Bus, path string) *Store {
-	s := &Store{path: path, b: b}
-	_ = s.load()
-	return s
-}
-
-func (s *Store) load() error {
-	data, err := os.ReadFile(s.path)
+// New opens (or creates) a LevelDB database at dbPath and returns a Store.
+// dbPath should be a directory path (LevelDB creates it if absent).
+func New(b *bus.Bus, dbPath string) *Store {
+	db, err := leveldb.OpenFile(dbPath, nil)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
+		log.Fatalf("[R5] FATAL: failed to open LevelDB at %s: %v", dbPath, err)
 	}
-	return json.Unmarshal(data, &s.data)
+	return &Store{
+		b:       b,
+		writeCh: make(chan types.Megram, 1024),
+		db:      db,
+	}
 }
 
-func (s *Store) save() error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
+// Write enqueues a Megram for async non-blocking persistence.
+// Drops the Megram with a warning if the write queue is full (back-pressure).
+//
+// Expectations:
+//   - Non-blocking: never blocks the caller goroutine
+//   - Assigns ID and CreatedAt if missing
+//   - Drops Megram with log warning when queue is at capacity
+//   - Does not guarantee persistence before returning
+func (s *Store) Write(m types.Megram) {
+	if m.ID == "" {
+		m.ID = uuid.New().String()
 	}
-	data, err := json.MarshalIndent(s.data, "", "  ")
-	if err != nil {
-		return err
+	if m.CreatedAt == "" {
+		m.CreatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
-	return os.WriteFile(s.path, data, 0o644)
+	if m.Level == "" {
+		m.Level = "M"
+	}
+	select {
+	case s.writeCh <- m:
+	default:
+		log.Printf("[R5] WARNING: write queue full — dropping Megram id=%s state=%s", m.ID, m.State)
+	}
 }
 
-// Write stores a MemoryEntry. Only R4b should call this (enforced by message routing).
-func (s *Store) Write(entry types.MemoryEntry) error {
-	if entry.EntryID == "" {
-		entry.EntryID = uuid.New().String()
-	}
-	if entry.Timestamp == "" {
-		entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	}
+// QueryC returns all C-level SOPs for the (space, entity) tag pair.
+// Updates last_recalled_at for each returned entry, resetting time decay.
+//
+// Expectations:
+//   - Returns only C-level Megrams matching the (space, entity) pair
+//   - Returns empty slice (not error) when no C-level entries exist
+//   - Updates last_recalled_at for every returned entry
+//   - Returns error only on LevelDB iteration failure
+func (s *Store) QueryC(ctx context.Context, space, entity string) ([]types.SOPRecord, error) {
+	prefix := idxPrefix(space, entity)
+	iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
+	defer iter.Release()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data = append(s.data, entry)
-	return s.save()
-}
-
-// Query returns entries matching taskID, tags, and/or a natural-language keyword query.
-// All provided filters are ANDed; an empty filter is a wildcard.
-// The Query field is matched as keywords against entry tags, task_id, and serialised content.
-func (s *Store) Query(taskID, tags, query string) ([]types.MemoryEntry, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Pre-tokenise natural-language query into lowercase words
-	var keywords []string
-	for _, w := range strings.Fields(strings.ToLower(query)) {
-		if len(w) >= 3 { // skip short noise words
-			keywords = append(keywords, w)
-		}
-	}
-
-	var results []types.MemoryEntry
-	for _, e := range s.data {
-		if taskID != "" && e.TaskID != taskID {
+	var results []types.SOPRecord
+	for iter.Next() {
+		id := megIDFromIdxKey(string(iter.Key()), prefix)
+		if id == "" {
 			continue
 		}
-		if tags != "" {
-			matched := false
-			for _, tag := range e.Tags {
-				if strings.Contains(strings.ToLower(tag), strings.ToLower(tags)) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				continue
-			}
+		m, err := s.fetchMegram(id)
+		if err != nil {
+			continue
 		}
-		if len(keywords) > 0 {
-			// Serialise the entry into a single string for keyword scanning
-			raw, _ := json.Marshal(e)
-			haystack := strings.ToLower(string(raw))
-			anyMatch := false
-			for _, kw := range keywords {
-				if strings.Contains(haystack, kw) {
-					anyMatch = true
-					break
-				}
-			}
-			if !anyMatch {
-				continue
-			}
+		if m.Level != "C" {
+			continue
 		}
-		results = append(results, e)
+		// Update last_recalled_at to reset time decay for this entry.
+		_ = s.db.Put([]byte(prefixRecall+id), []byte(time.Now().UTC().Format(time.RFC3339)), nil)
+		results = append(results, types.SOPRecord{
+			ID:      m.ID,
+			Space:   m.Space,
+			Entity:  m.Entity,
+			Content: m.Content,
+			Sigma:   m.Sigma,
+		})
 	}
-	return results, nil
+	return results, iter.Error()
 }
 
-// Run starts the memory store's bus listener goroutine.
+// QueryMK computes the live dual-channel convolution potentials for a (space, entity) pair.
+// Time decay uses last_recalled_at when available (recall resets the decay clock).
+//
+// Expectations:
+//   - Returns Potentials with all zero values and Action="Ignore" when no megrams match
+//   - M_attention = Σ|fᵢ|·exp(−kᵢ·Δt_days)
+//   - M_decision = Σσᵢ·fᵢ·exp(−kᵢ·Δt_days)
+//   - Uses last_recalled_at as decay origin when it is later than created_at
+//   - Action is derived via the action decision plane thresholds
+//   - Returns error only on LevelDB iteration failure
+func (s *Store) QueryMK(ctx context.Context, space, entity string) (types.Potentials, error) {
+	prefix := idxPrefix(space, entity)
+	iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
+	defer iter.Release()
+
+	now := time.Now().UTC()
+	var attention, decision float64
+
+	for iter.Next() {
+		id := megIDFromIdxKey(string(iter.Key()), prefix)
+		if id == "" {
+			continue
+		}
+		m, err := s.fetchMegram(id)
+		if err != nil {
+			continue
+		}
+
+		createdAt, err := time.Parse(time.RFC3339, m.CreatedAt)
+		if err != nil {
+			continue
+		}
+		// Use last_recalled_at as decay origin when available (recall resets clock).
+		decayOrigin := createdAt
+		if recallBytes, err := s.db.Get([]byte(prefixRecall+id), nil); err == nil {
+			if recalled, err := time.Parse(time.RFC3339, string(recallBytes)); err == nil {
+				if recalled.After(decayOrigin) {
+					decayOrigin = recalled
+				}
+			}
+		}
+
+		deltaDays := now.Sub(decayOrigin).Hours() / 24.0
+		decay := math.Exp(-m.K * deltaDays)
+		attention += math.Abs(m.F) * decay
+		decision += m.Sigma * m.F * decay
+	}
+
+	if err := iter.Error(); err != nil {
+		return types.Potentials{}, err
+	}
+	return types.Potentials{
+		Attention: attention,
+		Decision:  decision,
+		Action:    deriveAction(attention, decision),
+	}, nil
+}
+
+// RecordNegativeFeedback appends a negative-σ Megram that mathematically cancels
+// a stale positive potential. This implements the "Soft Overwrite" from Module 4.
+//
+// Expectations:
+//   - No-ops when ruleID does not exist in the database
+//   - Copies space/entity/level/k from the original Megram
+//   - Sets sigma = -1.0 on the new Megram regardless of original sigma
+//   - Writes via the async queue (fire-and-forget)
+func (s *Store) RecordNegativeFeedback(_ context.Context, ruleID, content string) {
+	orig, err := s.fetchMegram(ruleID)
+	if err != nil {
+		return
+	}
+	s.Write(types.Megram{
+		ID:        uuid.New().String(),
+		Level:     orig.Level,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Space:     orig.Space,
+		Entity:    orig.Entity,
+		Content:   content,
+		State:     "negative_feedback",
+		F:         orig.F,
+		Sigma:     -1.0,
+		K:         orig.K,
+	})
+}
+
+// Close is a no-op; Run() handles draining and DB close on context cancellation.
+// Satisfies the types.MemoryService interface.
+func (s *Store) Close() {}
+
+// Run processes the async write queue and runs the Dreamer in the background.
+// Drains all pending writes and closes the DB when ctx is cancelled.
 func (s *Store) Run(ctx context.Context) {
-	writeCh := s.b.Subscribe(types.MsgMemoryWrite)
-	readCh := s.b.Subscribe(types.MsgMemoryRead)
+	go s.dreamer(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain any pending writes before exiting so one-shot mode doesn't lose data
-			for {
-				select {
-				case msg := <-writeCh:
-					entry, err := toMemoryEntry(msg.Payload)
-					if err == nil {
-						if err := s.Write(entry); err != nil {
-							log.Printf("[R5] ERROR: shutdown write failed: %v", err)
-						} else {
-							log.Printf("[R5] stored entry %s for task %s (shutdown flush)", entry.EntryID, entry.TaskID)
-						}
-					}
-				default:
-					return
-				}
+			s.drainWriteQueue()
+			if err := s.db.Close(); err != nil {
+				log.Printf("[R5] WARNING: DB close error: %v", err)
 			}
-
-		case msg, ok := <-writeCh:
-			if !ok {
-				return
-			}
-			entry, err := toMemoryEntry(msg.Payload)
-			if err != nil {
-				log.Printf("[R5] ERROR: bad MemoryEntry payload: %v", err)
-				continue
-			}
-			if err := s.Write(entry); err != nil {
-				log.Printf("[R5] ERROR: write failed: %v", err)
-			} else {
-				log.Printf("[R5] stored entry %s for task %s", entry.EntryID, entry.TaskID)
-			}
-
-		case msg, ok := <-readCh:
-			if !ok {
-				return
-			}
-			query, err := toMemoryQuery(msg.Payload)
-			if err != nil {
-				log.Printf("[R5] ERROR: bad MemoryQuery payload: %v", err)
-				continue
-			}
-			entries, err := s.Query(query.TaskID, query.Tags, query.Query)
-			if err != nil {
-				log.Printf("[R5] ERROR: query failed: %v", err)
-				entries = nil
-			}
-			resp := types.MemoryResponse{
-				TaskID:  query.TaskID,
-				Entries: entries,
-			}
-			s.b.Publish(types.Message{
-				ID:        uuid.New().String(),
-				Timestamp: time.Now().UTC(),
-				From:      types.RoleMemory,
-				To:        types.RolePlanner,
-				Type:      types.MsgMemoryResponse,
-				Payload:   resp,
-			})
+			return
+		case m := <-s.writeCh:
+			s.persistMegram(m)
 		}
 	}
 }
 
-func toMemoryEntry(payload any) (types.MemoryEntry, error) {
-	b, err := json.Marshal(payload)
+// ---------------------------------------------------------------------------
+// Internal — write path
+// ---------------------------------------------------------------------------
+
+func (s *Store) persistMegram(m types.Megram) {
+	data, err := json.Marshal(m)
 	if err != nil {
-		return types.MemoryEntry{}, fmt.Errorf("marshal: %w", err)
+		log.Printf("[R5] ERROR: marshal megram id=%s: %v", m.ID, err)
+		return
 	}
-	var e types.MemoryEntry
-	return e, json.Unmarshal(b, &e)
+	batch := new(leveldb.Batch)
+	batch.Put([]byte(prefixMegram+m.ID), data)
+	batch.Put([]byte(idxKey(m.Space, m.Entity, m.ID)), nil)
+	batch.Put([]byte(levelKey(m.Level, m.ID)), nil)
+
+	if err := s.db.Write(batch, nil); err != nil {
+		log.Printf("[R5] ERROR: persist megram id=%s: %v", m.ID, err)
+		return
+	}
+	log.Printf("[R5] persisted Megram id=%s level=%s state=%s space=%s entity=%s",
+		m.ID, m.Level, m.State, m.Space, m.Entity)
 }
 
-func toMemoryQuery(payload any) (types.MemoryQuery, error) {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return types.MemoryQuery{}, fmt.Errorf("marshal: %w", err)
+func (s *Store) drainWriteQueue() {
+	for {
+		select {
+		case m := <-s.writeCh:
+			s.persistMegram(m)
+		default:
+			return
+		}
 	}
-	var q types.MemoryQuery
-	return q, json.Unmarshal(b, &q)
+}
+
+// ---------------------------------------------------------------------------
+// Internal — Dreamer (offline consolidation engine)
+// ---------------------------------------------------------------------------
+
+// dreamer runs the Dreamer consolidation/GC engine on a 5-minute timer.
+// Blocked by ctx cancellation.
+func (s *Store) dreamer(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.runDreamer()
+		}
+	}
+}
+
+func (s *Store) runDreamer() {
+	log.Printf("[R5/Dreamer] starting consolidation cycle")
+	s.gcPass()
+	s.trustBankruptcyPass()
+	// Upward consolidation (LLM distillation into C-level SOPs) deferred to Phase 2.
+	log.Printf("[R5/Dreamer] consolidation cycle complete")
+}
+
+// gcPass scans M and K-level Megrams and hard-deletes those with M_attention < 0.1.
+//
+// Expectations:
+//   - Deletes M/K megrams whose decayed attention potential falls below Λ_gc=0.1
+//   - Does not delete C or T level megrams
+//   - Removes all four index entries (primary, inverted, level, recall) on delete
+func (s *Store) gcPass() {
+	now := time.Now().UTC()
+	for _, lvl := range []string{"M", "K"} {
+		prefix := prefixLevel + lvl + "|"
+		iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
+		var toDelete []string
+		for iter.Next() {
+			id := string(iter.Key())[len(prefix):]
+			m, err := s.fetchMegram(id)
+			if err != nil {
+				continue
+			}
+			createdAt, err := time.Parse(time.RFC3339, m.CreatedAt)
+			if err != nil {
+				continue
+			}
+			deltaDays := now.Sub(createdAt).Hours() / 24.0
+			decay := math.Exp(-m.K * deltaDays)
+			if math.Abs(m.F)*decay < 0.1 {
+				toDelete = append(toDelete, id)
+			}
+		}
+		iter.Release()
+		for _, id := range toDelete {
+			s.deleteMegram(id, lvl)
+			log.Printf("[R5/Dreamer] GC deleted Megram id=%s level=%s (M_att < Λ_gc=0.1)", id, lvl)
+		}
+	}
+}
+
+// trustBankruptcyPass scans C-level Megrams and demotes those whose live
+// M_decision < 0.0 to K-level with k reverted to 0.05 (stripping time immunity).
+//
+// Expectations:
+//   - Only processes C-level Megrams
+//   - Demotes to K (level="K", k=0.05) when live M_decision for the tag pair is < 0.0
+//   - Updates the primary megram record, level index (removes C, adds K), leaves idx intact
+//   - Does not delete demoted megrams (they remain queryable)
+func (s *Store) trustBankruptcyPass() {
+	prefix := prefixLevel + "C|"
+	iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
+	var toUpdate []types.Megram
+	for iter.Next() {
+		id := string(iter.Key())[len(prefix):]
+		m, err := s.fetchMegram(id)
+		if err != nil {
+			continue
+		}
+		pots, err := s.QueryMK(context.Background(), m.Space, m.Entity)
+		if err != nil {
+			continue
+		}
+		if pots.Decision < 0.0 {
+			m.Level = "K"
+			m.K = 0.05
+			toUpdate = append(toUpdate, m)
+		}
+	}
+	iter.Release()
+	for _, m := range toUpdate {
+		data, err := json.Marshal(m)
+		if err != nil {
+			continue
+		}
+		batch := new(leveldb.Batch)
+		batch.Put([]byte(prefixMegram+m.ID), data)
+		batch.Delete([]byte(levelKey("C", m.ID)))
+		batch.Put([]byte(levelKey("K", m.ID)), nil)
+		if err := s.db.Write(batch, nil); err != nil {
+			log.Printf("[R5/Dreamer] ERROR: trust bankruptcy update id=%s: %v", m.ID, err)
+		} else {
+			log.Printf("[R5/Dreamer] Trust Bankruptcy: demoted C→K id=%s (M_dec < 0.0)", m.ID)
+		}
+	}
+}
+
+// deleteMegram removes all keys associated with a Megram from LevelDB.
+func (s *Store) deleteMegram(id, level string) {
+	m, err := s.fetchMegram(id)
+	if err != nil {
+		return
+	}
+	batch := new(leveldb.Batch)
+	batch.Delete([]byte(prefixMegram + id))
+	batch.Delete([]byte(idxKey(m.Space, m.Entity, id)))
+	batch.Delete([]byte(levelKey(level, id)))
+	batch.Delete([]byte(prefixRecall + id))
+	_ = s.db.Write(batch, nil)
+}
+
+// fetchMegram retrieves a Megram by ID from LevelDB.
+func (s *Store) fetchMegram(id string) (types.Megram, error) {
+	data, err := s.db.Get([]byte(prefixMegram+id), nil)
+	if err != nil {
+		return types.Megram{}, err
+	}
+	var m types.Megram
+	return m, json.Unmarshal(data, &m)
+}
+
+// ---------------------------------------------------------------------------
+// Key helpers
+// ---------------------------------------------------------------------------
+
+// idxPrefix returns the LevelDB prefix for an inverted index scan.
+func idxPrefix(space, entity string) string {
+	return prefixIdx + safeKeyPart(space) + "|" + safeKeyPart(entity) + "|"
+}
+
+// idxKey returns the full inverted index key for a (space, entity, id) triple.
+func idxKey(space, entity, id string) string {
+	return idxPrefix(space, entity) + id
+}
+
+// levelKey returns the level-scan index key.
+func levelKey(level, id string) string {
+	return prefixLevel + level + "|" + id
+}
+
+// megIDFromIdxKey extracts the megram ID from a full index key, given the known prefix.
+func megIDFromIdxKey(fullKey, prefix string) string {
+	if !strings.HasPrefix(fullKey, prefix) {
+		return ""
+	}
+	return fullKey[len(prefix):]
+}
+
+// safeKeyPart replaces "|" with "_" so LevelDB keys parse unambiguously.
+func safeKeyPart(s string) string {
+	return strings.ReplaceAll(s, "|", "_")
+}
+
+// ---------------------------------------------------------------------------
+// Exported helpers (used by GGS and Planner)
+// ---------------------------------------------------------------------------
+
+// IntentSlug derives the MKCT space tag from a task intent string.
+// Format: "intent:<first_three_words_lowercase_underscored_alphanumeric_only>".
+//
+// Expectations:
+//   - Always starts with "intent:"
+//   - Uses at most 3 words from the intent
+//   - Lowercases all characters
+//   - Joins words with underscore
+//   - Strips all characters except a-z, 0-9, and underscore
+//   - Returns "intent:" for an empty or whitespace-only intent
+func IntentSlug(intent string) string {
+	words := strings.Fields(strings.ToLower(intent))
+	max := 3
+	if len(words) < max {
+		max = len(words)
+	}
+	var parts []string
+	for _, w := range words[:max] {
+		var b strings.Builder
+		for _, r := range w {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				b.WriteRune(r)
+			}
+		}
+		if b.Len() > 0 {
+			parts = append(parts, b.String())
+		}
+	}
+	return "intent:" + strings.Join(parts, "_")
+}
+
+// ParseToolCall extracts the tool name and primary target value from a tool-call
+// string in the format produced by R3 Executor:
+//
+//	"toolname: {json_input} → output_snippet"
+//
+// Extracts the "query", "command", or "path" field from the JSON input.
+//
+// Expectations:
+//   - Returns ("", "") when string lacks ": "
+//   - Extracts tool name as the part before the first ": "
+//   - Strips the " → output_snippet" suffix before JSON parsing
+//   - Returns "query" field when present in JSON
+//   - Returns "command" field when "query" absent
+//   - Returns "path" field when both "query" and "command" absent
+//   - Returns ("toolname", "") when JSON has none of the recognized fields
+//   - Returns ("toolname", "") when JSON is malformed
+func ParseToolCall(tc string) (toolName, target string) {
+	colonIdx := strings.Index(tc, ": ")
+	if colonIdx < 0 {
+		return "", ""
+	}
+	toolName = strings.TrimSpace(tc[:colonIdx])
+
+	rest := tc[colonIdx+2:]
+	if arrowIdx := strings.Index(rest, " → "); arrowIdx >= 0 {
+		rest = rest[:arrowIdx]
+	}
+
+	var m map[string]string
+	if err := json.Unmarshal([]byte(rest), &m); err != nil {
+		return toolName, ""
+	}
+	for _, key := range []string{"query", "command", "path"} {
+		if val := strings.TrimSpace(m[key]); val != "" {
+			return toolName, val
+		}
+	}
+	return toolName, ""
+}
+
+// deriveAction maps dual-channel potential values to an action using the
+// decision plane thresholds from the MKCT spec.
+//
+// Expectations:
+//   - Returns "Ignore" when attention < 0.5
+//   - Returns "Exploit" when attention >= 0.5 and decision > 0.2
+//   - Returns "Avoid" when attention >= 0.5 and decision < -0.2
+//   - Returns "Caution" when attention >= 0.5 and -0.2 <= decision <= 0.2
+func deriveAction(attention, decision float64) string {
+	if attention < 0.5 {
+		return "Ignore"
+	}
+	if decision > 0.2 {
+		return "Exploit"
+	}
+	if decision < -0.2 {
+		return "Avoid"
+	}
+	return "Caution"
+}
+
+// QuantizationMatrix exports the GGS state → (f, σ, k) table for use by GGS write path.
+func QuantizationMatrix() map[string]struct{ F, Sigma, K float64 } {
+	out := make(map[string]struct{ F, Sigma, K float64 }, len(quantizationMatrix))
+	for state, q := range quantizationMatrix {
+		out[state] = struct{ F, Sigma, K float64 }{F: q.f, Sigma: q.sigma, K: q.k}
+	}
+	return out
 }

@@ -7,6 +7,64 @@ import (
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
+// --- calibrateMKCT ---
+
+func TestCalibrateMKCT_EmptyReturnsEmpty(t *testing.T) {
+	// Returns "" when sops is empty and pots.Action is "Ignore"
+	got := calibrateMKCT(nil, types.Potentials{Action: "Ignore"})
+	if got != "" {
+		t.Errorf("expected empty string, got %q", got)
+	}
+}
+
+func TestCalibrateMKCT_ExploitIncludesShouldPrefer(t *testing.T) {
+	// Includes "SHOULD PREFER" block when pots.Action is Exploit
+	got := calibrateMKCT(nil, types.Potentials{Action: "Exploit"})
+	if !strings.Contains(got, "SHOULD PREFER") {
+		t.Errorf("expected SHOULD PREFER for Exploit action, got %q", got)
+	}
+}
+
+func TestCalibrateMKCT_AvoidIncludesMustNot(t *testing.T) {
+	// Includes "MUST NOT" block when pots.Action is Avoid
+	got := calibrateMKCT(nil, types.Potentials{Action: "Avoid"})
+	if !strings.Contains(got, "MUST NOT") {
+		t.Errorf("expected MUST NOT for Avoid action, got %q", got)
+	}
+}
+
+func TestCalibrateMKCT_CautionIncludesCaution(t *testing.T) {
+	// Includes "CAUTION" block when pots.Action is Caution
+	got := calibrateMKCT(nil, types.Potentials{Action: "Caution"})
+	if !strings.Contains(got, "CAUTION") {
+		t.Errorf("expected CAUTION for Caution action, got %q", got)
+	}
+}
+
+func TestCalibrateMKCT_PositiveSigmaUnderShouldPrefer(t *testing.T) {
+	// Positive-σ SOPs appear under "SHOULD PREFER (proven best practices)"
+	sops := []types.SOPRecord{{ID: "1", Content: "use mdfind for file search", Sigma: 1.0}}
+	got := calibrateMKCT(sops, types.Potentials{Action: "Ignore"})
+	if !strings.Contains(got, "SHOULD PREFER") {
+		t.Errorf("expected SHOULD PREFER section for positive-sigma SOP, got %q", got)
+	}
+	if !strings.Contains(got, "use mdfind for file search") {
+		t.Errorf("expected SOP content in output, got %q", got)
+	}
+}
+
+func TestCalibrateMKCT_NegativeSigmaUnderMustNot(t *testing.T) {
+	// Non-positive-σ SOPs appear under "MUST NOT (proven constraints)"
+	sops := []types.SOPRecord{{ID: "2", Content: "never use shell find on /", Sigma: -1.0}}
+	got := calibrateMKCT(sops, types.Potentials{Action: "Ignore"})
+	if !strings.Contains(got, "MUST NOT") {
+		t.Errorf("expected MUST NOT section for negative-sigma SOP, got %q", got)
+	}
+	if !strings.Contains(got, "never use shell find") {
+		t.Errorf("expected SOP content in MUST NOT block, got %q", got)
+	}
+}
+
 // --- calibrate ---
 
 func TestCalibrate_EmptyEntries(t *testing.T) {

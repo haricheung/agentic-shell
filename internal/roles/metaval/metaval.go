@@ -16,6 +16,8 @@ import (
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
+// Note: R4b no longer writes to R5. GGS is the sole writer to Shared Memory (R5).
+
 const systemPrompt = `You are R4b — Meta-Validator. Merge SubTaskOutcome results and verify the combined output satisfies the task criteria.
 
 You receive task_criteria (written by R2 to define what the COMBINED output must achieve) and all SubTaskOutcome results. Every subtask has already passed its own individual check.
@@ -230,46 +232,13 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		log.Printf("[R4b] task=%s ACCEPTED — forwarding to R7 (GGS) for final loss record and delivery", taskID)
 		// Snapshot cost metrics BEFORE Close() removes the log from the registry.
 		tl := m.logReg.Get(taskID)
-		taskStats := tl.Stats()
+		_ = tl.Stats() // snapshot for future use; GGS handles memory writes
 		m.logReg.Close(taskID, "accepted") // write task_end and flush before delivering result
-
-		// Build meaningful tags from task intent for cross-task retrieval
-		intentTags := []string{"success", taskID}
-		if tracker.spec.Intent != "" {
-			for _, word := range strings.Fields(tracker.spec.Intent) {
-				if len(word) >= 4 {
-					intentTags = append(intentTags, strings.ToLower(strings.Trim(word, ".,;:!?")))
-				}
-			}
-		}
-
-		// Write to memory (R4b's responsibility; GGS does not write memory)
-		entry := types.MemoryEntry{
-			EntryID:   uuid.New().String(),
-			TaskID:    taskID,
-			Type:      "episodic",
-			Content:   v.MergedOutput,
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Tags:      intentTags,
-			Cost:      toTaskCost(taskStats),
-		}
-		for _, o := range tracker.outcomes {
-			if o.Status == "matched" {
-				entry.CriteriaMet = append(entry.CriteriaMet, o.SubTaskID)
-			}
-		}
-		m.b.Publish(types.Message{
-			ID:        uuid.New().String(),
-			Timestamp: time.Now().UTC(),
-			From:      types.RoleMetaVal,
-			To:        types.RoleMemory,
-			Type:      types.MsgMemoryWrite,
-			Payload:   entry,
-		})
 
 		// Forward to GGS so it records the final loss (D=0) and delivers the result.
 		// GGS is the sole decision-maker in the medium loop — it closes the loop even
 		// on the happy path by computing L_t and updating L_prev before emitting FinalResult.
+		// GGS also writes the "accept" Megram to R5 (GGS is the sole writer to Shared Memory).
 		m.mu.Lock()
 		start, hasStart := m.taskStart[taskID]
 		outcomes := append([]types.SubTaskOutcome(nil), tracker.outcomes...)
@@ -286,6 +255,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 			Type:      types.MsgOutcomeSummary,
 			Payload: types.OutcomeSummary{
 				TaskID:       taskID,
+				Intent:       tracker.spec.Intent,
 				Summary:      v.Summary,
 				MergedOutput: v.MergedOutput,
 				ElapsedMs:    elapsedMs,
@@ -379,7 +349,6 @@ func safetyNetLoss(outcomes []types.SubTaskOutcome) types.LossBreakdown {
 //
 // Expectations:
 //   - Abandons and publishes FinalResult when replanCount >= maxReplans (safety net)
-//   - Writes a procedural MemoryEntry before publishing ReplanRequest
 //   - Resets tracker.outcomes so the next round starts clean
 //   - Increments replanCounts before checking the limit
 //   - Sends ReplanRequest to R7 (GGS), not R2 (Planner)
@@ -442,44 +411,8 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 		return
 	}
 
-	// Write procedural memory so the planner can avoid repeating the failure.
-	type failureLesson struct {
-		Lesson       string   `json:"lesson"`
-		GapSummary   string   `json:"gap_summary"`
-		FailedTasks  []string `json:"failed_subtasks"`
-		FailureClass string   `json:"failure_class,omitempty"`
-	}
-	fc := aggregateFailureClassFromOutcomes(outcomes)
-	lesson := failureLesson{
-		Lesson:       "Task failed: " + gapSummary + ". Avoid repeating the same approach.",
-		GapSummary:   gapSummary,
-		FailedTasks:  failedIDs,
-		FailureClass: fc,
-	}
-	tags := []string{"failure", "replan", taskID}
-	if fc != "" {
-		tags = append(tags, "failure_class:"+fc)
-	}
-	for _, word := range strings.Fields(gapSummary) {
-		if len(word) >= 4 {
-			tags = append(tags, strings.ToLower(strings.Trim(word, ".,;:!?")))
-		}
-	}
-	m.b.Publish(types.Message{
-		ID:        uuid.New().String(),
-		Timestamp: time.Now().UTC(),
-		From:      types.RoleMetaVal,
-		To:        types.RoleMemory,
-		Type:      types.MsgMemoryWrite,
-		Payload: types.MemoryEntry{
-			EntryID:   uuid.New().String(),
-			TaskID:    taskID,
-			Type:      "procedural",
-			Content:   lesson,
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Tags:      tags,
-		},
-	})
+	// GGS is the sole writer to R5 — it writes the "abandon" / action-state Megrams.
+	// R4b no longer writes procedural MemoryEntry; gap information reaches R5 via GGS.
 
 	// Compute elapsed time for GGS Ω calculation.
 	var elapsedMs int64
@@ -489,6 +422,7 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 
 	rr := types.ReplanRequest{
 		TaskID:          taskID,
+		Intent:          tracker.spec.Intent,
 		GapSummary:      gapSummary,
 		FailedSubTasks:  failedIDs,
 		CorrectionCount: totalCorrections,
@@ -512,33 +446,6 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 	m.mu.Unlock()
 }
 
-// toTaskCost converts a tasklog.TaskStats snapshot into a types.TaskCost for
-// embedding in episodic MemoryEntry.Cost so R2 can calibrate planning heuristics.
-func toTaskCost(stats *tasklog.TaskStats) *types.TaskCost {
-	if stats == nil {
-		return nil
-	}
-	var byCost []types.RoleCost
-	var totalTok int
-	var llmMs int64
-	for _, rs := range stats.Roles {
-		byCost = append(byCost, types.RoleCost{
-			Role:        rs.Role,
-			Calls:       rs.Calls,
-			TotalTokens: rs.PromptTokens + rs.CompletionTokens,
-			ElapsedMs:   rs.ElapsedMs,
-		})
-		totalTok += rs.PromptTokens + rs.CompletionTokens
-		llmMs += rs.ElapsedMs
-	}
-	return &types.TaskCost{
-		ByRole:        byCost,
-		TotalTokens:   totalTok,
-		LLMElapsedMs:  llmMs,
-		ToolCallCount: stats.ToolCallCount,
-		ToolElapsedMs: stats.ToolElapsedMs,
-	}
-}
 
 // extractJSON finds the first complete JSON object in s by brace-matching.
 // Returns the extracted substring or s unchanged if no complete object is found.
