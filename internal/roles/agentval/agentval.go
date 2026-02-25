@@ -24,6 +24,9 @@ Scoring rules:
 
 Special rules (apply in order, first match wins):
 
+Executor failure rule (highest priority):
+- If ExecutionResult.status is "failed" → verdict "failed" immediately. Do not evaluate criteria. Do not retry. The executor itself failed before producing valid output; any content in the output field is an error message, not task evidence.
+
 Infrastructure error rule:
 - If output contains "context canceled", "context deadline exceeded", or any network/timeout error → verdict "failed" immediately. Do not retry infrastructure errors.
 

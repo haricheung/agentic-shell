@@ -2311,3 +2311,37 @@ no error, no hint, just exit code 1.
 the error is always visible on the terminal regardless of when main.go redirects the log.
 Added a second hint line: "Another artoo process may be running (LevelDB is single-writer).
 Kill it and retry."
+
+---
+
+## Issue #83 — R4a accepts hallucinated output: `status:"failed"` ExecutionResult scored as "matched"
+
+**Symptom**
+Running "count code lines of this project" produced `754 lines` (wrong — Python files from
+`cloc`'s hallucinated output) and was accepted as a successful result. Debug log showed R3
+failing with `parse LLM output: invalid character 'T' looking for beginning of value` yet
+the task completed as "accepted" with matched criteria.
+
+**Root cause**
+Two compounding bugs:
+
+1. **R3 embeds full raw LLM response in error output.** The executor `execute()` used:
+   `fmt.Errorf("parse LLM output: %w (raw: %s)", err, raw)`. The `(raw: %s)` suffix
+   embedded the complete hallucinated LLM response — including fake cloc output with line
+   counts — into `ExecutionResult.Output` (via `reason := err.Error()` in `RunSubTask`).
+
+2. **R4a ignores `status:"failed"` and evaluates criteria from error message content.**
+   The agentval `score()` function passes the full `ExecutionResult` JSON to the LLM
+   without any pre-check for `status:"failed"`. The system prompt listed infrastructure
+   errors by output content patterns but never mentioned `status:"failed"` itself. The
+   LLM received the error string containing `754` (embedded cloc output), matched both
+   criteria, and returned `verdict:"matched"`.
+
+**Fix**
+1. `internal/roles/executor/executor.go`: strip `(raw: %s)` from returned error; log raw
+   separately to debug.log only. `ExecutionResult.Output` now contains only a clean error
+   message with no embedded LLM content.
+
+2. `internal/roles/agentval/agentval.go`: add "Executor failure rule" (highest priority)
+   to `score()` system prompt: if `status` is `"failed"` → verdict `"failed"` immediately,
+   do not evaluate criteria, do not retry.

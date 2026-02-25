@@ -248,7 +248,11 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		// Parse as tool call
 		var tc toolCall
 		if err := json.Unmarshal([]byte(raw), &tc); err != nil {
-			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("parse LLM output: %w (raw: %s)", err, raw)
+			// Log the raw response to debug.log for diagnostics, but do NOT embed it in
+			// the returned error — it could contain hallucinated tool output that R4a would
+			// evaluate as evidence when scoring criteria (issue #83).
+			log.Printf("[R3] parse error (iter=%d) raw response: %s", i+1, raw)
+			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("parse LLM output: %w", err)
 		}
 
 		detail := tc.Command + tc.Path + tc.Query + tc.Pattern + tc.Name + firstN(tc.Script, 40)
