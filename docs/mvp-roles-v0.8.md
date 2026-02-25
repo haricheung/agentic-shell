@@ -470,6 +470,23 @@ knowledge — without ever blocking the operational hot path.
 
 ### 6a. The MKCT Pyramid
 
+```
+          Dreamer Consolidation (Λ_rule)
+                     ↑
+                    ╱╲
+                   ╱  ╲
+                  ╱ T  ╲──── Thinking         k = 0.0   immutable; system prompt
+                 ╱──────╲
+                ╱   C    ╲── Common Sense     k = 0.0   timeless until Λ_demote
+               ╱──────────╲
+              ╱     K      ╲─ Knowledge       k ← M     task cache; Dreamer GC
+             ╱──────────────╲
+            ╱       M        ╲ Megram         k ∈ {0.05, 0.2, 0.5}   GGS-written
+           ╱──────────────────╲
+                     ↓
+          Λ_gc (forgetting) / Λ_demote (Trust Bankruptcy)
+```
+
 | Layer | Name | Decay k | Description |
 |---|---|---|---|
 | M | Megram | per Quantization Matrix | Raw episodic fact; default layer on creation |
