@@ -2403,3 +2403,24 @@ immediately followed by the fake final-result JSON. E.g.:
 `toolCall` parse attempts. `json.Decoder.Decode` reads exactly one complete JSON value
 and ignores all subsequent content — the concatenated second object is silently dropped,
 and the first (the actual tool call) is parsed correctly.
+
+---
+
+## Issue #86 — R2 suggests third-party CLIs (`cloc`, `tokei`) in subtask context field
+
+**Symptom**
+Running "count code lines of this project" caused R3 to execute `cloc` via the shell
+tool. `cloc` is not installed; the command failed silently (or produced wrong output
+on systems where it is installed), leading to wrong results or task failures.
+
+**Root cause**
+R2's LLM spontaneously wrote `cloc` and `tokei` into the subtask `context` field from
+training knowledge, suggesting them as the preferred way to count lines. R3 followed
+the suggestion and ran them via the `shell` tool. There was no instruction in R2's
+system prompt prohibiting third-party CLI tools.
+
+**Fix**
+`internal/roles/planner/planner.go`: added one rule to the `Context field rules` block:
+> Do NOT suggest third-party CLI tools (cloc, tokei, jq, ripgrep, fd, bat, etc.) —
+> use only standard Unix commands (find, wc, grep, awk, sed, sort, du) or the
+> executor's built-in tools (mdfind, glob, shell, search).
