@@ -286,23 +286,23 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		// Log tool invocation with the most relevant param per tool type.
 		switch tc.Tool {
 		case "shell":
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", "shell", "cmd", firstN(tc.Command, 120))
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "shell", "cmd", firstN(tc.Command, 120))
 		case "mdfind":
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", "mdfind", "query", tc.Query)
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "mdfind", "query", tc.Query)
 		case "glob":
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", "glob", "pattern", tc.Pattern, "root", tc.Root)
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "glob", "pattern", tc.Pattern, "root", tc.Root)
 		case "read_file":
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", "read_file", "path", tc.Path)
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "read_file", "path", tc.Path)
 		case "write_file":
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", "write_file", "path", tc.Path, "bytes", len(tc.Content))
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "write_file", "path", tc.Path, "bytes", len(tc.Content))
 		case "applescript":
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", "applescript", "script", firstN(tc.Script, 100))
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "applescript", "script", firstN(tc.Script, 100))
 		case "shortcuts":
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", "shortcuts", "name", tc.Name)
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "shortcuts", "name", tc.Name)
 		case "search":
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", "search", "query", tc.Query)
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "search", "query", tc.Query)
 		default:
-			slog.Debug("[R3] tool call", "iter", i+1, "tool", tc.Tool)
+			slog.Info("[R3] tool call", "iter", i+1, "tool", tc.Tool)
 		}
 
 		tcInputJSON, _ := json.Marshal(tc)

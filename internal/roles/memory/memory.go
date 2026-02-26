@@ -262,7 +262,7 @@ func (s *Store) persistMegram(m types.Megram) {
 		slog.Error("[R5] persist megram failed", "id", m.ID, "error", err)
 		return
 	}
-	slog.Debug("[R5] persisted Megram", "id", m.ID, "level", m.Level, "state", m.State, "space", m.Space, "entity", m.Entity)
+	slog.Info("[R5] persisted Megram", "id", m.ID, "level", m.Level, "state", m.State, "space", m.Space, "entity", m.Entity)
 }
 
 func (s *Store) drainWriteQueue() {
@@ -280,24 +280,39 @@ func (s *Store) drainWriteQueue() {
 // Internal — Dreamer (offline consolidation engine)
 // ---------------------------------------------------------------------------
 
-// dreamer runs the Dreamer consolidation/GC engine on a 5-minute timer.
-// Blocked by ctx cancellation.
+// dreamer runs the Dreamer consolidation/GC engine.
+// Triggers: (a) 5-minute periodic timer, (b) 50 ms after each FinalResult
+// (debounced) so Megrams from GGS flush before GC/trust-bankruptcy runs,
+// (c) one final cycle on context cancellation (handles one-shot mode exit).
 func (s *Store) dreamer(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
+	finalResultCh := s.b.Subscribe(types.MsgFinalResult)
+	var settleC <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
+			s.runDreamer("shutdown")
 			return
 		case <-ticker.C:
-			s.runDreamer()
+			s.runDreamer("timer")
+		case _, ok := <-finalResultCh:
+			if !ok {
+				return
+			}
+			// Short settle so GGS Megram write (async) lands before consolidation.
+			// Debounced: re-arming on rapid successive FinalResults is intentional.
+			settleC = time.After(50 * time.Millisecond)
+		case <-settleC:
+			settleC = nil
+			s.runDreamer("post-task")
 		}
 	}
 }
 
-func (s *Store) runDreamer() {
+func (s *Store) runDreamer(trigger string) {
 	start := time.Now()
-	slog.Info("[R5/Dreamer] consolidation cycle starting", "trigger", "timer")
+	slog.Info("[R5/Dreamer] consolidation cycle starting", "trigger", trigger)
 	gcScanned, gcDeleted := s.gcPass()
 	tbScanned, tbDemoted := s.trustBankruptcyPass()
 	// Upward consolidation (LLM distillation into C-level SOPs) deferred to Phase 2.
