@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	searchMaxResults = 5
-	bingSearchURL    = "https://api.bing.microsoft.com/v7.0/search"
-	bingAPIKeyEnv    = "BING_API_KEY"
+	searchMaxResults  = 5
+	googleSearchURL   = "https://www.googleapis.com/customsearch/v1"
+	googleAPIKeyEnv   = "GOOGLE_API_KEY"
+	googleCSEIDEnv    = "GOOGLE_CSE_ID"
 )
 
 var searchClient = &http.Client{
@@ -44,18 +45,18 @@ func SearchAvailable() bool {
 	return true
 }
 
-// Search queries the web. Uses Bing Web Search API when BING_API_KEY is set;
-// falls back to DuckDuckGo HTML scraping otherwise.
+// Search queries the web. Uses Google Custom Search API when both GOOGLE_API_KEY
+// and GOOGLE_CSE_ID are set; falls back to DuckDuckGo HTML scraping otherwise.
 //
 // Expectations:
-//   - Uses Bing when BING_API_KEY env var is non-empty
-//   - Uses DuckDuckGo when BING_API_KEY is unset or empty
+//   - Uses Google when GOOGLE_API_KEY and GOOGLE_CSE_ID are both non-empty
+//   - Uses DuckDuckGo when either Google env var is unset or empty
 //   - Returns formatted results on success
 //   - Returns a "no results" message when no results are found
 //   - Returns error when the HTTP request fails
 func Search(ctx context.Context, query string) (string, error) {
-	if os.Getenv(bingAPIKeyEnv) != "" {
-		return searchBing(ctx, query)
+	if os.Getenv(googleAPIKeyEnv) != "" && os.Getenv(googleCSEIDEnv) != "" {
+		return searchGoogle(ctx, query)
 	}
 	return searchDDG(ctx, query)
 }
@@ -159,16 +160,19 @@ func stripHTMLTags(s string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Bing (optional — requires BING_API_KEY)
+// Google Custom Search (optional — requires GOOGLE_API_KEY + GOOGLE_CSE_ID)
 // ---------------------------------------------------------------------------
 
-func searchBing(ctx context.Context, query string) (string, error) {
-	reqURL := bingSearchURL + "?q=" + url.QueryEscape(query) + "&count=10"
+func searchGoogle(ctx context.Context, query string) (string, error) {
+	reqURL := googleSearchURL +
+		"?key=" + url.QueryEscape(os.Getenv(googleAPIKeyEnv)) +
+		"&cx=" + url.QueryEscape(os.Getenv(googleCSEIDEnv)) +
+		"&q=" + url.QueryEscape(query) +
+		"&num=10"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("search: create request: %w", err)
 	}
-	req.Header.Set("Ocp-Apim-Subscription-Key", os.Getenv(bingAPIKeyEnv))
 
 	resp, err := searchClient.Do(req)
 	if err != nil {
@@ -184,37 +188,35 @@ func searchBing(ctx context.Context, query string) (string, error) {
 		return "", fmt.Errorf("search: HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	pages, err := parseBingResults(body)
+	pages, err := parseGoogleResults(body)
 	if err != nil {
 		return "", fmt.Errorf("search: parse response: %w", err)
 	}
 	return formatSearchResult(query, pages), nil
 }
 
-type bingResponse struct {
-	WebPages struct {
-		Value []struct {
-			Name    string `json:"name"`
-			URL     string `json:"url"`
-			Snippet string `json:"snippet"`
-		} `json:"value"`
-	} `json:"webPages"`
+type googleResponse struct {
+	Items []struct {
+		Title   string `json:"title"`
+		Link    string `json:"link"`
+		Snippet string `json:"snippet"`
+	} `json:"items"`
 }
 
-// parseBingResults extracts organic search results from a Bing API JSON response.
+// parseGoogleResults extracts organic search results from a Google Custom Search JSON response.
 //
 // Expectations:
-//   - Returns empty slice when webPages.value is absent or empty
+//   - Returns empty slice when items array is absent or empty
 //   - Returns error on malformed JSON
-//   - Maps name → Name, url → URL, snippet → Snippet for each result
-func parseBingResults(data []byte) ([]searchPage, error) {
-	var br bingResponse
-	if err := json.Unmarshal(data, &br); err != nil {
+//   - Maps title → Name, link → URL, snippet → Snippet for each result
+func parseGoogleResults(data []byte) ([]searchPage, error) {
+	var gr googleResponse
+	if err := json.Unmarshal(data, &gr); err != nil {
 		return nil, err
 	}
-	pages := make([]searchPage, 0, len(br.WebPages.Value))
-	for _, v := range br.WebPages.Value {
-		pages = append(pages, searchPage{Name: v.Name, URL: v.URL, Snippet: v.Snippet})
+	pages := make([]searchPage, 0, len(gr.Items))
+	for _, item := range gr.Items {
+		pages = append(pages, searchPage{Name: item.Title, URL: item.Link, Snippet: item.Snippet})
 	}
 	return pages, nil
 }

@@ -129,12 +129,12 @@ func TestStripHTMLTags_EmptyInputReturnsEmpty(t *testing.T) {
 	}
 }
 
-// ── parseBingResults ─────────────────────────────────────────────────────────
+// ── parseGoogleResults ───────────────────────────────────────────────────────
 
-func TestParseBingResults_EmptyValueReturnsEmptySlice(t *testing.T) {
-	// Returns empty slice when webPages.value is absent or empty
-	data := []byte(`{"webPages":{"value":[]}}`)
-	pages, err := parseBingResults(data)
+func TestParseGoogleResults_EmptyItemsReturnsEmptySlice(t *testing.T) {
+	// Returns empty slice when items array is absent or empty
+	data := []byte(`{"items":[]}`)
+	pages, err := parseGoogleResults(data)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -143,20 +143,32 @@ func TestParseBingResults_EmptyValueReturnsEmptySlice(t *testing.T) {
 	}
 }
 
-func TestParseBingResults_MalformedJSONReturnsError(t *testing.T) {
+func TestParseGoogleResults_MissingItemsReturnsEmptySlice(t *testing.T) {
+	// Returns empty slice when items array is absent or empty
+	data := []byte(`{}`)
+	pages, err := parseGoogleResults(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pages) != 0 {
+		t.Errorf("expected 0 results for missing items, got %d", len(pages))
+	}
+}
+
+func TestParseGoogleResults_MalformedJSONReturnsError(t *testing.T) {
 	// Returns error on malformed JSON
-	_, err := parseBingResults([]byte(`{not valid json`))
+	_, err := parseGoogleResults([]byte(`{not valid json`))
 	if err == nil {
 		t.Error("expected error for malformed JSON, got nil")
 	}
 }
 
-func TestParseBingResults_MapsNameURLSnippet(t *testing.T) {
-	// Maps name → Name, url → URL, snippet → Snippet for each result
-	data := []byte(`{"webPages":{"value":[
-		{"name":"Go Language","url":"https://go.dev","snippet":"An open source language."}
-	]}}`)
-	pages, err := parseBingResults(data)
+func TestParseGoogleResults_MapsTitleLinkSnippet(t *testing.T) {
+	// Maps title → Name, link → URL, snippet → Snippet for each result
+	data := []byte(`{"items":[
+		{"title":"Go Language","link":"https://go.dev","snippet":"An open source language."}
+	]}`)
+	pages, err := parseGoogleResults(data)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
