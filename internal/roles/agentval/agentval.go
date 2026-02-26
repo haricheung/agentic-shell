@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"regexp"
 	"time"
 
@@ -221,11 +221,9 @@ func (a *AgentValidator) Run(
 ) types.SubTaskOutcome {
 	// Log all criteria on a single line (JSON) so they're always visible in one entry,
 	// then repeat as numbered lines for easier reading.
-	criteriaJSON, _ := json.Marshal(subTask.SuccessCriteria)
-	log.Printf("[R4a] subtask=%s seq=%d intent=%q criteria(%d)=%s",
-		subTask.SubTaskID, subTask.Sequence, subTask.Intent, len(subTask.SuccessCriteria), criteriaJSON)
+	slog.Debug("[R4a] received subtask", "subtask", subTask.SubTaskID, "seq", subTask.Sequence, "intent", subTask.Intent, "criteria_count", len(subTask.SuccessCriteria))
 	for i, c := range subTask.SuccessCriteria {
-		log.Printf("[R4a]   [%d] %q", i+1, c)
+		slog.Debug("[R4a] criterion", "index", i+1, "criterion", c)
 	}
 
 	var trajectory []types.GapTrajectoryPoint
@@ -253,53 +251,52 @@ func (a *AgentValidator) Run(
 		}
 
 		attempt++
-		log.Printf("[R4a] scoring subtask=%s attempt=%d status=%s", subTask.SubTaskID, attempt, result.Status)
+		slog.Debug("[R4a] scoring subtask", "subtask", subTask.SubTaskID, "attempt", attempt, "status", result.Status)
 
 		v, err := a.score(ctx, subTask, result, tlog)
 		if err != nil {
-			log.Printf("[R4a] ERROR scoring: %v", err)
+			slog.Error("[R4a] scoring error", "error", err)
 			reason := fmt.Sprintf("scoring error: %v", err)
 			v = &verdict{Verdict: "failed", Score: 0, FailureReason: reason}
 		}
 
 		// Log the full verdict with per-criterion ✓/✗ so the gap between
 		// criteria and outcome is explicit — no manual cross-referencing needed.
-		log.Printf("[R4a] subtask=%s attempt=%d verdict=%s score=%.2f",
-			subTask.SubTaskID, attempt, v.Verdict, v.Score)
+		slog.Debug("[R4a] verdict", "subtask", subTask.SubTaskID, "attempt", attempt, "verdict", v.Verdict, "score", v.Score)
 		if len(v.CriteriaResults) > 0 {
 			// Preferred path: LLM returned per-criterion breakdown.
 			// Print summary JSON on one line first (never lost in scrollback),
 			// then repeat as readable numbered lines.
 			crJSON, _ := json.Marshal(v.CriteriaResults)
-			log.Printf("[R4a]   criteria_results=%s", crJSON)
+			slog.Debug("[R4a] criteria results", "results", string(crJSON))
 			for i, cr := range v.CriteriaResults {
 				mark := "✓"
 				if !cr.Met {
 					mark = "✗"
 				}
 				if cr.Evidence != "" {
-					log.Printf("[R4a]   [%s] [%d] %q — %s", mark, i+1, cr.Criterion, cr.Evidence)
+					slog.Debug("[R4a] criterion verdict", "mark", mark, "index", i+1, "criterion", cr.Criterion, "evidence", cr.Evidence)
 				} else {
-					log.Printf("[R4a]   [%s] [%d] %q", mark, i+1, cr.Criterion)
+					slog.Debug("[R4a] criterion verdict", "mark", mark, "index", i+1, "criterion", cr.Criterion)
 				}
 			}
 		} else {
 			// Fallback: LLM omitted criteria_results; show original list untagged
 			// and the unmet list so reader can compare.
 			unmetJSON, _ := json.Marshal(v.UnmetCriteria)
-			log.Printf("[R4a]   criteria_results=(none) unmet=%s", unmetJSON)
+			slog.Debug("[R4a] no criteria_results from LLM", "unmet", string(unmetJSON))
 			for i, c := range subTask.SuccessCriteria {
-				log.Printf("[R4a]   [?] [%d] %q", i+1, c)
+				slog.Debug("[R4a] unverified criterion", "index", i+1, "criterion", c)
 			}
 		}
 		if v.WhatWasWrong != "" {
-			log.Printf("[R4a]   wrong:  %s", v.WhatWasWrong)
+			slog.Debug("[R4a] correction: what was wrong", "detail", v.WhatWasWrong)
 		}
 		if v.WhatToDo != "" {
-			log.Printf("[R4a]   todo:   %s", v.WhatToDo)
+			slog.Debug("[R4a] correction: what to do", "detail", v.WhatToDo)
 		}
 		if v.FailureReason != "" {
-			log.Printf("[R4a]   reason: %s", v.FailureReason)
+			slog.Debug("[R4a] failure reason", "reason", v.FailureReason)
 		}
 
 		// Log per-criterion verdicts to the task log.
@@ -316,7 +313,7 @@ func (a *AgentValidator) Run(
 
 		switch v.Verdict {
 		case "matched":
-			log.Printf("[R4a] subtask=%s MATCHED on attempt=%d", subTask.SubTaskID, attempt)
+			slog.Info("[R4a] subtask MATCHED", "subtask", subTask.SubTaskID, "attempt", attempt)
 			o := a.outcome(subTask, "matched", result.Output, nil, trajectory, toCriteriaVerdicts(v.CriteriaResults), lastToolCalls)
 			tlog.SubtaskEnd(subTask.SubTaskID, "matched")
 			a.publish(o)
@@ -324,7 +321,7 @@ func (a *AgentValidator) Run(
 
 		case "retry":
 			if attempt >= maxRetries {
-				log.Printf("[R4a] subtask=%s max retries reached, reporting failed", subTask.SubTaskID)
+				slog.Info("[R4a] subtask max retries reached", "subtask", subTask.SubTaskID, "max_retries", maxRetries)
 				reason := fmt.Sprintf("max retries (%d) reached; last issue: %s", maxRetries, v.WhatWasWrong)
 				o := a.outcome(subTask, "failed", result.Output, &reason, trajectory, toCriteriaVerdicts(v.CriteriaResults), lastToolCalls)
 				tlog.SubtaskEnd(subTask.SubTaskID, "failed")
@@ -375,7 +372,7 @@ func (a *AgentValidator) Run(
 			if reason == "" {
 				reason = "validation failed"
 			}
-			log.Printf("[R4a] subtask=%s FAILED: %s", subTask.SubTaskID, reason)
+			slog.Info("[R4a] subtask FAILED", "subtask", subTask.SubTaskID, "reason", reason)
 			o := a.outcome(subTask, "failed", result.Output, &reason, trajectory, toCriteriaVerdicts(v.CriteriaResults), lastToolCalls)
 			tlog.SubtaskEnd(subTask.SubTaskID, "failed")
 			a.publish(o)

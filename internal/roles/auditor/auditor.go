@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -85,7 +85,7 @@ func (a *Auditor) loadStats() {
 	}
 	var ps persistedStats
 	if err := json.Unmarshal(data, &ps); err != nil {
-		log.Printf("[AUDIT] WARNING: could not load persisted stats: %v", err)
+		slog.Warn("[R6] could not load persisted stats", "error", err)
 		return
 	}
 	a.windowStart = ps.WindowStart
@@ -95,8 +95,7 @@ func (a *Auditor) loadStats() {
 	a.boundaryViolations = ps.BoundaryViolations
 	a.driftAlerts = ps.DriftAlerts
 	a.anomalies = ps.Anomalies
-	log.Printf("[AUDIT] loaded persisted stats: tasks=%d corrections=%d window_start=%s",
-		ps.TasksObserved, ps.TotalCorrections, ps.WindowStart.Format(time.RFC3339))
+	slog.Info("[R6] loaded persisted stats", "tasks", ps.TasksObserved, "corrections", ps.TotalCorrections, "window_start", ps.WindowStart.Format(time.RFC3339))
 }
 
 // saveStats writes current window stats to statsPath. Called from the auditor goroutine.
@@ -114,30 +113,30 @@ func (a *Auditor) saveStats() {
 	a.mu.Unlock()
 	data, err := json.Marshal(ps)
 	if err != nil {
-		log.Printf("[AUDIT] WARNING: could not marshal stats: %v", err)
+		slog.Warn("[R6] could not marshal stats", "error", err)
 		return
 	}
 	if err := os.WriteFile(a.statsPath, data, 0o644); err != nil {
-		log.Printf("[AUDIT] WARNING: could not save stats: %v", err)
+		slog.Warn("[R6] could not save stats", "error", err)
 	}
 }
 
 // Run starts the auditor loop. It blocks until ctx is cancelled.
 func (a *Auditor) Run(ctx context.Context) {
 	if err := os.MkdirAll(filepath.Dir(a.logPath), 0o755); err != nil {
-		log.Printf("[AUDIT] ERROR: create log dir: %v", err)
+		slog.Error("[R6] create log dir", "error", err)
 		return
 	}
 
 	f, err := os.OpenFile(a.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		log.Printf("[AUDIT] ERROR: open log file: %v", err)
+		slog.Error("[R6] open audit log file", "error", err)
 		return
 	}
 	a.logFile = f
 	defer f.Close()
 
-	log.Printf("[AUDIT] started; writing to %s", a.logPath)
+	slog.Info("[R6] auditor started", "log", a.logPath)
 
 	queryCh := a.b.Subscribe(types.MsgAuditQuery)
 
@@ -155,13 +154,23 @@ func (a *Auditor) Run(ctx context.Context) {
 			return
 
 		case <-tickC:
+			a.mu.Lock()
+			idle := a.tasksObserved == 0 && len(a.boundaryViolations) == 0 && len(a.driftAlerts) == 0
+			a.mu.Unlock()
+			if idle {
+				// Nothing happened this window — reset silently, don't spam the terminal.
+				a.mu.Lock()
+				a.windowStart = time.Now().UTC()
+				a.mu.Unlock()
+				continue
+			}
 			a.publishReport("periodic")
 
 		case msg, ok := <-queryCh:
 			if !ok {
 				return
 			}
-			log.Printf("[AUDIT] received AuditQuery from %s", msg.From)
+			slog.Debug("[R6] received AuditQuery", "from", msg.From)
 			a.publishReport("on-demand")
 
 		case msg, ok := <-a.tap:
@@ -213,7 +222,7 @@ func (a *Auditor) process(msg types.Message) {
 			anomaly = "boundary_violation"
 			d := fmt.Sprintf("unexpected %s→%s for %s", msg.From, msg.To, msg.Type)
 			detail = &d
-			log.Printf("[AUDIT] BOUNDARY VIOLATION: %s", d)
+			slog.Warn("[R6] boundary violation", "detail", d)
 			a.mu.Lock()
 			a.boundaryViolations = append(a.boundaryViolations, d)
 			a.anomalies = append(a.anomalies, "boundary_violation: "+d)
@@ -248,7 +257,7 @@ func (a *Auditor) process(msg types.Message) {
 				d := fmt.Sprintf("task %s correction_count=%d (thrashing threshold=%d) replan#%d",
 					rr.TaskID, rr.CorrectionCount, thrashThreshold, count)
 				detail = &d
-				log.Printf("[AUDIT] THRASHING DETECTED: %s", d)
+				slog.Warn("[R6] thrashing detected", "detail", d)
 				a.mu.Lock()
 				a.driftAlerts = append(a.driftAlerts, d)
 				a.anomalies = append(a.anomalies, "drift: "+d)
@@ -279,7 +288,7 @@ func (a *Auditor) process(msg types.Message) {
 				d := fmt.Sprintf("task %s ∇L=%.3f (worsening) directive=%s L=%.3f",
 					pd.TaskID, pd.GradL, pd.Directive, pd.Loss.L)
 				detail = &d
-				log.Printf("[AUDIT] CONVERGENCE FAILURE: %s", d)
+				slog.Warn("[R6] convergence failure", "detail", d)
 				a.mu.Lock()
 				a.anomalies = append(a.anomalies, "convergence_failure: "+d)
 				a.mu.Unlock()
@@ -304,7 +313,7 @@ func (a *Auditor) process(msg types.Message) {
 					d := fmt.Sprintf("task %s: %d consecutive break_symmetry without D decreasing (D=%.3f)",
 						pd.TaskID, count, pd.Loss.D)
 					detail = &d
-					log.Printf("[AUDIT] GGS THRASHING: %s", d)
+					slog.Warn("[R6] GGS thrashing", "detail", d)
 					a.mu.Lock()
 					a.anomalies = append(a.anomalies, "ggs_thrashing: "+d)
 					a.mu.Unlock()
@@ -382,8 +391,7 @@ func (a *Auditor) publishReport(trigger string) {
 		Anomalies:   anomalies,
 	}
 
-	log.Printf("[AUDIT] publishing %s report: tasks=%d corrections=%.1f violations=%d drifts=%d",
-		trigger, tasks, avgCorrections, len(violations), len(drifts))
+	slog.Info("[R6] publishing audit report", "trigger", trigger, "tasks", tasks, "avg_corrections", avgCorrections, "violations", len(violations), "drifts", len(drifts))
 
 	a.b.Publish(types.Message{
 		ID:        uuid.New().String(),
@@ -401,11 +409,11 @@ func (a *Auditor) writeEvent(e types.AuditEvent) {
 
 	data, err := json.Marshal(e)
 	if err != nil {
-		log.Printf("[AUDIT] ERROR: marshal event: %v", err)
+		slog.Error("[R6] marshal audit event", "error", err)
 		return
 	}
 	if _, err := fmt.Fprintf(a.logFile, "%s\n", data); err != nil {
-		log.Printf("[AUDIT] ERROR: write event: %v", err)
+		slog.Error("[R6] write audit event", "error", err)
 	}
 }
 

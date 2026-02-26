@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -139,14 +139,14 @@ func (p *Planner) Run(ctx context.Context) {
 			}
 			spec, err := toTaskSpec(msg.Payload)
 			if err != nil {
-				log.Printf("[R2] ERROR: bad TaskSpec payload: %v", err)
+				slog.Error("[R2] bad TaskSpec payload", "error", err)
 				continue
 			}
-			log.Printf("[R2] received TaskSpec task_id=%s", spec.TaskID)
+			slog.Info("[R2] received TaskSpec", "task", spec.TaskID)
 			currentSpec = &spec
 			go func(s types.TaskSpec) {
 				if err := p.plan(ctx, s); err != nil {
-					log.Printf("[R2] ERROR: planning failed: %v", err)
+					slog.Error("[R2] planning failed", "error", err)
 				}
 			}(spec)
 
@@ -156,20 +156,19 @@ func (p *Planner) Run(ctx context.Context) {
 			}
 			pd, err := toPlanDirective(msg.Payload)
 			if err != nil {
-				log.Printf("[R2] ERROR: bad PlanDirective payload: %v", err)
+				slog.Error("[R2] bad PlanDirective payload", "error", err)
 				continue
 			}
-			log.Printf("[R2] received PlanDirective task_id=%s directive=%s prev=%s Ω=%.3f",
-				pd.TaskID, pd.Directive, pd.PrevDirective, pd.BudgetPressure)
+			slog.Info("[R2] received PlanDirective", "task", pd.TaskID, "directive", pd.Directive, "prev", pd.PrevDirective, "budget_pressure", pd.BudgetPressure)
 
 			if currentSpec == nil {
-				log.Printf("[R2] WARNING: PlanDirective received but no current TaskSpec")
+				slog.Warn("[R2] PlanDirective received but no current TaskSpec")
 				continue
 			}
 			spec := *currentSpec
 			go func(s types.TaskSpec, directive types.PlanDirective) {
 				if err := p.replanWithDirective(ctx, s, directive); err != nil {
-					log.Printf("[R2] ERROR: replanning failed: %v", err)
+					slog.Error("[R2] replanning failed", "error", err)
 				}
 			}(spec, pd)
 		}
@@ -264,17 +263,17 @@ func (p *Planner) queryMKCTConstraints(ctx context.Context, intent string) strin
 	sops, err1 := p.mem.QueryC(ctx, space, entity)
 	pots, err2 := p.mem.QueryMK(ctx, space, entity)
 	if err1 != nil {
-		log.Printf("[R2] WARNING: QueryC failed: %v", err1)
+		slog.Warn("[R2] QueryC failed", "error", err1)
 	}
 	if err2 != nil {
-		log.Printf("[R2] WARNING: QueryMK failed: %v", err2)
+		slog.Warn("[R2] QueryMK failed", "error", err2)
 	}
 
 	constraints := calibrateMKCT(sops, pots)
 	if constraints != "" {
-		log.Printf("[R2] MKCT calibration: %d SOPs, action=%s", len(sops), pots.Action)
+		slog.Debug("[R2] MKCT calibration", "sops", len(sops), "action", pots.Action)
 	} else {
-		log.Printf("[R2] MKCT calibration: no relevant memory (action=%s)", pots.Action)
+		slog.Debug("[R2] MKCT calibration: no relevant memory", "action", pots.Action)
 	}
 	return constraints
 }
@@ -519,7 +518,7 @@ func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string) error {
 		Type:      types.MsgDispatchManifest,
 		Payload:   manifest,
 	})
-	log.Printf("[R2] dispatched manifest task_id=%s subtasks=%d", spec.TaskID, len(subTasks))
+	slog.Info("[R2] dispatched manifest", "task", spec.TaskID, "subtasks", len(subTasks))
 
 	// Fan-out sub-tasks to executor
 	for _, st := range subTasks {
@@ -531,11 +530,9 @@ func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string) error {
 			Type:      types.MsgSubTask,
 			Payload:   st,
 		})
-		criteriaJSON, _ := json.Marshal(st.SuccessCriteria)
-		log.Printf("[R2] dispatched subtask=%s sequence=%d intent=%q criteria(%d)=%s",
-			st.SubTaskID, st.Sequence, st.Intent, len(st.SuccessCriteria), criteriaJSON)
+		slog.Debug("[R2] dispatched subtask", "subtask", st.SubTaskID, "seq", st.Sequence, "intent", st.Intent, "criteria_count", len(st.SuccessCriteria))
 		for i, c := range st.SuccessCriteria {
-			log.Printf("[R2]   [%d] %q", i+1, c)
+			slog.Debug("[R2] criterion", "index", i+1, "criterion", c)
 		}
 	}
 

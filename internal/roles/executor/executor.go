@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"regexp"
 	"strings"
@@ -103,10 +103,10 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 	allToolCalls = append(allToolCalls, toolCalls...)
 	if err != nil {
 		if ctx.Err() != nil {
-			log.Printf("[R3] subtask=%s cancelled, skipping publish", subTask.SubTaskID)
+			slog.Debug("[R3] subtask cancelled, skipping publish", "subtask", subTask.SubTaskID)
 			return
 		}
-		log.Printf("[R3] ERROR executing subtask %s: %v", subTask.SubTaskID, err)
+		slog.Error("[R3] execute subtask error", "subtask", subTask.SubTaskID, "error", err)
 		reason := err.Error()
 		result = types.ExecutionResult{
 			SubTaskID:   subTask.SubTaskID,
@@ -116,7 +116,7 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 		}
 	}
 	if ctx.Err() != nil {
-		log.Printf("[R3] subtask=%s context done after execute, skipping publish", subTask.SubTaskID)
+		slog.Debug("[R3] context done after execute, skipping publish", "subtask", subTask.SubTaskID)
 		return
 	}
 
@@ -128,7 +128,7 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 		Type:      types.MsgExecutionResult,
 		Payload:   result,
 	})
-	log.Printf("[R3] published ExecutionResult subtask_id=%s status=%s", result.SubTaskID, result.Status)
+	slog.Debug("[R3] published ExecutionResult", "subtask", result.SubTaskID, "status", result.Status)
 
 	// Listen for correction signals and re-execute
 	for {
@@ -139,15 +139,15 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 			if !ok {
 				return
 			}
-			log.Printf("[R3] received CorrectionSignal attempt=%d for subtask=%s", correction.AttemptNumber, correction.SubTaskID)
+			slog.Debug("[R3] received CorrectionSignal", "attempt", correction.AttemptNumber, "subtask", correction.SubTaskID)
 			result, toolCalls, err = e.execute(ctx, subTask, &correction, allToolCalls, tlog)
 			allToolCalls = append(allToolCalls, toolCalls...)
 			if err != nil {
 				if ctx.Err() != nil {
-					log.Printf("[R3] subtask=%s cancelled during correction, skipping publish", subTask.SubTaskID)
+					slog.Debug("[R3] subtask cancelled during correction, skipping publish", "subtask", subTask.SubTaskID)
 					return
 				}
-				log.Printf("[R3] ERROR re-executing subtask %s: %v", subTask.SubTaskID, err)
+				slog.Error("[R3] re-execute subtask error", "subtask", subTask.SubTaskID, "error", err)
 				reason := err.Error()
 				result = types.ExecutionResult{
 					SubTaskID:   subTask.SubTaskID,
@@ -157,7 +157,7 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 				}
 			}
 			if ctx.Err() != nil {
-				log.Printf("[R3] subtask=%s context done after correction, skipping publish", subTask.SubTaskID)
+				slog.Debug("[R3] context done after correction, skipping publish", "subtask", subTask.SubTaskID)
 				return
 			}
 			e.b.Publish(types.Message{
@@ -168,7 +168,7 @@ func (e *Executor) RunSubTask(ctx context.Context, subTask types.SubTask, correc
 				Type:      types.MsgExecutionResult,
 				Payload:   result,
 			})
-			log.Printf("[R3] published corrected ExecutionResult subtask_id=%s status=%s", result.SubTaskID, result.Status)
+			slog.Debug("[R3] published corrected ExecutionResult", "subtask", result.SubTaskID, "status", result.Status)
 		}
 	}
 }
@@ -200,11 +200,10 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 	wd, _ := os.Getwd()
 
 	if correction == nil {
-		log.Printf("[R3] execute subtask=%s seq=%d intent=%q", st.SubTaskID, st.Sequence, st.Intent)
+		slog.Debug("[R3] execute subtask", "subtask", st.SubTaskID, "seq", st.Sequence, "intent", st.Intent)
 	} else {
-		log.Printf("[R3] re-execute subtask=%s seq=%d attempt=%d intent=%q",
-			st.SubTaskID, st.Sequence, correction.AttemptNumber+1, st.Intent)
-		log.Printf("[R3]   correction: wrong=%q todo=%q", correction.WhatWasWrong, correction.WhatToDo)
+		slog.Debug("[R3] re-execute subtask", "subtask", st.SubTaskID, "seq", st.Sequence, "attempt", correction.AttemptNumber+1, "intent", st.Intent,
+			"wrong", correction.WhatWasWrong, "todo", correction.WhatToDo)
 	}
 
 	var userPrompt string
@@ -238,7 +237,7 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("llm: %w", err)
 		}
 		raw = llm.StripFences(raw)
-		log.Printf("[R3] llm response (iter=%d): %s", i, firstN(raw, 200))
+		slog.Debug("[R3] llm response", "iter", i, "preview", firstN(raw, 200))
 
 		// Try to parse as final result first.
 		// Use json.Decoder (not json.Unmarshal) so that a response containing multiple
@@ -248,8 +247,7 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		var fr finalResult
 		if err := json.NewDecoder(strings.NewReader(raw)).Decode(&fr); err == nil && fr.Action == "result" {
 			outStr, _ := json.Marshal(fr.Output)
-			log.Printf("[R3] result subtask=%s status=%s output=%s",
-				st.SubTaskID, fr.Status, firstN(strings.TrimSpace(string(outStr)), 500))
+			slog.Debug("[R3] final result", "subtask", st.SubTaskID, "status", fr.Status, "output", firstN(strings.TrimSpace(string(outStr)), 500))
 			return types.ExecutionResult{
 				SubTaskID:   st.SubTaskID,
 				Status:      fr.Status,
@@ -265,7 +263,7 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			// Log the raw response to debug.log for diagnostics, but do NOT embed it in
 			// the returned error — it could contain hallucinated tool output that R4a would
 			// evaluate as evidence when scoring criteria (issue #83).
-			log.Printf("[R3] parse error (iter=%d) raw response: %s", i+1, raw)
+			slog.Warn("[R3] parse error", "iter", i+1, "raw", raw)
 			return types.ExecutionResult{}, toolCallHistory, fmt.Errorf("parse LLM output: %w", err)
 		}
 
@@ -276,7 +274,7 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		// execution and inject a hard stop so the LLM must either output a final result
 		// or try a genuinely different tool/query.
 		if len(toolCallHistory) > 0 && currentSig == toolCallHistory[len(toolCallHistory)-1] {
-			log.Printf("[R3] loop detected: identical call blocked (tool=%s iter=%d)", tc.Tool, i+1)
+			slog.Warn("[R3] loop detected: identical call blocked", "tool", tc.Tool, "iter", i+1)
 			toolResultsCtx.WriteString(fmt.Sprintf(
 				"\n⚠️ DUPLICATE CALL BLOCKED: [%s] was already called with identical parameters — repeated calls return identical results and waste budget. You MUST now either:\n1. Output the final result using what you already have (even if partial), OR\n2. Use a COMPLETELY DIFFERENT query, tool, or approach.\nDo NOT repeat this call.\n",
 				tc.Tool))
@@ -288,23 +286,23 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		// Log tool invocation with the most relevant param per tool type.
 		switch tc.Tool {
 		case "shell":
-			log.Printf("[R3] tool[%d] shell: %s", i+1, firstN(tc.Command, 120))
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", "shell", "cmd", firstN(tc.Command, 120))
 		case "mdfind":
-			log.Printf("[R3] tool[%d] mdfind: query=%q", i+1, tc.Query)
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", "mdfind", "query", tc.Query)
 		case "glob":
-			log.Printf("[R3] tool[%d] glob: pattern=%q root=%q", i+1, tc.Pattern, tc.Root)
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", "glob", "pattern", tc.Pattern, "root", tc.Root)
 		case "read_file":
-			log.Printf("[R3] tool[%d] read_file: %s", i+1, tc.Path)
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", "read_file", "path", tc.Path)
 		case "write_file":
-			log.Printf("[R3] tool[%d] write_file: %s (%d bytes)", i+1, tc.Path, len(tc.Content))
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", "write_file", "path", tc.Path, "bytes", len(tc.Content))
 		case "applescript":
-			log.Printf("[R3] tool[%d] applescript: %s", i+1, firstN(tc.Script, 100))
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", "applescript", "script", firstN(tc.Script, 100))
 		case "shortcuts":
-			log.Printf("[R3] tool[%d] shortcuts: name=%q", i+1, tc.Name)
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", "shortcuts", "name", tc.Name)
 		case "search":
-			log.Printf("[R3] tool[%d] search: query=%q", i+1, tc.Query)
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", "search", "query", tc.Query)
 		default:
-			log.Printf("[R3] tool[%d] %s", i+1, tc.Tool)
+			slog.Debug("[R3] tool call", "iter", i+1, "tool", tc.Tool)
 		}
 
 		tcInputJSON, _ := json.Marshal(tc)
@@ -313,13 +311,13 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		toolElapsedMs := time.Since(toolStart).Milliseconds()
 		if err != nil {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s ERROR: %v\n", tc.Tool, err))
-			log.Printf("[R3] tool[%d] → ERROR: %v", i+1, err)
+			slog.Warn("[R3] tool error", "iter", i+1, "tool", tc.Tool, "error", err)
 			// Append error evidence to tool_calls so R4a can verify
 			toolCallHistory[len(toolCallHistory)-1] += " → ERROR: " + firstN(err.Error(), 80)
 			tlog.ToolCall(st.SubTaskID, tc.Tool, string(tcInputJSON), "", err.Error(), toolElapsedMs)
 		} else {
 			toolResultsCtx.WriteString(fmt.Sprintf("Tool %s result:\n%s\n", tc.Tool, headTail(result, 4000)))
-			log.Printf("[R3] tool[%d] → %s", i+1, firstN(strings.TrimSpace(result), 500))
+			slog.Debug("[R3] tool result", "iter", i+1, "tool", tc.Tool, "output", firstN(strings.TrimSpace(result), 500))
 			// Append leading content to tool_calls so R4a sees concrete evidence.
 			// firstN: nearly all tool outputs (search titles, file paths, shell results)
 			// put the relevant content at the start. lastN was wrong for search results.
@@ -518,12 +516,12 @@ func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 		// The model occasionally ignores the prompt priority and emits
 		// `find /Users/... -name <pattern>` which is extremely slow (~6 min).
 		if query, ok := redirectPersonalFind(tc.Command); ok {
-			log.Printf("[R3] redirecting personal find to mdfind: query=%q (original: %s)", query, firstN(tc.Command, 80))
+			slog.Debug("[R3] redirecting personal find to mdfind", "query", query, "original", firstN(tc.Command, 80))
 			return tools.RunMdfind(ctx, query)
 		}
 		cmd := normalizeFindCmd(tc.Command)
 		if cmd != tc.Command {
-			log.Printf("[R3] normalized find cmd: %q -> %q", tc.Command, cmd)
+			slog.Debug("[R3] normalized find cmd", "from", tc.Command, "to", cmd)
 		}
 		stdout, stderr, err := tools.RunShell(ctx, cmd)
 		if err != nil {
@@ -563,7 +561,7 @@ func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 		// Redirect bare filenames and "./" paths to the workspace so generated files
 		// (scripts, reports, data) never land in the project root or CWD.
 		if resolved, redirected := tools.ResolveOutputPath(writePath); redirected {
-			log.Printf("[R3] write_file: redirecting %q → workspace %q", tc.Path, resolved)
+			slog.Debug("[R3] write_file redirected to workspace", "from", tc.Path, "to", resolved)
 			writePath = resolved
 		}
 		if irreversible, reason := isIrreversibleWriteFile(writePath); irreversible {

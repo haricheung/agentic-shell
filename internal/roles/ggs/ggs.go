@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"strings"
 	"sync"
@@ -79,11 +79,10 @@ func (g *GGS) Run(ctx context.Context) {
 			}
 			rr, err := toReplanRequest(msg.Payload)
 			if err != nil {
-				log.Printf("[R7] ERROR: bad ReplanRequest: %v", err)
+				slog.Error("[R7] bad ReplanRequest", "error", err)
 				continue
 			}
-			log.Printf("[R7] received ReplanRequest task=%s gap=%q corrections=%d elapsed=%dms",
-				rr.TaskID, rr.GapSummary, rr.CorrectionCount, rr.ElapsedMs)
+			slog.Info("[R7] received ReplanRequest", "task", rr.TaskID, "gap", rr.GapSummary, "corrections", rr.CorrectionCount, "elapsed_ms", rr.ElapsedMs)
 			go g.process(ctx, rr)
 		case msg, ok := <-acceptCh:
 			if !ok {
@@ -91,11 +90,10 @@ func (g *GGS) Run(ctx context.Context) {
 			}
 			os, err := toOutcomeSummary(msg.Payload)
 			if err != nil {
-				log.Printf("[R7] ERROR: bad OutcomeSummary: %v", err)
+				slog.Error("[R7] bad OutcomeSummary", "error", err)
 				continue
 			}
-			log.Printf("[R7] received OutcomeSummary task=%s elapsed=%dms — D=0 accept path",
-				os.TaskID, os.ElapsedMs)
+			slog.Info("[R7] received OutcomeSummary", "task", os.TaskID, "elapsed_ms", os.ElapsedMs)
 			go g.processAccept(ctx, os)
 		}
 	}
@@ -152,17 +150,15 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 
 	const law2KillThreshold = 2
 	if consecutiveWorsening >= law2KillThreshold && directive != "abandon" && directive != "success" {
-		log.Printf("[R7] LAW2 KILL-SWITCH: task=%s consecutive_worsening=%d — overriding %s→abandon",
-			taskID, consecutiveWorsening, directive)
+		slog.Warn("[R7] LAW2 kill-switch: overriding to abandon", "task", taskID, "consecutive_worsening", consecutiveWorsening, "directive", directive)
 		directive = "abandon"
 	}
 
-	log.Printf("[R7] task=%s round=%d D=%.3f P=%.3f Ω=%.3f L=%.3f ∇L=%.3f gradient=%s macro-state=%s",
-		taskID, replanCount, D, P, Omega, L, gradL, gradient, directive)
+	slog.Info("[R7] GGS compute", "task", taskID, "round", replanCount, "D", D, "P", P, "Omega", Omega, "L", L, "gradL", gradL, "gradient", gradient, "directive", directive)
 
 	// "success" macro-state: D ≤ δ, Ω < θ — close enough, deliver result without routing to R2.
 	if directive == "success" {
-		log.Printf("[R7] task=%s SUCCESS (D=%.3f ≤ δ=%.1f)", taskID, D, delta)
+		slog.Info("[R7] task SUCCESS", "task", taskID, "D", D, "delta", delta)
 		summary := buildSuccessSummary(rr)
 		output := mergeMatchedOutputs(rr.Outcomes)
 
@@ -202,7 +198,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 
 	// "abandon" macro-state: Ω ≥ θ or Law 2 kill-switch.
 	if directive == "abandon" {
-		log.Printf("[R7] task=%s ABANDON (Ω=%.3f ≥ %.1f)", taskID, Omega, abandonOmega)
+		slog.Info("[R7] task ABANDON", "task", taskID, "Omega", Omega, "threshold", abandonOmega)
 		summary := buildAbandonSummary(rr)
 
 		// Write terminal Megram to R5 (GGS is sole writer).
@@ -257,8 +253,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 	failureClass := computeFailureClass(rr.Outcomes)
 	rationale := buildRationale(directive, D, P, Omega, gradL, rr.GapSummary)
 
-	log.Printf("[R7] task=%s emitting PlanDirective directive=%s prev=%s blocked_tools=%v",
-		taskID, directive, prevDirective, blockedTools)
+	slog.Info("[R7] emitting PlanDirective", "task", taskID, "directive", directive, "prev", prevDirective, "blocked_tools", blockedTools)
 
 	g.b.Publish(types.Message{
 		ID:        uuid.New().String(),
@@ -335,8 +330,7 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 		gradL = L - lPrev // ∇L across rounds (e.g. L after first replan → 0 on final accept)
 	}
 
-	log.Printf("[R7] task=%s ACCEPT D=0.000 P=0.500 Ω=%.3f L=%.3f ∇L=%.3f replans=%d prev=%s",
-		taskID, Omega, L, gradL, replanCount, prevDirective)
+	slog.Info("[R7] task ACCEPT", "task", taskID, "Omega", Omega, "L", L, "gradL", gradL, "replans", replanCount, "prev", prevDirective)
 
 	// Clean up per-task state (task is done).
 	g.mu.Lock()

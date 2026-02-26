@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -54,11 +54,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "warning: could not create workspace: %v\n", err)
 	}
 
-	// Redirect debug logs to file so they don't interfere with the terminal UI.
+	// Set up structured logger (slog) writing to debug.log.
+	// Level: DEBUG when ARTOO_DEBUG is set; INFO otherwise.
 	// Tail ~/.artoo/debug.log (or $ARTOO_DATA_DIR/debug.log) to observe internal role activity.
+	logLevel := slog.LevelInfo
+	if os.Getenv("ARTOO_DEBUG") != "" {
+		logLevel = slog.LevelDebug
+	}
 	if f, err := os.OpenFile(filepath.Join(cacheDir, "debug.log"),
 		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
-		log.SetOutput(f)
+		slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: logLevel})))
 		defer f.Close()
 	}
 
@@ -226,7 +231,7 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 		states[st.SubTaskID] = &subtaskState{resultCh: resultC, correctionCh: correctionC}
 		mu.Unlock()
 
-		log.Printf("[DISPATCHER] spawning executor+agentval for subtask=%s (seq=%d)", st.SubTaskID, st.Sequence)
+		slog.Debug("[DISPATCHER] spawning executor+agentval", "subtask", st.SubTaskID, "seq", st.Sequence)
 		subTask := st
 		tl := logReg.Get(subTask.ParentTaskID)
 		go exec.RunSubTask(td.ctx, subTask, correctionC, tl)
@@ -250,7 +255,7 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 			prevCtx = "\n\nOutputs from prior steps (use these directly — do not re-run discovery):\n" +
 				strings.Join(td.prevOutputs, "\n---\n")
 		}
-		log.Printf("[DISPATCHER] dispatching sequence=%d (%d subtasks)", seq, len(subtasks))
+		slog.Debug("[DISPATCHER] dispatching sequence", "seq", seq, "count", len(subtasks))
 		for _, st := range subtasks {
 			if prevCtx != "" {
 				st.Context = st.Context + prevCtx
@@ -297,7 +302,7 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 				return
 			}
 			if td, found := dispatches[taskID]; found {
-				log.Printf("[DISPATCHER] aborting task=%s", taskID)
+				slog.Info("[DISPATCHER] aborting task", "task", taskID)
 				td.cancel()
 				delete(dispatches, taskID)
 			}
@@ -309,7 +314,7 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 			raw, _ := json.Marshal(msg.Payload)
 			var manifest types.DispatchManifest
 			if err := json.Unmarshal(raw, &manifest); err != nil {
-				log.Printf("[DISPATCHER] ERROR: bad DispatchManifest payload: %v", err)
+				slog.Error("[DISPATCHER] bad DispatchManifest payload", "error", err)
 				continue
 			}
 			td, exists := dispatches[manifest.TaskID]
@@ -319,7 +324,7 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 				dispatches[manifest.TaskID] = td
 			}
 			td.expected = len(manifest.SubTaskIDs)
-			log.Printf("[DISPATCHER] manifest task_id=%s expecting %d subtasks", manifest.TaskID, td.expected)
+			slog.Debug("[DISPATCHER] manifest received", "task", manifest.TaskID, "expecting", td.expected)
 			tryStart(td)
 
 		case msg, ok := <-subTaskCh:
@@ -328,7 +333,7 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 			}
 			st, err := toSubTask(msg.Payload)
 			if err != nil {
-				log.Printf("[DISPATCHER] ERROR: bad SubTask payload: %v", err)
+				slog.Error("[DISPATCHER] bad SubTask payload", "error", err)
 				continue
 			}
 			td, exists := dispatches[st.ParentTaskID]
@@ -374,20 +379,20 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 			}
 			result, err := toExecutionResult(msg.Payload)
 			if err != nil {
-				log.Printf("[DISPATCHER] ERROR: bad ExecutionResult payload: %v", err)
+				slog.Error("[DISPATCHER] bad ExecutionResult payload", "error", err)
 				continue
 			}
 			mu.Lock()
 			state, found := states[result.SubTaskID]
 			mu.Unlock()
 			if !found {
-				log.Printf("[DISPATCHER] WARNING: no state for subtask=%s (already completed?)", result.SubTaskID)
+				slog.Warn("[DISPATCHER] no state for subtask (already completed?)", "subtask", result.SubTaskID)
 				continue
 			}
 			select {
 			case state.resultCh <- result:
 			default:
-				log.Printf("[DISPATCHER] WARNING: resultCh full for subtask=%s", result.SubTaskID)
+				slog.Warn("[DISPATCHER] resultCh full, dropping result", "subtask", result.SubTaskID)
 			}
 		}
 	}
@@ -620,6 +625,9 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 				// goroutine can reach rl.Readline() (which draws ❯) before the
 				// display goroutine calls endTask(), whose \r\033[K then erases it.
 				disp.WaitTaskClose(300 * time.Millisecond)
+				// Suppress stale pipeline messages (GGS goroutines, Megram writes) until
+				// the next task starts. Abort() is a no-op on inTask=false, so no ✗ is shown.
+				disp.Abort()
 				printResult(result, input)
 				printCostStats(perceiverUsage, logReg.GetStats(result.TaskID))
 				history = append(history, sessionEntry{Input: input, Summary: result.Summary})

@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"os"
 	"strings"
@@ -92,7 +92,7 @@ func (s *Store) Write(m types.Megram) {
 	select {
 	case s.writeCh <- m:
 	default:
-		log.Printf("[R5] WARNING: write queue full — dropping Megram id=%s state=%s", m.ID, m.State)
+		slog.Warn("[R5] write queue full — dropping Megram", "id", m.ID, "state", m.State)
 	}
 }
 
@@ -234,7 +234,7 @@ func (s *Store) Run(ctx context.Context) {
 		case <-ctx.Done():
 			s.drainWriteQueue()
 			if err := s.db.Close(); err != nil {
-				log.Printf("[R5] WARNING: DB close error: %v", err)
+				slog.Warn("[R5] DB close error", "error", err)
 			}
 			return
 		case m := <-s.writeCh:
@@ -250,7 +250,7 @@ func (s *Store) Run(ctx context.Context) {
 func (s *Store) persistMegram(m types.Megram) {
 	data, err := json.Marshal(m)
 	if err != nil {
-		log.Printf("[R5] ERROR: marshal megram id=%s: %v", m.ID, err)
+		slog.Error("[R5] marshal megram failed", "id", m.ID, "error", err)
 		return
 	}
 	batch := new(leveldb.Batch)
@@ -259,11 +259,10 @@ func (s *Store) persistMegram(m types.Megram) {
 	batch.Put([]byte(levelKey(m.Level, m.ID)), nil)
 
 	if err := s.db.Write(batch, nil); err != nil {
-		log.Printf("[R5] ERROR: persist megram id=%s: %v", m.ID, err)
+		slog.Error("[R5] persist megram failed", "id", m.ID, "error", err)
 		return
 	}
-	log.Printf("[R5] persisted Megram id=%s level=%s state=%s space=%s entity=%s",
-		m.ID, m.Level, m.State, m.Space, m.Entity)
+	slog.Debug("[R5] persisted Megram", "id", m.ID, "level", m.Level, "state", m.State, "space", m.Space, "entity", m.Entity)
 }
 
 func (s *Store) drainWriteQueue() {
@@ -297,26 +296,33 @@ func (s *Store) dreamer(ctx context.Context) {
 }
 
 func (s *Store) runDreamer() {
-	log.Printf("[R5/Dreamer] starting consolidation cycle")
-	s.gcPass()
-	s.trustBankruptcyPass()
+	start := time.Now()
+	slog.Info("[R5/Dreamer] consolidation cycle starting", "trigger", "timer")
+	gcScanned, gcDeleted := s.gcPass()
+	tbScanned, tbDemoted := s.trustBankruptcyPass()
 	// Upward consolidation (LLM distillation into C-level SOPs) deferred to Phase 2.
-	log.Printf("[R5/Dreamer] consolidation cycle complete")
+	elapsed := time.Since(start)
+	slog.Info("[R5/Dreamer] consolidation cycle complete",
+		"elapsed_ms", elapsed.Milliseconds(),
+		"gc_scanned", gcScanned, "gc_deleted", gcDeleted,
+		"trust_scanned", tbScanned, "trust_demoted", tbDemoted)
 }
 
 // gcPass scans M and K-level Megrams and hard-deletes those with M_attention < 0.1.
+// Returns (scanned, deleted) counts for Dreamer cycle logging.
 //
 // Expectations:
 //   - Deletes M/K megrams whose decayed attention potential falls below Λ_gc=0.1
 //   - Does not delete C or T level megrams
 //   - Removes all four index entries (primary, inverted, level, recall) on delete
-func (s *Store) gcPass() {
+func (s *Store) gcPass() (scanned, deleted int) {
 	now := time.Now().UTC()
 	for _, lvl := range []string{"M", "K"} {
 		prefix := prefixLevel + lvl + "|"
 		iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
 		var toDelete []string
 		for iter.Next() {
+			scanned++
 			id := string(iter.Key())[len(prefix):]
 			m, err := s.fetchMegram(id)
 			if err != nil {
@@ -335,24 +341,29 @@ func (s *Store) gcPass() {
 		iter.Release()
 		for _, id := range toDelete {
 			s.deleteMegram(id, lvl)
-			log.Printf("[R5/Dreamer] GC deleted Megram id=%s level=%s (M_att < Λ_gc=0.1)", id, lvl)
+			deleted++
+			slog.Info("[R5/Dreamer] GC deleted Megram", "id", id, "level", lvl, "reason", "M_att < Λ_gc=0.1")
 		}
 	}
+	slog.Debug("[R5/Dreamer] GC pass complete", "scanned", scanned, "deleted", deleted, "threshold_lambda_gc", 0.1)
+	return
 }
 
 // trustBankruptcyPass scans C-level Megrams and demotes those whose live
 // M_decision < 0.0 to K-level with k reverted to 0.05 (stripping time immunity).
+// Returns (scanned, demoted) counts for Dreamer cycle logging.
 //
 // Expectations:
 //   - Only processes C-level Megrams
 //   - Demotes to K (level="K", k=0.05) when live M_decision for the tag pair is < 0.0
 //   - Updates the primary megram record, level index (removes C, adds K), leaves idx intact
 //   - Does not delete demoted megrams (they remain queryable)
-func (s *Store) trustBankruptcyPass() {
+func (s *Store) trustBankruptcyPass() (scanned, demoted int) {
 	prefix := prefixLevel + "C|"
 	iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
 	var toUpdate []types.Megram
 	for iter.Next() {
+		scanned++
 		id := string(iter.Key())[len(prefix):]
 		m, err := s.fetchMegram(id)
 		if err != nil {
@@ -369,6 +380,7 @@ func (s *Store) trustBankruptcyPass() {
 		}
 	}
 	iter.Release()
+	slog.Debug("[R5/Dreamer] Trust Bankruptcy pass", "c_level_scanned", scanned, "to_demote", len(toUpdate))
 	for _, m := range toUpdate {
 		data, err := json.Marshal(m)
 		if err != nil {
@@ -379,11 +391,13 @@ func (s *Store) trustBankruptcyPass() {
 		batch.Delete([]byte(levelKey("C", m.ID)))
 		batch.Put([]byte(levelKey("K", m.ID)), nil)
 		if err := s.db.Write(batch, nil); err != nil {
-			log.Printf("[R5/Dreamer] ERROR: trust bankruptcy update id=%s: %v", m.ID, err)
+			slog.Error("[R5/Dreamer] trust bankruptcy update failed", "id", m.ID, "error", err)
 		} else {
-			log.Printf("[R5/Dreamer] Trust Bankruptcy: demoted C→K id=%s (M_dec < 0.0)", m.ID)
+			demoted++
+			slog.Info("[R5/Dreamer] Trust Bankruptcy: demoted C→K", "id", m.ID, "reason", "M_dec < 0.0")
 		}
 	}
+	return
 }
 
 // deleteMegram removes all keys associated with a Megram from LevelDB.

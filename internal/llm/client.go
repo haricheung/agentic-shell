@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -146,8 +146,8 @@ func (c *Client) Validate() error {
 
 // Chat sends a system + user prompt and returns the assistant's text response and token usage.
 func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, error) {
-	log.Printf("[%s] ── SYSTEM PROMPT ──────────────────────────────\n%s\n── END SYSTEM ──────────────────────────────────", c.label, system)
-	log.Printf("[%s] ── USER PROMPT ─────────────────────────────────\n%s\n── END USER ────────────────────────────────────", c.label, user)
+	slog.Debug("[LLM] system prompt", "role", c.label, "prompt", system)
+	slog.Debug("[LLM] user prompt", "role", c.label, "prompt", user)
 
 	payload := chatRequest{
 		Model: c.model,
@@ -203,8 +203,7 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, Usage, 
 
 	content := chatResp.Choices[0].Message.Content
 	chatResp.Usage.ElapsedMs = elapsedMs
-	log.Printf("[%s] ── RESPONSE (tokens: prompt=%d completion=%d elapsed=%dms) ──\n%s\n── END RESPONSE ────────────────────────────────",
-		c.label, chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens, elapsedMs, content)
+	slog.Debug("[LLM] response", "role", c.label, "prompt_tokens", chatResp.Usage.PromptTokens, "completion_tokens", chatResp.Usage.CompletionTokens, "elapsed_ms", elapsedMs, "response", content)
 	return content, chatResp.Usage, nil
 }
 

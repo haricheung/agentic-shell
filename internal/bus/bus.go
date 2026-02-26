@@ -1,7 +1,7 @@
 package bus
 
 import (
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/haricheung/agentic-shell/internal/types"
@@ -38,7 +38,7 @@ func (b *Bus) Publish(msg types.Message) {
 		select {
 		case ch <- msg:
 		default:
-			log.Printf("[BUS] WARNING: subscriber channel full for type=%s from=%s — message dropped", msg.Type, msg.From)
+			slog.Warn("[BUS] subscriber channel full, message dropped", "type", msg.Type, "from", msg.From)
 		}
 	}
 
@@ -50,7 +50,7 @@ func (b *Bus) Publish(msg types.Message) {
 		select {
 		case tap <- msg:
 		default:
-			log.Printf("[BUS] WARNING: tap channel full — message dropped type=%s", msg.Type)
+			slog.Warn("[BUS] tap channel full, message dropped", "type", msg.Type)
 		}
 	}
 }

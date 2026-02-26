@@ -17,7 +17,7 @@ package tasklog
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -181,13 +181,13 @@ func (r *Registry) Open(taskID, intent string) *TaskLog {
 	}
 
 	if err := os.MkdirAll(r.dir, 0o755); err != nil {
-		log.Printf("[TASKLOG] could not create dir %s: %v", r.dir, err)
+		slog.Error("[TASKLOG] could not create dir", "dir", r.dir, "error", err)
 		return nil
 	}
 	path := filepath.Join(r.dir, taskID+".jsonl")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		log.Printf("[TASKLOG] could not open %s: %v", path, err)
+		slog.Error("[TASKLOG] could not open log file", "path", path, "error", err)
 		return nil
 	}
 
@@ -477,7 +477,7 @@ func (tl *TaskLog) write(e Event) {
 	e.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
 	data, err := json.Marshal(e)
 	if err != nil {
-		log.Printf("[TASKLOG] marshal error: %v", err)
+		slog.Error("[TASKLOG] marshal event", "error", err)
 		return
 	}
 	tl.mu.Lock()
@@ -486,6 +486,6 @@ func (tl *TaskLog) write(e Event) {
 		return
 	}
 	if _, err = fmt.Fprintf(tl.f, "%s\n", data); err != nil {
-		log.Printf("[TASKLOG] write error: %v", err)
+		slog.Error("[TASKLOG] write event", "error", err)
 	}
 }

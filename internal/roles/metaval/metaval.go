@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -97,7 +97,7 @@ func (m *MetaValidator) Run(ctx context.Context) {
 			}
 			manifest, err := toDispatchManifest(msg.Payload)
 			if err != nil {
-				log.Printf("[R4b] ERROR: bad DispatchManifest: %v", err)
+				slog.Error("[R4b] bad DispatchManifest", "error", err)
 				continue
 			}
 
@@ -117,7 +117,7 @@ func (m *MetaValidator) Run(ctx context.Context) {
 				m.taskStart[manifest.TaskID] = time.Now().UTC()
 			}
 			m.mu.Unlock()
-			log.Printf("[R4b] tracking task=%s expecting %d outcomes", manifest.TaskID, len(manifest.SubTaskIDs))
+			slog.Debug("[R4b] tracking task", "task", manifest.TaskID, "expecting", len(manifest.SubTaskIDs))
 
 		case msg, ok := <-outcomeCh:
 			if !ok {
@@ -125,7 +125,7 @@ func (m *MetaValidator) Run(ctx context.Context) {
 			}
 			outcome, err := toSubTaskOutcome(msg.Payload)
 			if err != nil {
-				log.Printf("[R4b] ERROR: bad SubTaskOutcome: %v", err)
+				slog.Error("[R4b] bad SubTaskOutcome", "error", err)
 				continue
 			}
 
@@ -133,15 +133,14 @@ func (m *MetaValidator) Run(ctx context.Context) {
 			tracker, found := m.trackers[outcome.ParentTaskID]
 			if !found {
 				m.mu.Unlock()
-				log.Printf("[R4b] WARNING: outcome for unknown task %s", outcome.ParentTaskID)
+				slog.Warn("[R4b] outcome for unknown task", "task", outcome.ParentTaskID)
 				continue
 			}
 			tracker.outcomes = append(tracker.outcomes, outcome)
 			complete := len(tracker.outcomes) >= tracker.expectedCount
 			m.mu.Unlock()
 
-			log.Printf("[R4b] outcome for subtask=%s status=%s (%d/%d)",
-				outcome.SubTaskID, outcome.Status, len(tracker.outcomes), tracker.expectedCount)
+			slog.Debug("[R4b] outcome received", "subtask", outcome.SubTaskID, "status", outcome.Status, "received", len(tracker.outcomes), "expected", tracker.expectedCount)
 
 			if complete {
 				go m.evaluate(ctx, tracker)
@@ -164,18 +163,17 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 	}
 
 	// Log the full criteria set R4b is evaluating against so it's auditable.
-	log.Printf("[R4b] task=%s evaluating %d outcomes (failed=%d)",
-		taskID, len(tracker.outcomes), len(failedIDs))
+	slog.Info("[R4b] evaluating outcomes", "task", taskID, "total", len(tracker.outcomes), "failed", len(failedIDs))
 	for _, o := range tracker.outcomes {
 		criteriaJSON, _ := json.Marshal(o.SuccessCriteria)
-		log.Printf("[R4b]   subtask=%s status=%s criteria=%s", o.SubTaskID, o.Status, criteriaJSON)
+		slog.Debug("[R4b] subtask outcome detail", "subtask", o.SubTaskID, "status", o.Status, "criteria", string(criteriaJSON))
 	}
 
 	// Hard gate (code-enforced, not LLM-dependent): any failed subtask forces
 	// replan immediately. The LLM is only called when ALL subtasks matched so
 	// it cannot override a failed status by reasoning about "overall goal".
 	if len(failedIDs) > 0 {
-		log.Printf("[R4b] task=%s hard-gate REPLAN: %d failed subtask(s): %v", taskID, len(failedIDs), failedIDs)
+		slog.Info("[R4b] hard-gate replan", "task", taskID, "failed_count", len(failedIDs), "failed_ids", failedIDs)
 		// Build gap summary with actual failure reasons so GGS and memory get
 		// actionable text, not just subtask IDs.
 		var gapParts []string
@@ -207,7 +205,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 	tl := m.logReg.Get(taskID)
 	tl.LLMCall("metaval", systemPrompt, userPrompt, raw, usage.PromptTokens, usage.CompletionTokens, usage.ElapsedMs, 0)
 	if err != nil {
-		log.Printf("[R4b] ERROR: LLM call failed: %v", err)
+		slog.Error("[R4b] LLM call failed", "error", err)
 		return
 	}
 	raw = extractJSON(llm.StripFences(raw))
@@ -221,7 +219,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 		Recommendation string   `json:"recommendation"`
 	}
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
-		log.Printf("[R4b] ERROR: parse verdict: %v (raw: %s)", err, raw)
+		slog.Error("[R4b] parse verdict failed", "error", err, "raw", raw)
 		m.triggerReplan(ctx, tracker, nil, totalCorrections,
 			"metaval verdict parse error: "+err.Error())
 		return
@@ -229,7 +227,7 @@ func (m *MetaValidator) evaluate(ctx context.Context, tracker *manifestTracker) 
 
 	switch v.Verdict {
 	case "accept":
-		log.Printf("[R4b] task=%s ACCEPTED — forwarding to R7 (GGS) for final loss record and delivery", taskID)
+		slog.Info("[R4b] task ACCEPTED, forwarding to GGS", "task", taskID)
 		// Snapshot cost metrics BEFORE Close() removes the log from the registry.
 		tl := m.logReg.Get(taskID)
 		_ = tl.Stats() // snapshot for future use; GGS handles memory writes
@@ -371,7 +369,7 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 	// GGS should have issued abandon before this point via Ω ≥ 0.8, but this
 	// prevents infinite looping if GGS is slow or unavailable.
 	if replanCount >= maxReplans {
-		log.Printf("[R4b] task=%s ABANDONED (safety net) after %d replan rounds", taskID, replanCount)
+		slog.Info("[R4b] task ABANDONED (safety net)", "task", taskID, "replan_rounds", replanCount)
 		m.logReg.Close(taskID, "abandoned")
 		// Build a human-readable reason from the last failure outcomes so the
 		// user sees WHY it failed, not just which subtask ID.
@@ -430,8 +428,7 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 		Outcomes:        outcomes,
 		Recommendation:  "replan",
 	}
-	log.Printf("[R4b] task=%s sending ReplanRequest to R7 (GGS) round=%d gap=%q elapsed=%dms",
-		taskID, replanCount, gapSummary, elapsedMs)
+	slog.Info("[R4b] sending ReplanRequest to GGS", "task", taskID, "round", replanCount, "gap", gapSummary, "elapsed_ms", elapsedMs)
 	m.b.Publish(types.Message{
 		ID:        uuid.New().String(),
 		Timestamp: time.Now().UTC(),

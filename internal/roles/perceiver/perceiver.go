@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -117,7 +117,7 @@ func (p *Perceiver) publish(spec types.TaskSpec) (string, error) {
 		Type:      types.MsgTaskSpec,
 		Payload:   spec,
 	})
-	log.Printf("[R1] published TaskSpec task_id=%s", spec.TaskID)
+	slog.Info("[R1] published TaskSpec", "task_id", spec.TaskID)
 	return spec.TaskID, nil
 }
 
