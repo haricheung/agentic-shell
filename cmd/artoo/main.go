@@ -157,6 +157,18 @@ func main() {
 
 	// REPL or one-shot
 	if len(os.Args) > 1 && os.Args[1] != "" {
+		// Meta commands intercepted before the pipeline so they work in one-shot mode too.
+		input := strings.Join(os.Args[1:], " ")
+		switch strings.TrimSpace(input) {
+		case "/memory":
+			printMemorySummary(mem.Summary())
+			cancel()
+			return
+		case "/audit":
+			// Audit report requires the auditor goroutine to be running — use REPL path.
+			// Fall through to one-shot below (auditor is already started above).
+		}
+
 		// One-shot mode: Ctrl+C cancels the whole task and exits.
 		intrCh := make(chan os.Signal, 1)
 		signal.Notify(intrCh, os.Interrupt)
@@ -167,8 +179,6 @@ func main() {
 			case <-ctx.Done():
 			}
 		}()
-
-		input := strings.Join(os.Args[1:], " ")
 		if err := runTask(ctx, b, toolClient, input, resultCh, logReg); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			cancel()
