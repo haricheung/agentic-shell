@@ -350,14 +350,40 @@ type MemoryService interface {
 	Close()
 }
 
+// MegRamRecord carries the fields of a single Megram plus its live decay contribution.
+type MegRamRecord struct {
+	ID        string  `json:"id"`
+	State     string  `json:"state"`
+	Sigma     float64 `json:"sigma"`
+	F         float64 `json:"f"`
+	K         float64 `json:"k"`
+	CreatedAt string  `json:"created_at"`
+	Attention float64 `json:"attention"` // |f|·exp(−k·Δt) for this entry
+	Decision  float64 `json:"decision"`  // σ·f·exp(−k·Δt) for this entry
+}
+
+// MegRamGroup groups all Megrams sharing the same (level, space, entity) tag pair,
+// with pre-computed aggregate dual-channel potentials.
+type MegRamGroup struct {
+	Level     string         `json:"level"`
+	Space     string         `json:"space"`
+	Entity    string         `json:"entity"`
+	Megrams   []MegRamRecord `json:"megrams"`
+	Attention float64        `json:"attention"` // Σ attention over all entries
+	Decision  float64        `json:"decision"`  // Σ decision over all entries
+	Action    string         `json:"action"`    // derived from aggregate potentials
+}
+
 // MemorySummary is returned by Store.Summary() for the /memory REPL command.
 //
 // Expectations:
 //   - LevelCounts contains an entry for each of "M", "K", "C", "T" (zero when empty)
 //   - CLevel contains one SOPRecord per C-level Megram currently in the store
+//   - Groups is nil when verbose=false; populated by SummaryVerbose()
 type MemorySummary struct {
 	LevelCounts map[string]int `json:"level_counts"` // "M"→N, "K"→N, "C"→N, "T"→N
 	CLevel      []SOPRecord    `json:"c_level"`       // all promoted SOPs and constraints
+	Groups      []MegRamGroup  `json:"groups,omitempty"` // populated by SummaryVerbose() only
 }
 
 // Ensure imports are used

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -604,6 +605,94 @@ func (s *Store) Summary() types.MemorySummary {
 	iter.Release()
 
 	return types.MemorySummary{LevelCounts: counts, CLevel: cLevel}
+}
+
+// SummaryVerbose returns the same counts as Summary plus a Groups slice that contains
+// every Megram in the store, grouped by (level, space, entity) with per-entry and
+// aggregate dual-channel potentials.
+//
+// Expectations:
+//   - Groups contains one entry per distinct (level, space, entity) combination
+//   - Groups are sorted: M→K→C→T, then by space, then by entity
+//   - Each MegRamRecord carries its individual attention/decision contribution
+//   - Aggregate Attention/Decision equal the sum of their entries' contributions
+//   - Action is derived from the aggregate potentials using the decision plane
+func (s *Store) SummaryVerbose() types.MemorySummary {
+	base := s.Summary()
+	now := time.Now().UTC()
+
+	groupMap := make(map[string]*types.MegRamGroup) // key: "level|space|entity"
+
+	iter := s.db.NewIterator(util.BytesPrefix([]byte(prefixMegram)), nil)
+	for iter.Next() {
+		var m types.Megram
+		if err := json.Unmarshal(iter.Value(), &m); err != nil {
+			continue
+		}
+		createdAt, err := time.Parse(time.RFC3339, m.CreatedAt)
+		if err != nil {
+			continue
+		}
+		decayOrigin := createdAt
+		if recallBytes, err := s.db.Get([]byte(prefixRecall+m.ID), nil); err == nil {
+			if recalled, err := time.Parse(time.RFC3339, string(recallBytes)); err == nil {
+				if recalled.After(decayOrigin) {
+					decayOrigin = recalled
+				}
+			}
+		}
+		deltaDays := now.Sub(decayOrigin).Hours() / 24.0
+		decay := math.Exp(-m.K * deltaDays)
+		att := math.Abs(m.F) * decay
+		dec := m.Sigma * m.F * decay
+
+		key := m.Level + "|" + m.Space + "|" + m.Entity
+		if _, ok := groupMap[key]; !ok {
+			groupMap[key] = &types.MegRamGroup{
+				Level:  m.Level,
+				Space:  m.Space,
+				Entity: m.Entity,
+			}
+		}
+		g := groupMap[key]
+		g.Megrams = append(g.Megrams, types.MegRamRecord{
+			ID:        m.ID,
+			State:     m.State,
+			Sigma:     m.Sigma,
+			F:         m.F,
+			K:         m.K,
+			CreatedAt: m.CreatedAt,
+			Attention: att,
+			Decision:  dec,
+		})
+		g.Attention += att
+		g.Decision += dec
+	}
+	iter.Release()
+
+	levelOrder := map[string]int{"M": 0, "K": 1, "C": 2, "T": 3}
+	groups := make([]types.MegRamGroup, 0, len(groupMap))
+	for _, g := range groupMap {
+		g.Action = deriveAction(g.Attention, g.Decision)
+		// Sort Megrams within each group newest-first.
+		sort.Slice(g.Megrams, func(i, j int) bool {
+			return g.Megrams[i].CreatedAt > g.Megrams[j].CreatedAt
+		})
+		groups = append(groups, *g)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		li, lj := levelOrder[groups[i].Level], levelOrder[groups[j].Level]
+		if li != lj {
+			return li < lj
+		}
+		if groups[i].Space != groups[j].Space {
+			return groups[i].Space < groups[j].Space
+		}
+		return groups[i].Entity < groups[j].Entity
+	})
+
+	base.Groups = groups
+	return base
 }
 
 // QuantizationMatrix exports the GGS state → (f, σ, k) table for use by GGS write path.

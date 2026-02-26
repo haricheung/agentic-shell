@@ -164,6 +164,10 @@ func main() {
 			printMemorySummary(mem.Summary())
 			cancel()
 			return
+		case "/memory verbose":
+			printMemorySummaryVerbose(mem.SummaryVerbose())
+			cancel()
+			return
 		case "/audit":
 			// Audit report requires the auditor goroutine to be running — use REPL path.
 			// Fall through to one-shot below (auditor is already started above).
@@ -562,6 +566,10 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			printMemorySummary(mem.Summary())
 			continue
 		}
+		if input == "/memory verbose" {
+			printMemorySummaryVerbose(mem.SummaryVerbose())
+			continue
+		}
 
 		// /audit — request an on-demand audit report directly from R6, bypassing the pipeline.
 		if input == "/audit" {
@@ -858,6 +866,96 @@ func printMemorySummary(s types.MemorySummary) {
 		}
 	}
 	fmt.Println()
+}
+
+func printMemorySummaryVerbose(s types.MemorySummary) {
+	const (
+		bold   = "\033[1m"
+		cyan   = "\033[36m"
+		green  = "\033[32m"
+		red    = "\033[31m"
+		yellow = "\033[33m"
+		dim    = "\033[2m"
+		reset  = "\033[0m"
+	)
+	total := s.LevelCounts["M"] + s.LevelCounts["K"] + s.LevelCounts["C"] + s.LevelCounts["T"]
+	fmt.Printf("\n%s%s📦 MKCT Memory — verbose%s  %s%d Megrams total%s\n",
+		bold, cyan, reset, dim, total, reset)
+
+	levelOrder := []string{"M", "K", "C", "T"}
+	levelDesc := map[string]string{
+		"M": "episodic facts",
+		"K": "task-scoped cache",
+		"C": "timeless SOPs ★",
+		"T": "system persona",
+	}
+
+	for _, lvl := range levelOrder {
+		// Collect groups for this level.
+		var lvlGroups []types.MegRamGroup
+		for _, g := range s.Groups {
+			if g.Level == lvl {
+				lvlGroups = append(lvlGroups, g)
+			}
+		}
+		count := s.LevelCounts[lvl]
+		marker := dim
+		if count > 0 {
+			marker = reset
+		}
+		fmt.Printf("\n%s── %s%s  %s%s%s  %s(%d entries)%s\n",
+			bold, lvl, reset,
+			marker, levelDesc[lvl], reset,
+			dim, count, reset)
+
+		if len(lvlGroups) == 0 {
+			fmt.Printf("   %s(empty)%s\n", dim, reset)
+			continue
+		}
+
+		for _, g := range lvlGroups {
+			actionCol := dim
+			switch g.Action {
+			case "Exploit":
+				actionCol = green
+			case "Avoid":
+				actionCol = red
+			case "Caution":
+				actionCol = yellow
+			}
+			fmt.Printf("  %s[%s / %s]%s  att=%.2f  dec=%+.2f  %s→ %s%s\n",
+				bold, g.Space, g.Entity, reset,
+				g.Attention, g.Decision,
+				actionCol, g.Action, reset)
+
+			for _, r := range g.Megrams {
+				age := relativeTime(r.CreatedAt)
+				fmt.Printf("    %-18s  σ=%+.1f  f=%.2f  k=%.2f  att=%.2f  dec=%+.2f  %s%s%s\n",
+					r.State, r.Sigma, r.F, r.K, r.Attention, r.Decision,
+					dim, age, reset)
+			}
+		}
+	}
+	fmt.Println()
+}
+
+// relativeTime formats an RFC3339 timestamp as a human-readable age string.
+func relativeTime(ts string) string {
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return ts
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
 }
 
 func printAuditReport(rep types.AuditReport) {

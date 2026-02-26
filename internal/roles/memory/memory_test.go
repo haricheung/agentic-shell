@@ -955,3 +955,87 @@ func TestSummary_NonCLevelNotInCLevelSlice(t *testing.T) {
 		t.Errorf("expected 0 CLevel entries when no C-level Megrams, got %d", len(got.CLevel))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// SummaryVerbose tests
+// ---------------------------------------------------------------------------
+
+func TestSummaryVerbose_EmptyStoreReturnsNoGroups(t *testing.T) {
+	// Groups is empty when store has no Megrams
+	s := newTestStore(t)
+	defer s.db.Close()
+	got := s.SummaryVerbose()
+	if len(got.Groups) != 0 {
+		t.Errorf("expected 0 groups on empty store, got %d", len(got.Groups))
+	}
+}
+
+func TestSummaryVerbose_GroupsByLevelSpaceEntity(t *testing.T) {
+	// Megrams sharing the same (level, space, entity) are grouped together
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "intent:foo", Entity: "env:local", F: 0.9, Sigma: 1.0, K: 0.05, CreatedAt: now})
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "intent:foo", Entity: "env:local", F: 0.9, Sigma: 1.0, K: 0.05, CreatedAt: now})
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "intent:bar", Entity: "env:local", F: 0.8, Sigma: 1.0, K: 0.05, CreatedAt: now})
+
+	got := s.SummaryVerbose()
+	if len(got.Groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(got.Groups))
+	}
+	// Both groups should be M-level.
+	for _, g := range got.Groups {
+		if g.Level != "M" {
+			t.Errorf("expected Level=M, got %q", g.Level)
+		}
+	}
+}
+
+func TestSummaryVerbose_AggregatesAttentionDecision(t *testing.T) {
+	// Group Attention/Decision equal the sum of individual entry contributions (fresh entries, Δt≈0)
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "sp", Entity: "en", F: 0.9, Sigma: 1.0, K: 0.05, CreatedAt: now})
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "sp", Entity: "en", F: 0.8, Sigma: 1.0, K: 0.05, CreatedAt: now})
+
+	got := s.SummaryVerbose()
+	if len(got.Groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(got.Groups))
+	}
+	g := got.Groups[0]
+	if len(g.Megrams) != 2 {
+		t.Fatalf("expected 2 megrams in group, got %d", len(g.Megrams))
+	}
+	sumAtt := g.Megrams[0].Attention + g.Megrams[1].Attention
+	if math.Abs(g.Attention-sumAtt) > 1e-9 {
+		t.Errorf("group Attention %.6f != sum of entries %.6f", g.Attention, sumAtt)
+	}
+}
+
+func TestSummaryVerbose_SortedByLevelThenSpace(t *testing.T) {
+	// Groups are sorted M before K, then alphabetically by space within each level
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "K", Space: "z_space", Entity: "e", F: 0.3, Sigma: 0, K: 0.2, CreatedAt: now})
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "b_space", Entity: "e", F: 0.9, Sigma: 1.0, K: 0.05, CreatedAt: now})
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "a_space", Entity: "e", F: 0.9, Sigma: 1.0, K: 0.05, CreatedAt: now})
+
+	got := s.SummaryVerbose()
+	if len(got.Groups) != 3 {
+		t.Fatalf("expected 3 groups, got %d", len(got.Groups))
+	}
+	if got.Groups[0].Level != "M" || got.Groups[0].Space != "a_space" {
+		t.Errorf("expected first group M/a_space, got %s/%s", got.Groups[0].Level, got.Groups[0].Space)
+	}
+	if got.Groups[1].Level != "M" || got.Groups[1].Space != "b_space" {
+		t.Errorf("expected second group M/b_space, got %s/%s", got.Groups[1].Level, got.Groups[1].Space)
+	}
+	if got.Groups[2].Level != "K" {
+		t.Errorf("expected third group K-level, got %s", got.Groups[2].Level)
+	}
+}
