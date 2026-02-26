@@ -13,12 +13,28 @@ import (
 )
 
 const (
-	searchMaxResults = 5
-	bingSearchURL    = "https://api.bing.microsoft.com/v7.0/search"
-	bingAPIKeyEnv    = "BING_API_KEY"
+	searchMaxResults  = 5
+	bingSearchURL     = "https://api.bing.microsoft.com/v7.0/search"
+	bingAPIKeyEnv     = "BING_API_KEY"
+	redditSearchURL   = "https://www.reddit.com/search.json"
+	redditMaxResults  = 5
 )
 
-var searchClient = &http.Client{Timeout: 15 * time.Second}
+var searchClient = &http.Client{
+	Timeout: 15 * time.Second,
+	// Reddit requires a real User-Agent or it returns 429.
+	Transport: &userAgentTransport{ua: "artoo-agent/1.0 (agentic-shell)"},
+}
+
+type userAgentTransport struct {
+	ua string
+}
+
+func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	r.Header.Set("User-Agent", t.ua)
+	return http.DefaultTransport.RoundTrip(r)
+}
 
 // SearchAvailable reports whether the Bing search tool is usable.
 //
@@ -104,6 +120,134 @@ func parseBingResults(data []byte) ([]searchPage, error) {
 	}
 	return pages, nil
 }
+
+// ---------------------------------------------------------------------------
+// Reddit Search (public JSON API — no key required)
+// ---------------------------------------------------------------------------
+
+type redditPost struct {
+	Subreddit string
+	Title     string
+	Score     int
+	URL       string // external link or reddit thread URL
+	Permalink string // always the reddit thread URL
+	Body      string // selftext for text posts; empty for link posts
+}
+
+type redditResponse struct {
+	Data struct {
+		Children []struct {
+			Data struct {
+				Subreddit string  `json:"subreddit"`
+				Title     string  `json:"title"`
+				Score     int     `json:"score"`
+				URL       string  `json:"url"`
+				Permalink string  `json:"permalink"`
+				Selftext  string  `json:"selftext"`
+			} `json:"data"`
+		} `json:"children"`
+	} `json:"data"`
+}
+
+// RedditSearch queries Reddit's public search API and returns formatted posts.
+//
+// Expectations:
+//   - Returns formatted posts when Reddit responds with results
+//   - Returns a "no results" message when no posts are found
+//   - Returns error when the HTTP request fails or returns non-200
+//   - Caps output at redditMaxResults posts
+func RedditSearch(ctx context.Context, query string) (string, error) {
+	reqURL := redditSearchURL + "?q=" + url.QueryEscape(query) + "&limit=10&sort=relevance&type=link"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("reddit: create request: %w", err)
+	}
+
+	resp, err := searchClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("reddit: http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reddit: read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("reddit: HTTP %d", resp.StatusCode)
+	}
+
+	posts, err := parseRedditResults(body)
+	if err != nil {
+		return "", fmt.Errorf("reddit: parse response: %w", err)
+	}
+	return formatRedditResults(query, posts), nil
+}
+
+// parseRedditResults extracts posts from a Reddit search JSON response.
+//
+// Expectations:
+//   - Returns empty slice when data.children is absent or empty
+//   - Returns error on malformed JSON
+//   - Maps subreddit, title, score, url, permalink, selftext for each post
+func parseRedditResults(data []byte) ([]redditPost, error) {
+	var rr redditResponse
+	if err := json.Unmarshal(data, &rr); err != nil {
+		return nil, err
+	}
+	posts := make([]redditPost, 0, len(rr.Data.Children))
+	for _, c := range rr.Data.Children {
+		d := c.Data
+		posts = append(posts, redditPost{
+			Subreddit: d.Subreddit,
+			Title:     d.Title,
+			Score:     d.Score,
+			URL:       d.URL,
+			Permalink: "https://www.reddit.com" + d.Permalink,
+			Body:      d.Selftext,
+		})
+	}
+	return posts, nil
+}
+
+// formatRedditResults converts a list of Reddit posts into a readable text block.
+//
+// Expectations:
+//   - Returns "no results" message when posts slice is empty
+//   - Includes subreddit, title, score, body preview, and permalink for each post
+//   - Omits body line when body is empty (link posts)
+//   - Separates posts with a blank line
+//   - Caps output at redditMaxResults posts
+//   - Truncates body preview to 200 characters
+func formatRedditResults(query string, posts []redditPost) string {
+	if len(posts) == 0 {
+		return fmt.Sprintf("No Reddit results found for: %q", query)
+	}
+	var sb strings.Builder
+	for i, p := range posts {
+		if i >= redditMaxResults {
+			break
+		}
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(fmt.Sprintf("r/%s • score: %d\n", p.Subreddit, p.Score))
+		sb.WriteString(p.Title + "\n")
+		if p.Body != "" {
+			preview := p.Body
+			if len(preview) > 200 {
+				preview = preview[:200] + "…"
+			}
+			sb.WriteString(preview + "\n")
+		}
+		sb.WriteString(p.Permalink + "\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Shared formatting helper
+// ---------------------------------------------------------------------------
 
 // formatSearchResult converts a list of search pages into a readable text block.
 //

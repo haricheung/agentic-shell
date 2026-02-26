@@ -39,9 +39,13 @@ Tool selection — use the FIRST tool that fits; do not skip down the list:
    NEVER use "find" to locate personal files — use mdfind (tool #1) instead.
    Never include ~/Music/Music or ~/Library in shell paths.`
 
-const systemPromptTail = `
-8. search — web search (DuckDuckGo). Input: {"action":"tool","tool":"search","query":"..."}
+// searchToolEntry and redditToolEntry are included in the system prompt only when
+// the respective tool is available (Bing requires BING_API_KEY; Reddit is always on).
+const searchToolEntry = `8. search — Bing web search. Input: {"action":"tool","tool":"search","query":"..."}`
+const redditToolEntry = `9. reddit_search — search Reddit posts and community discussions.
+   Input: {"action":"tool","tool":"reddit_search","query":"..."}`
 
+const systemPromptExec = `
 Execution rules:
 - Read intent, success_criteria, and context before acting. Context may contain prior-step outputs — use them directly.
 - One tool call per response; wait for the REAL tool result before proceeding.
@@ -61,7 +65,14 @@ To report the final result:
 {"action":"result","subtask_id":"...","status":"completed|uncertain|failed","output":"<result text>","uncertainty":null,"tool_calls":["<tool: input → output summary>",...]}`
 
 func buildSystemPrompt() string {
-	return systemPromptBase + "\n" + systemPromptTail
+	var b strings.Builder
+	b.WriteString(systemPromptBase)
+	if tools.SearchAvailable() {
+		b.WriteString("\n" + searchToolEntry)
+	}
+	b.WriteString("\n" + redditToolEntry)
+	b.WriteString(systemPromptExec)
+	return b.String()
 }
 
 const correctionPrompt = `You are R3 — Executor. A correction has been received from R4a. Re-execute the subtask using a DIFFERENT approach.
@@ -301,6 +312,8 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 			slog.Info("[R3] tool call", "iter", i+1, "tool", "shortcuts", "name", tc.Name)
 		case "search":
 			slog.Info("[R3] tool call", "iter", i+1, "tool", "search", "query", tc.Query)
+		case "reddit_search":
+			slog.Info("[R3] tool call", "iter", i+1, "tool", "reddit_search", "query", tc.Query)
 		default:
 			slog.Info("[R3] tool call", "iter", i+1, "tool", tc.Tool)
 		}
@@ -570,6 +583,8 @@ func (e *Executor) runTool(ctx context.Context, tc toolCall) (string, error) {
 		return "ok", tools.WriteFile(writePath, tc.Content)
 	case "search":
 		return tools.Search(ctx, tc.Query)
+	case "reddit_search":
+		return tools.RedditSearch(ctx, tc.Query)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", tc.Tool)
 	}
