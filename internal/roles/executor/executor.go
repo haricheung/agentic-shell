@@ -39,8 +39,9 @@ Tool selection — use the FIRST tool that fits; do not skip down the list:
    NEVER use "find" to locate personal files — use mdfind (tool #1) instead.
    Never include ~/Music/Music or ~/Library in shell paths.`
 
-// searchToolEntry is included in the system prompt only when LANGSEARCH_API_KEY is set.
-const searchToolEntry = `8. search — web search. Input: {"action":"tool","tool":"search","query":"..."}`
+// searchToolEntry is always included — DuckDuckGo requires no API key.
+// Bing is used automatically when BING_API_KEY is set.
+const searchToolEntry = `8. search — web search (DuckDuckGo by default; Bing when BING_API_KEY is set). Input: {"action":"tool","tool":"search","query":"..."}`
 
 const systemPromptExec = `
 Execution rules:
