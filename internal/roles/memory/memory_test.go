@@ -867,3 +867,91 @@ func TestTrustBankruptcyPass_DemotesCLevel(t *testing.T) {
 		t.Errorf("expected k=0.05 after trust bankruptcy, got %.3f", m.K)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Summary tests
+// ---------------------------------------------------------------------------
+
+func TestSummary_EmptyStoreReturnsZeroCounts(t *testing.T) {
+	// LevelCounts contains entries for all four levels with zero values when store is empty
+	s := newTestStore(t)
+	defer s.db.Close()
+	got := s.Summary()
+	for _, lvl := range []string{"M", "K", "C", "T"} {
+		if got.LevelCounts[lvl] != 0 {
+			t.Errorf("expected LevelCounts[%s]=0 on empty store, got %d", lvl, got.LevelCounts[lvl])
+		}
+	}
+	if len(got.CLevel) != 0 {
+		t.Errorf("expected empty CLevel on empty store, got %d entries", len(got.CLevel))
+	}
+}
+
+func TestSummary_CountsMatchPersisted(t *testing.T) {
+	// LevelCounts reflects Megrams actually persisted to LevelDB
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "a", Entity: "b", CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "a", Entity: "b", CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "K", Space: "c", Entity: "d", CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+
+	got := s.Summary()
+	if got.LevelCounts["M"] != 2 {
+		t.Errorf("expected M=2, got %d", got.LevelCounts["M"])
+	}
+	if got.LevelCounts["K"] != 1 {
+		t.Errorf("expected K=1, got %d", got.LevelCounts["K"])
+	}
+	if got.LevelCounts["C"] != 0 {
+		t.Errorf("expected C=0, got %d", got.LevelCounts["C"])
+	}
+}
+
+func TestSummary_CLevelPopulatesSOPRecords(t *testing.T) {
+	// CLevel contains one SOPRecord per C-level Megram with correct fields
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	s.persistMegram(types.Megram{
+		ID: uuid.New().String(), Level: "C",
+		Space: "intent:db_task", Entity: "env:local",
+		Content: "Always backup first", Sigma: +1.0,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+
+	got := s.Summary()
+	if got.LevelCounts["C"] != 1 {
+		t.Fatalf("expected C=1, got %d", got.LevelCounts["C"])
+	}
+	if len(got.CLevel) != 1 {
+		t.Fatalf("expected 1 CLevel entry, got %d", len(got.CLevel))
+	}
+	rec := got.CLevel[0]
+	if rec.Space != "intent:db_task" {
+		t.Errorf("expected Space 'intent:db_task', got %q", rec.Space)
+	}
+	if rec.Entity != "env:local" {
+		t.Errorf("expected Entity 'env:local', got %q", rec.Entity)
+	}
+	if rec.Content != "Always backup first" {
+		t.Errorf("expected Content 'Always backup first', got %q", rec.Content)
+	}
+	if rec.Sigma != +1.0 {
+		t.Errorf("expected Sigma=+1.0, got %.1f", rec.Sigma)
+	}
+}
+
+func TestSummary_NonCLevelNotInCLevelSlice(t *testing.T) {
+	// CLevel slice contains only C-level Megrams, not M or K
+	s := newTestStore(t)
+	defer s.db.Close()
+
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "M", Space: "x", Entity: "y", CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+	s.persistMegram(types.Megram{ID: uuid.New().String(), Level: "K", Space: "x", Entity: "y", CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+
+	got := s.Summary()
+	if len(got.CLevel) != 0 {
+		t.Errorf("expected 0 CLevel entries when no C-level Megrams, got %d", len(got.CLevel))
+	}
+}

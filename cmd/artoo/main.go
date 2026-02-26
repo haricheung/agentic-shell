@@ -181,7 +181,7 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	} else {
 		// REPL mode
-		runREPL(ctx, b, toolClient, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh, logReg)
+		runREPL(ctx, b, toolClient, resultCh, auditReportCh, cancel, cacheDir, disp, abortTaskCh, logReg, mem)
 	}
 }
 
@@ -431,7 +431,7 @@ type sessionEntry struct {
 	Summary string
 }
 
-func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string, logReg *tasklog.Registry) {
+func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string, logReg *tasklog.Registry, mem *memory.Store) {
 	fmt.Println("\033[1m\033[36m⚡ artoo\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.artoo/debug.log)\033[0m")
 
 	rl, err := readline.NewEx(&readline.Config{
@@ -545,6 +545,12 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 				continue
 			}
 			input = strings.Join(lines, "\n")
+		}
+
+		// /memory — print a live summary of the MKCT pyramid without touching the pipeline.
+		if input == "/memory" {
+			printMemorySummary(mem.Summary())
+			continue
 		}
 
 		// /audit — request an on-demand audit report directly from R6, bypassing the pipeline.
@@ -791,6 +797,59 @@ func printCostStats(perceiverUsage llm.Usage, stats *tasklog.TaskStats) {
 	fmt.Println()
 }
 
+func printMemorySummary(s types.MemorySummary) {
+	const (
+		bold  = "\033[1m"
+		cyan  = "\033[36m"
+		green = "\033[32m"
+		red   = "\033[31m"
+		dim   = "\033[2m"
+		reset = "\033[0m"
+	)
+	total := s.LevelCounts["M"] + s.LevelCounts["K"] + s.LevelCounts["C"] + s.LevelCounts["T"]
+	fmt.Printf("\n%s%s📦 MKCT Memory Summary%s  %s%d Megrams total%s\n",
+		bold, cyan, reset, dim, total, reset)
+
+	type row struct{ lvl, desc string }
+	rows := []row{
+		{"M", "episodic facts       (short half-life, raw events)"},
+		{"K", "task-scoped cache    (pruned by Dreamer GC)"},
+		{"C", "timeless SOPs ★      (promoted patterns, k=0.0)"},
+		{"T", "system persona       (hardcoded in system prompt)"},
+	}
+	for _, r := range rows {
+		n := s.LevelCounts[r.lvl]
+		marker := dim
+		if n > 0 {
+			marker = reset
+		}
+		fmt.Printf("  %s%-2s%s  %s%-5d%s  %s%s%s\n",
+			bold, r.lvl, reset,
+			marker, n, reset,
+			dim, r.desc, reset)
+	}
+
+	if len(s.CLevel) == 0 {
+		fmt.Printf("\n  %sNo C-level entries yet — Dreamer consolidation pending.%s\n", dim, reset)
+	} else {
+		fmt.Printf("\n  %sC-level entries (promoted knowledge):%s\n", bold, reset)
+		for _, rec := range s.CLevel {
+			sigStr := fmt.Sprintf("%+.1f", rec.Sigma)
+			col := green
+			if rec.Sigma < 0 {
+				col = red
+			}
+			content := rec.Content
+			if len(content) > 80 {
+				content = content[:80] + "…"
+			}
+			fmt.Printf("  %s%s%s  [%s / %s]\n      %s\n",
+				col, sigStr, reset, rec.Space, rec.Entity, content)
+		}
+	}
+	fmt.Println()
+}
+
 func printAuditReport(rep types.AuditReport) {
 	const (
 		bold   = "\033[1m"
@@ -819,7 +878,21 @@ func printAuditReport(rep types.AuditReport) {
 			fmt.Printf("    • %s\n", d)
 		}
 	}
-	if len(rep.BoundaryViolations) == 0 && len(rep.DriftAlerts) == 0 {
+	th := rep.ToolHealth
+	if th.ExecutionFailures > 0 || th.EnvironmentalRetries > 0 || th.LogicalRetries > 0 {
+		fmt.Printf("  %sTool health:%s\n", yellow, reset)
+		if th.ExecutionFailures > 0 {
+			fmt.Printf("    • Execution failures:    %d\n", th.ExecutionFailures)
+		}
+		if th.EnvironmentalRetries > 0 {
+			fmt.Printf("    • Environmental retries: %d  (tool/infra errors)\n", th.EnvironmentalRetries)
+		}
+		if th.LogicalRetries > 0 {
+			fmt.Printf("    • Logical retries:       %d  (LLM format/reasoning)\n", th.LogicalRetries)
+		}
+	}
+	if len(rep.BoundaryViolations) == 0 && len(rep.DriftAlerts) == 0 &&
+		th.ExecutionFailures == 0 && th.EnvironmentalRetries == 0 && th.LogicalRetries == 0 {
 		fmt.Printf("  %sNo anomalies detected.%s\n", dim, reset)
 	}
 	fmt.Println()

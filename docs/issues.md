@@ -2424,3 +2424,31 @@ system prompt prohibiting third-party CLI tools.
 > Do NOT suggest third-party CLI tools (cloc, tokei, jq, ripgrep, fd, bat, etc.) —
 > use only standard Unix commands (find, wc, grep, awk, sed, sort, du) or the
 > executor's built-in tools (mdfind, glob, shell, search).
+
+## Issue #87 — R6 Auditor blind to tool-level failure rates and LLM correction classes
+
+**Symptom**
+Log analysis revealed: `search` tool 25% error rate (connection resets), `shell` 12.9% error rate, 70/269 executor LLM calls producing invalid JSON. None of these were surfaced in audit reports — the operator had to grep debug logs to find them.
+
+**Root cause**
+The Auditor tracked only message-routing violations, gradient convergence (∇L), and GGS thrashing. It had no visibility into `ExecutionResult.Status == "failed"` (subtask-level failures) or `CorrectionSignal.FailureClass` (which distinguishes environmental tool errors from logical LLM errors).
+
+**Fix**
+- `types.go`: added `ToolHealth{ExecutionFailures, EnvironmentalRetries, LogicalRetries}` struct; added `ToolHealth` field to `AuditReport`
+- `auditor.go`: added tracking fields + persistence; `process()` now watches `MsgExecutionResult` (status="failed" → `executionFailures++`) and `MsgCorrectionSignal` (by `FailureClass` → `environmentalRetries` / `logicalRetries`); idle guard includes all three; `publishReport()` snapshots and resets them
+- `cmd/artoo/main.go`: `printAuditReport` shows ToolHealth section when any counter is non-zero; "No anomalies" guard updated to include ToolHealth
+- `auditor_test.go`: 4 new tests covering all new expectations
+
+## Issue #88 — No way to inspect MKCT pyramid state at runtime
+
+**Symptom**
+Operator had no user-facing way to see how many Megrams are stored per level (M/K/C/T) or read the promoted C-level SOPs/constraints without grepping LevelDB files.
+
+**Root cause**
+`MemoryService` interface only exposed `QueryC`/`QueryMK` (specific tag lookups) and `Write`. No aggregate scan existed.
+
+**Fix**
+- `types.go`: added `MemorySummary{LevelCounts map[string]int, CLevel []SOPRecord}`
+- `memory.go`: added `Store.Summary()` — scans the `l|<level>|` prefix for each level to get counts; reads full Megrams for C-level entries to populate `CLevel`
+- `cmd/artoo/main.go`: added `/memory` REPL command (calls `mem.Summary()` directly, no bus round-trip); added `printMemorySummary()` with colour-coded level table and C-level entry list
+- `memory_test.go`: 4 new tests covering empty store, count accuracy, C-level field mapping, and non-C exclusion

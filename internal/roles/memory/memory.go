@@ -567,6 +567,45 @@ func deriveAction(attention, decision float64) string {
 	return "Caution"
 }
 
+// Summary scans the LevelDB store and returns per-level Megram counts and all C-level entries.
+// Used by the /memory REPL command. Reads are synchronous; not called from hot paths.
+//
+// Expectations:
+//   - LevelCounts contains an entry for each of "M", "K", "C", "T" (zero when empty)
+//   - CLevel contains one SOPRecord per C-level Megram currently in the store
+func (s *Store) Summary() types.MemorySummary {
+	counts := map[string]int{"M": 0, "K": 0, "C": 0, "T": 0}
+	for _, lvl := range []string{"M", "K", "C", "T"} {
+		prefix := prefixLevel + lvl + "|"
+		iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
+		for iter.Next() {
+			counts[lvl]++
+		}
+		iter.Release()
+	}
+
+	var cLevel []types.SOPRecord
+	cPrefix := prefixLevel + "C|"
+	iter := s.db.NewIterator(util.BytesPrefix([]byte(cPrefix)), nil)
+	for iter.Next() {
+		id := string(iter.Key())[len(cPrefix):]
+		m, err := s.fetchMegram(id)
+		if err != nil {
+			continue
+		}
+		cLevel = append(cLevel, types.SOPRecord{
+			ID:      m.ID,
+			Space:   m.Space,
+			Entity:  m.Entity,
+			Content: m.Content,
+			Sigma:   m.Sigma,
+		})
+	}
+	iter.Release()
+
+	return types.MemorySummary{LevelCounts: counts, CLevel: cLevel}
+}
+
 // QuantizationMatrix exports the GGS state → (f, σ, k) table for use by GGS write path.
 func QuantizationMatrix() map[string]struct{ F, Sigma, K float64 } {
 	out := make(map[string]struct{ F, Sigma, K float64 }, len(quantizationMatrix))

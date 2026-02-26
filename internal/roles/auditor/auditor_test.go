@@ -99,6 +99,92 @@ func TestDetectGGSThrashing_NotFiredWhenDDecreases(t *testing.T) {
 	}
 }
 
+// ── ToolHealth tracking ───────────────────────────────────────────────────────
+
+func makeExecutionResultMsg(status string) types.Message {
+	return types.Message{
+		From: types.RoleExecutor,
+		To:   types.RoleAgentVal,
+		Type: types.MsgExecutionResult,
+		Payload: types.ExecutionResult{
+			SubTaskID: "st1",
+			Status:    status,
+		},
+	}
+}
+
+func makeCorrectionSignalMsg(failureClass string) types.Message {
+	return types.Message{
+		From: types.RoleAgentVal,
+		To:   types.RoleExecutor,
+		Type: types.MsgCorrectionSignal,
+		Payload: types.CorrectionSignal{
+			SubTaskID:    "st1",
+			AttemptNumber: 1,
+			FailureClass: failureClass,
+		},
+	}
+}
+
+func TestTracksExecutionFailures_CountsFailedResults(t *testing.T) {
+	// ExecutionResult with Status=="failed" increments executionFailures
+	a, _ := newTestAuditor()
+	a.process(makeExecutionResultMsg("failed"))
+	a.process(makeExecutionResultMsg("failed"))
+	a.mu.Lock()
+	got := a.executionFailures
+	a.mu.Unlock()
+	if got != 2 {
+		t.Errorf("expected executionFailures=2, got %d", got)
+	}
+}
+
+func TestTracksExecutionFailures_IgnoresCompletedResults(t *testing.T) {
+	// ExecutionResult with Status!="failed" does not increment executionFailures
+	a, _ := newTestAuditor()
+	a.process(makeExecutionResultMsg("completed"))
+	a.process(makeExecutionResultMsg("uncertain"))
+	a.mu.Lock()
+	got := a.executionFailures
+	a.mu.Unlock()
+	if got != 0 {
+		t.Errorf("expected executionFailures=0, got %d", got)
+	}
+}
+
+func TestTracksRetries_EnvironmentalFailureClass(t *testing.T) {
+	// CorrectionSignal with FailureClass=="environmental" increments environmentalRetries
+	a, _ := newTestAuditor()
+	a.process(makeCorrectionSignalMsg("environmental"))
+	a.process(makeCorrectionSignalMsg("environmental"))
+	a.mu.Lock()
+	env := a.environmentalRetries
+	logic := a.logicalRetries
+	a.mu.Unlock()
+	if env != 2 {
+		t.Errorf("expected environmentalRetries=2, got %d", env)
+	}
+	if logic != 0 {
+		t.Errorf("expected logicalRetries=0, got %d", logic)
+	}
+}
+
+func TestTracksRetries_LogicalFailureClass(t *testing.T) {
+	// CorrectionSignal with FailureClass=="logical" increments logicalRetries
+	a, _ := newTestAuditor()
+	a.process(makeCorrectionSignalMsg("logical"))
+	a.mu.Lock()
+	env := a.environmentalRetries
+	logic := a.logicalRetries
+	a.mu.Unlock()
+	if logic != 1 {
+		t.Errorf("expected logicalRetries=1, got %d", logic)
+	}
+	if env != 0 {
+		t.Errorf("expected environmentalRetries=0, got %d", env)
+	}
+}
+
 func TestDetectGGSThrashing_ResetOnNonBreakSymmetryDirective(t *testing.T) {
 	// break_symmetry D=0.8 → change_path → break_symmetry D=0.8 again → no thrashing (reset)
 	a, _ := newTestAuditor()

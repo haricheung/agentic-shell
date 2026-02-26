@@ -17,13 +17,16 @@ import (
 
 // persistedStats mirrors the window stats fields that survive process restarts.
 type persistedStats struct {
-	WindowStart        time.Time          `json:"window_start"`
-	TasksObserved      int                `json:"tasks_observed"`
-	TotalCorrections   int                `json:"total_corrections"`
-	GapTrends          types.GapTrendDist `json:"gap_trends"`
-	BoundaryViolations []string           `json:"boundary_violations"`
-	DriftAlerts        []string           `json:"drift_alerts"`
-	Anomalies          []string           `json:"anomalies"`
+	WindowStart         time.Time          `json:"window_start"`
+	TasksObserved       int                `json:"tasks_observed"`
+	TotalCorrections    int                `json:"total_corrections"`
+	GapTrends           types.GapTrendDist `json:"gap_trends"`
+	BoundaryViolations  []string           `json:"boundary_violations"`
+	DriftAlerts         []string           `json:"drift_alerts"`
+	Anomalies           []string           `json:"anomalies"`
+	ExecutionFailures   int                `json:"execution_failures"`
+	EnvironmentalRetries int               `json:"environmental_retries"`
+	LogicalRetries      int                `json:"logical_retries"`
 }
 
 // Auditor (R6) taps the message bus read-only for passive observation, and also
@@ -48,13 +51,16 @@ type Auditor struct {
 	lastBreakSymD map[string]float64 // D from previous break_symmetry per task_id
 
 	// window stats — reset after each report
-	windowStart        time.Time
-	tasksObserved      int
-	totalCorrections   int
-	gapTrends          types.GapTrendDist
-	boundaryViolations []string
-	driftAlerts        []string
-	anomalies          []string
+	windowStart          time.Time
+	tasksObserved        int
+	totalCorrections     int
+	gapTrends            types.GapTrendDist
+	boundaryViolations   []string
+	driftAlerts          []string
+	anomalies            []string
+	executionFailures    int
+	environmentalRetries int
+	logicalRetries       int
 }
 
 // New creates an Auditor. tap must be a dedicated bus tap (NewTap()).
@@ -95,6 +101,9 @@ func (a *Auditor) loadStats() {
 	a.boundaryViolations = ps.BoundaryViolations
 	a.driftAlerts = ps.DriftAlerts
 	a.anomalies = ps.Anomalies
+	a.executionFailures = ps.ExecutionFailures
+	a.environmentalRetries = ps.EnvironmentalRetries
+	a.logicalRetries = ps.LogicalRetries
 	slog.Info("[R6] loaded persisted stats", "tasks", ps.TasksObserved, "corrections", ps.TotalCorrections, "window_start", ps.WindowStart.Format(time.RFC3339))
 }
 
@@ -102,13 +111,16 @@ func (a *Auditor) loadStats() {
 func (a *Auditor) saveStats() {
 	a.mu.Lock()
 	ps := persistedStats{
-		WindowStart:        a.windowStart,
-		TasksObserved:      a.tasksObserved,
-		TotalCorrections:   a.totalCorrections,
-		GapTrends:          a.gapTrends,
-		BoundaryViolations: a.boundaryViolations,
-		DriftAlerts:        a.driftAlerts,
-		Anomalies:          a.anomalies,
+		WindowStart:          a.windowStart,
+		TasksObserved:        a.tasksObserved,
+		TotalCorrections:     a.totalCorrections,
+		GapTrends:            a.gapTrends,
+		BoundaryViolations:   a.boundaryViolations,
+		DriftAlerts:          a.driftAlerts,
+		Anomalies:            a.anomalies,
+		ExecutionFailures:    a.executionFailures,
+		EnvironmentalRetries: a.environmentalRetries,
+		LogicalRetries:       a.logicalRetries,
 	}
 	a.mu.Unlock()
 	data, err := json.Marshal(ps)
@@ -155,7 +167,8 @@ func (a *Auditor) Run(ctx context.Context) {
 
 		case <-tickC:
 			a.mu.Lock()
-			idle := a.tasksObserved == 0 && len(a.boundaryViolations) == 0 && len(a.driftAlerts) == 0
+			idle := a.tasksObserved == 0 && len(a.boundaryViolations) == 0 && len(a.driftAlerts) == 0 &&
+				a.executionFailures == 0 && a.environmentalRetries == 0 && a.logicalRetries == 0
 			a.mu.Unlock()
 			if idle {
 				// Nothing happened this window — reset silently, don't spam the terminal.
@@ -327,6 +340,29 @@ func (a *Auditor) process(msg types.Message) {
 		}
 	}
 
+	// 5. Track execution failures (subtasks that ended in failure regardless of retries).
+	if msg.Type == types.MsgExecutionResult {
+		if er, err := toExecutionResult(msg.Payload); err == nil && er.Status == "failed" {
+			a.mu.Lock()
+			a.executionFailures++
+			a.mu.Unlock()
+		}
+	}
+
+	// 6. Track correction failure classes — environmental = tool/infra; logical = LLM format/reasoning.
+	if msg.Type == types.MsgCorrectionSignal {
+		if cs, err := toCorrectionSignal(msg.Payload); err == nil {
+			a.mu.Lock()
+			switch cs.FailureClass {
+			case "environmental":
+				a.environmentalRetries++
+			case "logical":
+				a.logicalRetries++
+			}
+			a.mu.Unlock()
+		}
+	}
+
 	event := types.AuditEvent{
 		EventID:     uuid.New().String(),
 		Timestamp:   time.Now().UTC().Format(time.RFC3339),
@@ -341,7 +377,8 @@ func (a *Auditor) process(msg types.Message) {
 
 	// Persist stats only on messages that mutate them, not on every tap message.
 	if msg.Type == types.MsgDispatchManifest || msg.Type == types.MsgReplanRequest ||
-		msg.Type == types.MsgPlanDirective || anomaly != "none" {
+		msg.Type == types.MsgPlanDirective || msg.Type == types.MsgExecutionResult ||
+		msg.Type == types.MsgCorrectionSignal || anomaly != "none" {
 		a.saveStats()
 	}
 }
@@ -356,6 +393,11 @@ func (a *Auditor) publishReport(trigger string) {
 	drifts := append([]string(nil), a.driftAlerts...)
 	anomalies := append([]string(nil), a.anomalies...)
 	windowFrom := a.windowStart.Format(time.RFC3339)
+	toolHealth := types.ToolHealth{
+		ExecutionFailures:    a.executionFailures,
+		EnvironmentalRetries: a.environmentalRetries,
+		LogicalRetries:       a.logicalRetries,
+	}
 
 	// Reset window
 	a.windowStart = now
@@ -365,6 +407,9 @@ func (a *Auditor) publishReport(trigger string) {
 	a.boundaryViolations = nil
 	a.driftAlerts = nil
 	a.anomalies = nil
+	a.executionFailures = 0
+	a.environmentalRetries = 0
+	a.logicalRetries = 0
 	a.mu.Unlock()
 
 	// Persist zeroed window immediately so a crash after reset doesn't replay old stats.
@@ -389,6 +434,7 @@ func (a *Auditor) publishReport(trigger string) {
 		},
 		DriftAlerts: drifts,
 		Anomalies:   anomalies,
+		ToolHealth:  toolHealth,
 	}
 
 	slog.Info("[R6] publishing audit report", "trigger", trigger, "tasks", tasks, "avg_corrections", avgCorrections, "violations", len(violations), "drifts", len(drifts))
@@ -433,4 +479,22 @@ func toPlanDirective(payload any) (types.PlanDirective, error) {
 	}
 	var pd types.PlanDirective
 	return pd, json.Unmarshal(b, &pd)
+}
+
+func toExecutionResult(payload any) (types.ExecutionResult, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return types.ExecutionResult{}, err
+	}
+	var er types.ExecutionResult
+	return er, json.Unmarshal(b, &er)
+}
+
+func toCorrectionSignal(payload any) (types.CorrectionSignal, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return types.CorrectionSignal{}, err
+	}
+	var cs types.CorrectionSignal
+	return cs, json.Unmarshal(b, &cs)
 }

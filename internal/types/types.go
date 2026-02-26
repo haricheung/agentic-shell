@@ -227,6 +227,18 @@ type AuditEvent struct {
 	Detail      *string `json:"detail"`
 }
 
+// ToolHealth tracks operational failure counts for the current audit window.
+//
+// Expectations:
+//   - ExecutionFailures counts ExecutionResult messages where Status == "failed"
+//   - EnvironmentalRetries counts CorrectionSignal messages where FailureClass == "environmental"
+//   - LogicalRetries counts CorrectionSignal messages where FailureClass == "logical"
+type ToolHealth struct {
+	ExecutionFailures    int `json:"execution_failures"`    // subtasks that ended in failure
+	EnvironmentalRetries int `json:"environmental_retries"` // tool/infra errors causing retries
+	LogicalRetries       int `json:"logical_retries"`       // LLM format/reasoning errors causing retries
+}
+
 // AuditReport is a summary produced by R6 for the human operator
 type AuditReport struct {
 	ReportID           string             `json:"report_id"`
@@ -236,6 +248,7 @@ type AuditReport struct {
 	ConvergenceHealth  ConvergenceHealth  `json:"convergence_health"`
 	DriftAlerts        []string           `json:"drift_alerts"`
 	Anomalies          []string           `json:"anomalies"`
+	ToolHealth         ToolHealth         `json:"tool_health"`
 }
 
 type AuditPeriod struct {
@@ -335,6 +348,16 @@ type MemoryService interface {
 	RecordNegativeFeedback(ctx context.Context, ruleID, content string)
 	// Close drains the pending write queue. Called by Run() on context cancellation.
 	Close()
+}
+
+// MemorySummary is returned by Store.Summary() for the /memory REPL command.
+//
+// Expectations:
+//   - LevelCounts contains an entry for each of "M", "K", "C", "T" (zero when empty)
+//   - CLevel contains one SOPRecord per C-level Megram currently in the store
+type MemorySummary struct {
+	LevelCounts map[string]int `json:"level_counts"` // "M"→N, "K"→N, "C"→N, "T"→N
+	CLevel      []SOPRecord    `json:"c_level"`       // all promoted SOPs and constraints
 }
 
 // Ensure imports are used
