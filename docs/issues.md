@@ -2452,3 +2452,13 @@ Operator had no user-facing way to see how many Megrams are stored per level (M/
 - `memory.go`: added `Store.Summary()` — scans the `l|<level>|` prefix for each level to get counts; reads full Megrams for C-level entries to populate `CLevel`
 - `cmd/artoo/main.go`: added `/memory` REPL command (calls `mem.Summary()` directly, no bus round-trip); added `printMemorySummary()` with colour-coded level table and C-level entry list
 - `memory_test.go`: 4 new tests covering empty store, count accuracy, C-level field mapping, and non-C exclusion
+
+---
+
+## Issue #89 — R4a accepts fabricated success narrative when primary action failed
+
+**Symptom**: Artoo claimed a Twitter video download succeeded and returned a file path. The actual yt-dlp invocation was killed mid-stream (no completion signal). R3 then ran `ls ~/Downloads/*.mp4`, found a pre-existing file from 9 days earlier, and wrote a fabricated prose narrative ("download completed successfully… interrupted by signal kill but file was saved"). R4a accepted it because the criteria — "output contains .mp4 path" and "output confirms download completed" — were evaluated against R3's self-written `output` prose rather than the `tool_calls` ground truth.
+
+**Root cause**: R4a's prompt said "trust tool output as primary evidence" but did not forbid granting `met=true` based solely on R3's `output` prose when `tool_calls` contradicted it. The `tool_calls` clearly showed yt-dlp truncated with no "100%" line, and the only mp4 found was a post-hoc `ls` of a stale file. R4a had all the evidence to reject the claim but lacked an explicit rule to cross-check it.
+
+**Fix**: Added "Evidence grounding rule" to R4a system prompt: (1) `output` is R3's own claim — treat as a CLAIM, not fact; (2) `tool_calls` is the ground truth; (3) if `output` claims success but the primary action's `tool_call` entry shows interruption/error/truncation with no completion signal → contradiction → retry; (4) post-hoc verification (ls/find/stat) after a failed primary action does not prove the primary action succeeded.

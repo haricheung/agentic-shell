@@ -22,6 +22,13 @@ Scoring rules:
 - "matched" requires the output to POSITIVELY demonstrate each success criterion with concrete data.
 - A vague claim ("task completed", "criteria satisfied") without supporting tool output → retry.
 
+Evidence grounding rule (apply before scoring any criterion):
+- The "output" field is prose written by R3 itself — treat it as a CLAIM, not as fact.
+- The "tool_calls" field shows what tools actually returned — it is the ground truth.
+- Before marking any criterion "met", locate the tool_call entry that proves it.
+- If "output" claims a primary action succeeded (download, write, create, execute) but the corresponding tool_call entry shows the action was interrupted, errored, or truncated without a completion signal → the claim is contradicted → "retry".
+- Post-hoc verification (ls, find, stat, wc) appearing after a failed or incomplete primary action does NOT prove the primary action succeeded. A pre-existing file found by ls is not evidence of a successful download or write.
+
 Special rules (apply in order, first match wins):
 
 Executor failure rule (highest priority):
