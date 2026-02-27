@@ -15,10 +15,9 @@ import (
 )
 
 const (
-	searchMaxResults  = 5
-	googleSearchURL   = "https://www.googleapis.com/customsearch/v1"
-	googleAPIKeyEnv   = "GOOGLE_API_KEY"
-	googleCSEIDEnv    = "GOOGLE_CSE_ID"
+	searchMaxResults = 5
+	serperSearchURL  = "https://google.serper.dev/search"
+	serperAPIKeyEnv  = "SERPER_API_KEY"
 )
 
 var searchClient = &http.Client{
@@ -45,18 +44,18 @@ func SearchAvailable() bool {
 	return true
 }
 
-// Search queries the web. Uses Google Custom Search API when both GOOGLE_API_KEY
-// and GOOGLE_CSE_ID are set; falls back to DuckDuckGo HTML scraping otherwise.
+// Search queries the web. Uses Serper.dev API when SERPER_API_KEY is set;
+// falls back to DuckDuckGo HTML scraping otherwise.
 //
 // Expectations:
-//   - Uses Google when GOOGLE_API_KEY and GOOGLE_CSE_ID are both non-empty
-//   - Uses DuckDuckGo when either Google env var is unset or empty
+//   - Uses Serper when SERPER_API_KEY is non-empty
+//   - Uses DuckDuckGo when SERPER_API_KEY is unset or empty
 //   - Returns formatted results on success
 //   - Returns a "no results" message when no results are found
 //   - Returns error when the HTTP request fails
 func Search(ctx context.Context, query string) (string, error) {
-	if os.Getenv(googleAPIKeyEnv) != "" && os.Getenv(googleCSEIDEnv) != "" {
-		return searchGoogle(ctx, query)
+	if os.Getenv(serperAPIKeyEnv) != "" {
+		return searchSerper(ctx, query)
 	}
 	return searchDDG(ctx, query)
 }
@@ -160,19 +159,18 @@ func stripHTMLTags(s string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Google Custom Search (optional — requires GOOGLE_API_KEY + GOOGLE_CSE_ID)
+// Serper.dev (optional — requires SERPER_API_KEY)
 // ---------------------------------------------------------------------------
 
-func searchGoogle(ctx context.Context, query string) (string, error) {
-	reqURL := googleSearchURL +
-		"?key=" + url.QueryEscape(os.Getenv(googleAPIKeyEnv)) +
-		"&cx=" + url.QueryEscape(os.Getenv(googleCSEIDEnv)) +
-		"&q=" + url.QueryEscape(query) +
-		"&num=10"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+func searchSerper(ctx context.Context, query string) (string, error) {
+	payload, _ := json.Marshal(map[string]any{"q": query, "num": 10})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, serperSearchURL,
+		strings.NewReader(string(payload)))
 	if err != nil {
 		return "", fmt.Errorf("search: create request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-KEY", os.Getenv(serperAPIKeyEnv))
 
 	resp, err := searchClient.Do(req)
 	if err != nil {
@@ -188,34 +186,34 @@ func searchGoogle(ctx context.Context, query string) (string, error) {
 		return "", fmt.Errorf("search: HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	pages, err := parseGoogleResults(body)
+	pages, err := parseSerperResults(body)
 	if err != nil {
 		return "", fmt.Errorf("search: parse response: %w", err)
 	}
 	return formatSearchResult(query, pages), nil
 }
 
-type googleResponse struct {
-	Items []struct {
+type serperResponse struct {
+	Organic []struct {
 		Title   string `json:"title"`
 		Link    string `json:"link"`
 		Snippet string `json:"snippet"`
-	} `json:"items"`
+	} `json:"organic"`
 }
 
-// parseGoogleResults extracts organic search results from a Google Custom Search JSON response.
+// parseSerperResults extracts organic search results from a Serper.dev JSON response.
 //
 // Expectations:
-//   - Returns empty slice when items array is absent or empty
+//   - Returns empty slice when organic array is absent or empty
 //   - Returns error on malformed JSON
 //   - Maps title → Name, link → URL, snippet → Snippet for each result
-func parseGoogleResults(data []byte) ([]searchPage, error) {
-	var gr googleResponse
-	if err := json.Unmarshal(data, &gr); err != nil {
+func parseSerperResults(data []byte) ([]searchPage, error) {
+	var sr serperResponse
+	if err := json.Unmarshal(data, &sr); err != nil {
 		return nil, err
 	}
-	pages := make([]searchPage, 0, len(gr.Items))
-	for _, item := range gr.Items {
+	pages := make([]searchPage, 0, len(sr.Organic))
+	for _, item := range sr.Organic {
 		pages = append(pages, searchPage{Name: item.Title, URL: item.Link, Snippet: item.Snippet})
 	}
 	return pages, nil

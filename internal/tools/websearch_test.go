@@ -129,12 +129,12 @@ func TestStripHTMLTags_EmptyInputReturnsEmpty(t *testing.T) {
 	}
 }
 
-// ── parseGoogleResults ───────────────────────────────────────────────────────
+// ── parseSerperResults ───────────────────────────────────────────────────────
 
-func TestParseGoogleResults_EmptyItemsReturnsEmptySlice(t *testing.T) {
-	// Returns empty slice when items array is absent or empty
-	data := []byte(`{"items":[]}`)
-	pages, err := parseGoogleResults(data)
+func TestParseSerperResults_EmptyOrganicReturnsEmptySlice(t *testing.T) {
+	// Returns empty slice when organic array is absent or empty
+	data := []byte(`{"organic":[]}`)
+	pages, err := parseSerperResults(data)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -143,32 +143,32 @@ func TestParseGoogleResults_EmptyItemsReturnsEmptySlice(t *testing.T) {
 	}
 }
 
-func TestParseGoogleResults_MissingItemsReturnsEmptySlice(t *testing.T) {
-	// Returns empty slice when items array is absent or empty
+func TestParseSerperResults_MissingOrganicReturnsEmptySlice(t *testing.T) {
+	// Returns empty slice when organic array is absent or empty
 	data := []byte(`{}`)
-	pages, err := parseGoogleResults(data)
+	pages, err := parseSerperResults(data)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(pages) != 0 {
-		t.Errorf("expected 0 results for missing items, got %d", len(pages))
+		t.Errorf("expected 0 results for missing organic, got %d", len(pages))
 	}
 }
 
-func TestParseGoogleResults_MalformedJSONReturnsError(t *testing.T) {
+func TestParseSerperResults_MalformedJSONReturnsError(t *testing.T) {
 	// Returns error on malformed JSON
-	_, err := parseGoogleResults([]byte(`{not valid json`))
+	_, err := parseSerperResults([]byte(`{not valid json`))
 	if err == nil {
 		t.Error("expected error for malformed JSON, got nil")
 	}
 }
 
-func TestParseGoogleResults_MapsTitleLinkSnippet(t *testing.T) {
+func TestParseSerperResults_MapsTitleLinkSnippet(t *testing.T) {
 	// Maps title → Name, link → URL, snippet → Snippet for each result
-	data := []byte(`{"items":[
+	data := []byte(`{"organic":[
 		{"title":"Go Language","link":"https://go.dev","snippet":"An open source language."}
 	]}`)
-	pages, err := parseGoogleResults(data)
+	pages, err := parseSerperResults(data)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -40,8 +40,8 @@ Tool selection — use the FIRST tool that fits; do not skip down the list:
    Never include ~/Music/Music or ~/Library in shell paths.`
 
 // searchToolEntry is always included — DuckDuckGo requires no API key.
-// Google Custom Search is used automatically when GOOGLE_API_KEY + GOOGLE_CSE_ID are set.
-const searchToolEntry = `8. search — web search (DuckDuckGo by default; Google when GOOGLE_API_KEY + GOOGLE_CSE_ID are set). Input: {"action":"tool","tool":"search","query":"..."}`
+// Serper.dev is used automatically when SERPER_API_KEY is set.
+const searchToolEntry = `8. search — web search (DuckDuckGo by default; Serper.dev when SERPER_API_KEY is set). Input: {"action":"tool","tool":"search","query":"..."}`
 
 const systemPromptExec = `
 Execution rules:
