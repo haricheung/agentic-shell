@@ -97,7 +97,7 @@ func failedOutcome(taskID, subID, reason string) types.SubTaskOutcome {
 func TestGGSIntegration_ChangePath(t *testing.T) {
 	// First round, D > δ, P = 0.5 (no keywords → neutral), |∇L|=0 < ε → change_path
 	b := bus.New()
-	g := ggs.New(b, nil, nil)
+	g := ggs.New(b, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	directiveCh := b.Subscribe(types.MsgPlanDirective)
@@ -122,7 +122,7 @@ func TestGGSIntegration_ChangePath(t *testing.T) {
 func TestGGSIntegration_BreakSymmetry(t *testing.T) {
 	// First round, D > δ, P > 0.5 (logical keyword), |∇L|=0 < ε → break_symmetry
 	b := bus.New()
-	g := ggs.New(b, nil, nil)
+	g := ggs.New(b, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	directiveCh := b.Subscribe(types.MsgPlanDirective)
@@ -145,7 +145,7 @@ func TestGGSIntegration_Refine_ImprovingGradient(t *testing.T) {
 	// Round 1: all failed (D=1.0), P=0.5 → change_path.
 	// Round 2: half failed (D=0.5), P=0.5, ∇L < 0 (|∇L| ≥ ε) → refine (has signal + environmental).
 	b := bus.New()
-	g := ggs.New(b, nil, nil)
+	g := ggs.New(b, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	directiveCh := b.Subscribe(types.MsgPlanDirective)
@@ -184,7 +184,7 @@ func TestGGSIntegration_Refine_ImprovingGradient(t *testing.T) {
 func TestGGSIntegration_Abandon_EmitsFinalResult(t *testing.T) {
 	// Ω ≥ 0.8 (large elapsedMs) → abandon → MsgFinalResult instead of MsgPlanDirective
 	b := bus.New()
-	g := ggs.New(b, nil, nil)
+	g := ggs.New(b, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	directiveCh := b.Subscribe(types.MsgPlanDirective)
@@ -221,7 +221,7 @@ func TestGGSIntegration_SuccessPath_EmitsFinalResult(t *testing.T) {
 	// D <= delta (most criteria met) and Ω < theta → "success" macro-state → FinalResult, not PlanDirective.
 	// 4 criteria, 1 fails → D=0.25 <= delta=0.3.
 	b := bus.New()
-	g := ggs.New(b, nil, nil)
+	g := ggs.New(b, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	directiveCh := b.Subscribe(types.MsgPlanDirective)
@@ -266,7 +266,7 @@ func TestGGSIntegration_SuccessPath_EmitsFinalResult(t *testing.T) {
 func TestGGSIntegration_AcceptPath_EmitsFinalResultWithDZero(t *testing.T) {
 	// OutcomeSummary (all matched) → GGS accept path → MsgFinalResult with D=0
 	b := bus.New()
-	g := ggs.New(b, nil, nil)
+	g := ggs.New(b, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	finalCh := b.Subscribe(types.MsgFinalResult)

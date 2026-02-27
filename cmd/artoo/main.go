@@ -108,7 +108,7 @@ func main() {
 	// Logical roles
 	plan := planner.New(b, brainClient, logReg, mem)
 	mv := metaval.New(b, toolClient, outputFn, logReg)
-	gs := ggs.New(b, outputFn, mem) // R7 — Goal Gradient Solver; sole writer to R5
+	gs := ggs.New(b, outputFn, mem, logReg) // R7 — Goal Gradient Solver; sole writer to R5
 	exec := executor.New(b, toolClient)
 	av := agentval.New(b, toolClient)
 

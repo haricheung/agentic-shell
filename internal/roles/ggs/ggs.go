@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/roles/memory"
+	"github.com/haricheung/agentic-shell/internal/tasklog"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
@@ -39,6 +40,7 @@ const (
 type GGS struct {
 	b              *bus.Bus
 	mem            types.MemoryService // R5 — sole writer; may be nil (memory disabled)
+	logReg         *tasklog.Registry   // per-task structured log; may be nil (logging disabled)
 	outputFn       func(taskID, summary string, output any)
 	mu             sync.Mutex
 	lPrev          map[string]float64  // L_{t-1} per task_id
@@ -49,10 +51,12 @@ type GGS struct {
 }
 
 // New creates a GGS. mem may be nil to disable memory writes (e.g. in tests).
-func New(b *bus.Bus, outputFn func(taskID, summary string, output any), mem types.MemoryService) *GGS {
+// logReg may be nil to disable per-task decision logging (e.g. in tests).
+func New(b *bus.Bus, outputFn func(taskID, summary string, output any), mem types.MemoryService, logReg *tasklog.Registry) *GGS {
 	return &GGS{
 		b:              b,
 		mem:            mem,
+		logReg:         logReg,
 		outputFn:       outputFn,
 		lPrev:          make(map[string]float64),
 		replans:        make(map[string]int),
@@ -162,8 +166,10 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		summary := buildSuccessSummary(rr)
 		output := mergeMatchedOutputs(rr.Outcomes)
 
+		g.logReg.Get(taskID).GGSDecision(D, P, Omega, L, gradL, "success", "", replanCount)
+
 		// Write terminal Megram to R5 (GGS is sole writer).
-		g.writeTerminalMegram(rr.Intent, summary, "success")
+		g.writeTerminalMegram(taskID, rr.Intent, summary, "success")
 
 		g.b.Publish(types.Message{
 			ID:        uuid.New().String(),
@@ -201,8 +207,10 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		slog.Info("[R7] task ABANDON", "task", taskID, "Omega", Omega, "threshold", abandonOmega)
 		summary := buildAbandonSummary(rr)
 
+		g.logReg.Get(taskID).GGSDecision(D, P, Omega, L, gradL, "abandon", "", replanCount)
+
 		// Write terminal Megram to R5 (GGS is sole writer).
-		g.writeTerminalMegram(rr.Intent, rr.GapSummary, "abandon")
+		g.writeTerminalMegram(taskID, rr.Intent, rr.GapSummary, "abandon")
 
 		g.b.Publish(types.Message{
 			ID:        uuid.New().String(),
@@ -236,7 +244,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 
 	// Action states: refine | change_path | change_approach | break_symmetry.
 	// Write one Megram per failed tool call to R5 (fire-and-forget).
-	g.writeMegramsFromToolCalls(rr.Outcomes, directive)
+	g.writeMegramsFromToolCalls(taskID, rr.Outcomes, directive)
 
 	blockedTools := deriveBlockedTools(rr.Outcomes, directive)
 
@@ -252,6 +260,10 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 	failedCriterion := primaryFailedCriterion(rr.Outcomes)
 	failureClass := computeFailureClass(rr.Outcomes)
 	rationale := buildRationale(directive, D, P, Omega, gradL, rr.GapSummary)
+
+	tl := g.logReg.Get(taskID)
+	tl.GGSDecision(D, P, Omega, L, gradL, directive, rationale, replanCount)
+	tl.PlanDirective(directive, blockedTools, allBlockedTargets, failureClass, rationale)
 
 	slog.Info("[R7] emitting PlanDirective", "task", taskID, "directive", directive, "prev", prevDirective, "blocked_tools", blockedTools)
 
@@ -332,6 +344,8 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 
 	slog.Info("[R7] task ACCEPT", "task", taskID, "Omega", Omega, "L", L, "gradL", gradL, "replans", replanCount, "prev", prevDirective)
 
+	g.logReg.Get(taskID).GGSDecision(D, P, Omega, L, gradL, "accept", "", replanCount)
+
 	// Clean up per-task state (task is done).
 	g.mu.Lock()
 	delete(g.lPrev, taskID)
@@ -342,7 +356,7 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 	g.mu.Unlock()
 
 	// Write terminal Megram to R5 (GGS is sole writer).
-	g.writeTerminalMegram(os.Intent, os.Summary, "accept")
+	g.writeTerminalMegram(taskID, os.Intent, os.Summary, "accept")
 
 	// GGS is the sole emitter of FinalResult — consistent path for accept, success, and abandon.
 	// Directive="accept"; Loss, GradL, Replans, PrevDirective for trajectory checkpoint display.
@@ -847,7 +861,8 @@ func buildRationale(directive string, D, P, Omega, gradL float64, gapSummary str
 //   - Sets f, sigma, k from quantization matrix for the given state
 //   - Publishes MsgMegram to bus for Auditor observability
 //   - Fires Write() async (non-blocking)
-func (g *GGS) writeTerminalMegram(intent, content, state string) {
+//   - Logs a memory_write event to the task log after writing
+func (g *GGS) writeTerminalMegram(taskID, intent, content, state string) {
 	if g.mem == nil {
 		return
 	}
@@ -868,6 +883,7 @@ func (g *GGS) writeTerminalMegram(intent, content, state string) {
 		K:         q.K,
 	}
 	g.mem.Write(meg)
+	g.logReg.Get(taskID).MemoryWrite(meg.State, meg.Level, meg.Space, meg.Entity)
 	if g.b != nil {
 		g.b.Publish(types.Message{
 			ID:        uuid.New().String(),
@@ -890,7 +906,8 @@ func (g *GGS) writeTerminalMegram(intent, content, state string) {
 //   - Deduplicates by (toolName, target) to avoid multiple Megrams for the same pair
 //   - Sets f, sigma, k from quantization matrix for the given directive
 //   - Skips tool calls where ParseToolCall returns an empty target
-func (g *GGS) writeMegramsFromToolCalls(outcomes []types.SubTaskOutcome, directive string) {
+//   - Logs one memory_write event per written Megram to the task log
+func (g *GGS) writeMegramsFromToolCalls(taskID string, outcomes []types.SubTaskOutcome, directive string) {
 	if g.mem == nil {
 		return
 	}
@@ -931,6 +948,7 @@ func (g *GGS) writeMegramsFromToolCalls(outcomes []types.SubTaskOutcome, directi
 				K:         q.K,
 			}
 			g.mem.Write(meg)
+			g.logReg.Get(taskID).MemoryWrite(meg.State, meg.Level, meg.Space, meg.Entity)
 			if g.b != nil {
 				g.b.Publish(types.Message{
 					ID:        uuid.New().String(),

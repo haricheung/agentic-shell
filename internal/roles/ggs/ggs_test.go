@@ -567,7 +567,7 @@ func TestProcessAccept_EmitsFinalResultWithCorrectPayload(t *testing.T) {
 	gs := New(b, func(_ string, summary string, output any) {
 		gotSummary = summary
 		gotOutput = output
-	}, nil)
+	}, nil, nil)
 	os := types.OutcomeSummary{
 		TaskID:       "t1",
 		Summary:      "all done",
@@ -602,7 +602,7 @@ func TestProcessAccept_EmitsFinalResultWithCorrectPayload(t *testing.T) {
 func TestProcessAccept_CleansUpPerTaskState(t *testing.T) {
 	// Removes lPrev and replans entries after accept
 	b := bus.New()
-	gs := New(b, nil, nil)
+	gs := New(b, nil, nil, nil)
 	gs.mu.Lock()
 	gs.lPrev["t2"] = 0.5
 	gs.replans["t2"] = 1
@@ -710,7 +710,7 @@ func TestProcessAccept_PrevDirectiveIsInitOnFirstTry(t *testing.T) {
 	// FinalResult.PrevDirective is "init" when no prior directive has been emitted
 	b := bus.New()
 	tap := b.NewTap()
-	gs := New(b, nil, nil)
+	gs := New(b, nil, nil, nil)
 
 	gs.processAccept(context.Background(), types.OutcomeSummary{TaskID: "t-init"})
 
@@ -763,7 +763,7 @@ func TestLaw2KillSwitch_AbandonAfterTwoConsecutiveWorsening(t *testing.T) {
 	// directive overridden to "abandon" after 2 consecutive worsening gradients
 	b := bus.New()
 	tap := b.NewTap()
-	gs := New(b, nil, nil)
+	gs := New(b, nil, nil, nil)
 
 	taskID := "law2-task"
 	// Prime lPrev to a very low value so first replan produces worsening gradient.
@@ -823,7 +823,7 @@ func TestLaw2KillSwitch_NotFiredAfterOnlyOneWorsening(t *testing.T) {
 	// Only 1 worsening does not trigger the kill-switch — PlanDirective emitted instead
 	b := bus.New()
 	tap := b.NewTap()
-	gs := New(b, nil, nil)
+	gs := New(b, nil, nil, nil)
 
 	taskID := "law2-one"
 	gs.mu.Lock()
@@ -859,7 +859,7 @@ func TestLaw2KillSwitch_ResetWhenGradientImproves(t *testing.T) {
 	// worseningCount resets to 0 when gradient is not worsening
 	// Sequence: worsening(1) → improving(0) → worsening(1) → no kill-switch on 3rd call
 	b := bus.New()
-	gs := New(b, nil, nil)
+	gs := New(b, nil, nil, nil)
 
 	taskID := "law2-reset"
 

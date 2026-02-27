@@ -180,7 +180,7 @@ func (p *Planner) plan(ctx context.Context, spec types.TaskSpec) error {
 	tl := p.logReg.Open(spec.TaskID, spec.Intent)
 
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
-	constraints := p.queryMKCTConstraints(ctx, spec.Intent)
+	constraints := p.queryMKCTConstraints(ctx, spec.Intent, tl)
 
 	today := time.Now().UTC().Format("2006-01-02")
 	var userPrompt string
@@ -203,7 +203,7 @@ func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, 
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
 
 	// Query MKCT memory for this intent.
-	constraints := p.queryMKCTConstraints(ctx, spec.Intent)
+	constraints := p.queryMKCTConstraints(ctx, spec.Intent, tl)
 
 	// blocked_tools: tool names to avoid (logical failure directives: break_symmetry, change_approach).
 	if len(pd.BlockedTools) > 0 {
@@ -253,7 +253,8 @@ func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, 
 //   - Includes "MUST NOT" block when Action is Avoid
 //   - Includes "CAUTION" block when Action is Caution
 //   - Appends C-level SOPs as "SHOULD PREFER" (σ>0) or "MUST NOT" (σ<0) lines
-func (p *Planner) queryMKCTConstraints(ctx context.Context, intent string) string {
+//   - Logs a memory_query event to tl after computing constraints
+func (p *Planner) queryMKCTConstraints(ctx context.Context, intent string, tl *tasklog.TaskLog) string {
 	if p.mem == nil {
 		return ""
 	}
@@ -270,6 +271,7 @@ func (p *Planner) queryMKCTConstraints(ctx context.Context, intent string) strin
 	}
 
 	constraints := calibrateMKCT(sops, pots)
+	tl.MemoryQuery(space, entity, len(sops), pots.Action, pots.Attention, pots.Decision)
 	if constraints != "" {
 		slog.Debug("[R2] MKCT calibration", "sops", len(sops), "action", pots.Action)
 	} else {

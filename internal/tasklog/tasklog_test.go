@@ -164,6 +164,10 @@ func TestTaskLog_NilReceiverNoops(t *testing.T) {
 	tl.CriterionVerdict("s1", "output contains path", true, "evidence", 1)
 	tl.Correction("s1", "wrong", "try this", 1)
 	tl.Replan("gap summary", 1)
+	tl.GGSDecision(0.5, 0.5, 0.3, 0.6, -0.1, "refine", "rationale", 1)
+	tl.PlanDirective("refine", []string{"shell"}, []string{"ls /"}, "environmental", "rationale")
+	tl.MemoryQuery("intent_slug", "env:local", 3, "Exploit", 4.2, 2.1)
+	tl.MemoryWrite("accept", "M", "intent_slug", "env:local")
 }
 
 // --- TotalTokens ---
@@ -397,4 +401,272 @@ func TestTaskEnd_IncludesToolStats(t *testing.T) {
 	if last.ToolElapsedMs != 1000 {
 		t.Errorf("tool_elapsed_ms = %d, want 1000", last.ToolElapsedMs)
 	}
+}
+
+// ── GGSDecision ───────────────────────────────────────────────────────────────
+
+func TestGGSDecision_WritesEvent(t *testing.T) {
+	// GGSDecision writes a ggs_decision event with all float and string fields
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.GGSDecision(0.4, 0.6, 0.2, 0.55, -0.05, "refine", "loss decreasing", 1)
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	for _, e := range events {
+		if e.Kind != KindGGSDecision {
+			continue
+		}
+		if e.D != 0.4 {
+			t.Errorf("D = %v, want 0.4", e.D)
+		}
+		if e.P != 0.6 {
+			t.Errorf("P = %v, want 0.6", e.P)
+		}
+		if e.Omega != 0.2 {
+			t.Errorf("Omega = %v, want 0.2", e.Omega)
+		}
+		if e.L != 0.55 {
+			t.Errorf("L = %v, want 0.55", e.L)
+		}
+		if e.GradL != -0.05 {
+			t.Errorf("GradL = %v, want -0.05", e.GradL)
+		}
+		if e.Directive != "refine" {
+			t.Errorf("Directive = %q, want %q", e.Directive, "refine")
+		}
+		if e.Rationale != "loss decreasing" {
+			t.Errorf("Rationale = %q, want %q", e.Rationale, "loss decreasing")
+		}
+		if e.ReplanRound != 1 {
+			t.Errorf("ReplanRound = %d, want 1", e.ReplanRound)
+		}
+		return
+	}
+	t.Fatal("no ggs_decision event found")
+}
+
+func TestGGSDecision_NilReceiverNoop(t *testing.T) {
+	// GGSDecision is a no-op on nil receiver
+	var tl *TaskLog
+	tl.GGSDecision(0.5, 0.5, 0.3, 0.6, -0.1, "refine", "rationale", 1)
+}
+
+func TestGGSDecision_AcceptDirectiveEmptyRationale(t *testing.T) {
+	// GGSDecision serialises directive="accept" with empty rationale (accept path)
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.GGSDecision(0.0, 0.5, 0.1, 0.2, -0.3, "accept", "", 0)
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	for _, e := range events {
+		if e.Kind == KindGGSDecision {
+			if e.Directive != "accept" {
+				t.Errorf("Directive = %q, want %q", e.Directive, "accept")
+			}
+			if e.D != 0.0 {
+				t.Errorf("D = %v, want 0.0", e.D)
+			}
+			return
+		}
+	}
+	t.Fatal("no ggs_decision event found")
+}
+
+// ── PlanDirective ─────────────────────────────────────────────────────────────
+
+func TestPlanDirective_WritesEvent(t *testing.T) {
+	// PlanDirective writes a plan_directive event with blocked_tools and blocked_targets
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.PlanDirective("change_approach", []string{"shell", "glob"}, []string{"ls /tmp"}, "logical", "switch method")
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	for _, e := range events {
+		if e.Kind != KindPlanDirective {
+			continue
+		}
+		if e.Directive != "change_approach" {
+			t.Errorf("Directive = %q, want %q", e.Directive, "change_approach")
+		}
+		if len(e.BlockedTools) != 2 || e.BlockedTools[0] != "shell" {
+			t.Errorf("BlockedTools = %v, want [shell glob]", e.BlockedTools)
+		}
+		if len(e.BlockedTargets) != 1 || e.BlockedTargets[0] != "ls /tmp" {
+			t.Errorf("BlockedTargets = %v, want [ls /tmp]", e.BlockedTargets)
+		}
+		if e.FailureClass != "logical" {
+			t.Errorf("FailureClass = %q, want %q", e.FailureClass, "logical")
+		}
+		if e.Rationale != "switch method" {
+			t.Errorf("Rationale = %q, want %q", e.Rationale, "switch method")
+		}
+		return
+	}
+	t.Fatal("no plan_directive event found")
+}
+
+func TestPlanDirective_NilReceiverNoop(t *testing.T) {
+	// PlanDirective is a no-op on nil receiver
+	var tl *TaskLog
+	tl.PlanDirective("refine", nil, nil, "environmental", "")
+}
+
+func TestPlanDirective_NilBlockedSlices(t *testing.T) {
+	// PlanDirective with nil blocked slices serialises without blocked_tools/blocked_targets
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.PlanDirective("refine", nil, nil, "environmental", "")
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	for _, e := range events {
+		if e.Kind == KindPlanDirective {
+			if e.BlockedTools != nil {
+				t.Errorf("BlockedTools should be nil, got %v", e.BlockedTools)
+			}
+			if e.BlockedTargets != nil {
+				t.Errorf("BlockedTargets should be nil, got %v", e.BlockedTargets)
+			}
+			return
+		}
+	}
+	t.Fatal("no plan_directive event found")
+}
+
+// ── MemoryQuery ───────────────────────────────────────────────────────────────
+
+func TestMemoryQuery_WritesEvent(t *testing.T) {
+	// MemoryQuery writes a memory_query event with space, entity, sop_count, action, attention, decision
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.MemoryQuery("list_files", "env:local", 3, "Exploit", 4.5, 2.1)
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	for _, e := range events {
+		if e.Kind != KindMemoryQuery {
+			continue
+		}
+		if e.Space != "list_files" {
+			t.Errorf("Space = %q, want %q", e.Space, "list_files")
+		}
+		if e.Entity != "env:local" {
+			t.Errorf("Entity = %q, want %q", e.Entity, "env:local")
+		}
+		if e.SOPCount != 3 {
+			t.Errorf("SOPCount = %d, want 3", e.SOPCount)
+		}
+		if e.Action != "Exploit" {
+			t.Errorf("Action = %q, want %q", e.Action, "Exploit")
+		}
+		if e.Attention != 4.5 {
+			t.Errorf("Attention = %v, want 4.5", e.Attention)
+		}
+		if e.Decision != 2.1 {
+			t.Errorf("Decision = %v, want 2.1", e.Decision)
+		}
+		return
+	}
+	t.Fatal("no memory_query event found")
+}
+
+func TestMemoryQuery_NilReceiverNoop(t *testing.T) {
+	// MemoryQuery is a no-op on nil receiver
+	var tl *TaskLog
+	tl.MemoryQuery("intent_slug", "env:local", 3, "Exploit", 4.2, 2.1)
+}
+
+func TestMemoryQuery_ZeroSOPsIgnoreAction(t *testing.T) {
+	// MemoryQuery with sop_count=0 and action=Ignore is still serialised
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.MemoryQuery("new_task", "env:local", 0, "Ignore", 0.0, 0.0)
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	for _, e := range events {
+		if e.Kind == KindMemoryQuery {
+			if e.SOPCount != 0 {
+				t.Errorf("SOPCount = %d, want 0", e.SOPCount)
+			}
+			if e.Action != "Ignore" {
+				t.Errorf("Action = %q, want Ignore", e.Action)
+			}
+			return
+		}
+	}
+	t.Fatal("no memory_query event found")
+}
+
+// ── MemoryWrite ───────────────────────────────────────────────────────────────
+
+func TestMemoryWrite_WritesEvent(t *testing.T) {
+	// MemoryWrite writes a memory_write event with state, level, space, entity
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.MemoryWrite("accept", "M", "list_files", "env:local")
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	for _, e := range events {
+		if e.Kind != KindMemoryWrite {
+			continue
+		}
+		if e.State != "accept" {
+			t.Errorf("State = %q, want %q", e.State, "accept")
+		}
+		if e.Level != "M" {
+			t.Errorf("Level = %q, want %q", e.Level, "M")
+		}
+		if e.Space != "list_files" {
+			t.Errorf("Space = %q, want %q", e.Space, "list_files")
+		}
+		if e.Entity != "env:local" {
+			t.Errorf("Entity = %q, want %q", e.Entity, "env:local")
+		}
+		return
+	}
+	t.Fatal("no memory_write event found")
+}
+
+func TestMemoryWrite_NilReceiverNoop(t *testing.T) {
+	// MemoryWrite is a no-op on nil receiver
+	var tl *TaskLog
+	tl.MemoryWrite("accept", "M", "intent_slug", "env:local")
+}
+
+func TestMemoryWrite_ActionStateToolSpace(t *testing.T) {
+	// MemoryWrite serialises tool-space and target-entity correctly for action states
+	dir := t.TempDir()
+	r := NewRegistry(filepath.Join(dir, "tasks"))
+	tl := r.Open("task1", "intent")
+	tl.MemoryWrite("change_approach", "M", "tool:shell", "target:ls /tmp")
+	r.Close("task1", "accepted")
+
+	events := readEvents(t, filepath.Join(dir, "tasks", "task1.jsonl"))
+	for _, e := range events {
+		if e.Kind == KindMemoryWrite {
+			if e.Space != "tool:shell" {
+				t.Errorf("Space = %q, want %q", e.Space, "tool:shell")
+			}
+			if e.Entity != "target:ls /tmp" {
+				t.Errorf("Entity = %q, want %q", e.Entity, "target:ls /tmp")
+			}
+			if e.State != "change_approach" {
+				t.Errorf("State = %q, want %q", e.State, "change_approach")
+			}
+			return
+		}
+	}
+	t.Fatal("no memory_write event found")
 }

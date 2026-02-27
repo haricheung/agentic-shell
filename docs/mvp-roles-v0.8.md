@@ -2,7 +2,7 @@
 
 **Version**: 0.8
 **Status**: Production
-**Date**: 2026-02-27
+**Date**: 2026-02-25
 **Authors**: Hari Cheung
 
 [toc]
@@ -158,7 +158,7 @@ All inter-role communications must pass through a shared message bus that the Au
 | R3 | Executor | Effector Agent | Plant (fast loop) | If a feasible sub-task is not correctly executed, this role is responsible |
 | R4a | Agent-Validator | Effector Agent | Sensor + Controller (fast loop) | If a gap between outcome and sub-task goal goes unresolved or unreported, this role is responsible |
 | R4b | Meta-Validator | Metaagent | Sensor (medium loop) | If the merged result is accepted outside plausible range or a task is silently abandoned, this role is responsible |
-| R5 | Shared Memory | Infrastructure | Cognitive substrate | If valid data is lost, corrupted, or wrongly retrieved, this role is responsible |
+| R5 | MKCT memory engine; episodic-to-semantic consolidation via Dreamer | Infrastructure | Cognitive substrate | If valid data is lost, corrupted, or wrongly retrieved, this role is responsible |
 | R6 | Auditor | Infrastructure | Lateral observer | If systematic failures go undetected and unreported to the human operator, this role is responsible |
 | R7 | Goal Gradient Solver | Metaagent | Controller (medium loop) | If the replanning direction is wrong, too conservative, or too aggressive for the observed gradient, this role is responsible |
 
@@ -252,6 +252,21 @@ TaskSpec {
 - Write per-subtask `success_criteria` as concrete, checkable assertions (not restatements of intent)
 - On replan: honour `PlanDirective.blocked_tools` (must not appear in any subtask) and `blocked_targets` (must not be reused as tool inputs)
 - Open task log via `logReg.Open()`
+
+### Memory Calibration Protocol (MKCT)
+
+Before generating a plan, R2 queries R5 with the task intent:
+
+1. **Derive tags**: `space = IntentSlug(intent)`, `entity = "env:local"`
+2. **QueryC** → `[]SOPRecord`: C-level timeless SOPs for this (space, entity) pair
+3. **QueryMK** → `Potentials{Attention, Decision, Action}`: dual-channel convolution result
+4. **Map Action to constraint**:
+   - `Exploit` → `SHOULD PREFER` block (proven approach worked well)
+   - `Avoid` → `MUST NOT` block (approach consistently failed)
+   - `Caution` → `CAUTION` block (mixed results; validate each step)
+   - `Ignore` → no constraint injected
+5. **Append C-level SOPs**: σ > 0 → `SHOULD PREFER`; σ ≤ 0 → `MUST NOT`
+6. **Merged MUST NOT set**: union of GGS `blocked_tools`, GGS `blocked_targets`, and memory constraints
 
 ### MUST NOT Set (priority order)
 
@@ -867,6 +882,9 @@ User
 
 | Decision | Rationale |
 |---|---|
+| R5 fully redesigned: MKCT pyramid, Megram atomic tuples, dual-channel convolution potentials, LevelDB inverted index, Dreamer consolidation + GC engine | Keyword-scan JSON store cannot support cross-task SOP promotion, decay-weighted avoidance, or distinction between approach-level and path-level failures |
+| GGS is the sole writer to R5 — one Megram per blocked_target on action states; one macro-state Megram on terminal states | Metaval previously wrote MemoryEntry on accept/fail, bypassing GGS observability |
+| R2 memory query returns structured data (`[]SOPRecord`, `Potentials`); R2 formats into prompt | Memory-as-text-formatter made memory untestable independently of R2 |
 | GGS decision table: 24 cells → 6 macro-states via diagnostic cascade | v0.7 used ∇L sign as the primary split. This was wrong: ∇L sign conflates approach quality with trajectory noise. The new cascade — Ω first, then D, then (|∇L|, P) — produces cleaner, orthogonal decisions |
 | `success` macro-state: D ≤ δ → accept without requiring D = 0 | Requiring all criteria to pass before accepting burns budget on noise-level gaps. D ≤ δ means the result is within the convergence threshold; replanning further is wasteful |
 | ∇L sign demoted from state-determining to urgency modulator | Improving loss with a logically wrong approach (P > ρ) is suspicious — it may indicate hallucination, criteria gaming, or convergence in the wrong basin. The system must not blindly trust an improving trend |
@@ -953,7 +971,6 @@ User
 | ∇L sign urgency modulation | Concrete implementation of per-macro-state urgency adjustment |
 | Structured criteria mode | `{criterion, mode}` objects distinguishing `verifiable` from `plausible`; affects D computation weighting |
 | R2 graceful failure on abandon | LLM-backed partial result + next-move suggestions (currently code-template only) |
-| Dreamer upward consolidation | LLM distillation of M-level clusters into C-level SOPs/Constraints; FinalResult-triggered settle delay |
 
 ### Phase 2 — Research
 

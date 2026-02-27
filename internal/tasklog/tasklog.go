@@ -37,6 +37,10 @@ const (
 	KindCriterionVerdict EventKind = "criterion_verdict"
 	KindCorrection       EventKind = "correction"
 	KindReplan           EventKind = "replan"
+	KindGGSDecision      EventKind = "ggs_decision"   // GGS loss computation result
+	KindPlanDirective    EventKind = "plan_directive"  // replanning directive to R2
+	KindMemoryQuery      EventKind = "memory_query"    // Planner MKCT query result
+	KindMemoryWrite      EventKind = "memory_write"    // Megram written by GGS
 )
 
 // Event is one JSONL line in the task log.
@@ -89,6 +93,28 @@ type Event struct {
 	GapSummary  string `json:"gap_summary,omitempty"`
 	GapTrend    string `json:"gap_trend,omitempty"`
 	ReplanRound int    `json:"replan_round,omitempty"`
+
+	// ggs_decision / plan_directive
+	D              float64  `json:"d,omitempty"`
+	P              float64  `json:"p,omitempty"`
+	Omega          float64  `json:"omega,omitempty"`
+	L              float64  `json:"l,omitempty"`
+	GradL          float64  `json:"grad_l,omitempty"`
+	Directive      string   `json:"directive,omitempty"`
+	Rationale      string   `json:"rationale,omitempty"`
+	BlockedTools   []string `json:"blocked_tools,omitempty"`
+	BlockedTargets []string `json:"blocked_targets,omitempty"`
+	FailureClass   string   `json:"failure_class,omitempty"`
+
+	// memory_query / memory_write
+	Space     string  `json:"space,omitempty"`
+	Entity    string  `json:"entity,omitempty"`
+	SOPCount  int     `json:"sop_count,omitempty"`
+	Action    string  `json:"action,omitempty"`
+	Attention float64 `json:"attention,omitempty"`
+	Decision  float64 `json:"decision,omitempty"`
+	Level     string  `json:"level,omitempty"`
+	State     string  `json:"state,omitempty"`
 }
 
 // TaskStats aggregates all cost metrics for a completed task.
@@ -470,6 +496,92 @@ func (tl *TaskLog) TotalTokens() int {
 	tl.mu.Lock()
 	defer tl.mu.Unlock()
 	return tl.promptTokens + tl.completionTokens
+}
+
+// GGSDecision writes a ggs_decision event capturing the full loss breakdown and
+// the directive selected by the Goal Gradient Solver for this replan round.
+//
+// Expectations:
+//   - No-op on nil receiver
+//   - All float fields (d, p, omega, l, grad_l) are serialised in the JSONL event
+//   - directive and rationale are serialised when non-empty
+//   - replan_round is serialised when > 0
+func (tl *TaskLog) GGSDecision(d, p, omega, l, gradL float64, directive, rationale string, replanRound int) {
+	if tl == nil {
+		return
+	}
+	tl.write(Event{
+		Kind:        KindGGSDecision,
+		D:           d,
+		P:           p,
+		Omega:       omega,
+		L:           l,
+		GradL:       gradL,
+		Directive:   directive,
+		Rationale:   rationale,
+		ReplanRound: replanRound,
+	})
+}
+
+// PlanDirective writes a plan_directive event capturing the replanning directive
+// issued by GGS to R2, including blocked tools, blocked targets, and failure class.
+//
+// Expectations:
+//   - No-op on nil receiver
+//   - directive, failureClass, and rationale are serialised when non-empty
+//   - blocked_tools and blocked_targets are serialised when non-nil/non-empty
+func (tl *TaskLog) PlanDirective(directive string, blockedTools, blockedTargets []string, failureClass, rationale string) {
+	if tl == nil {
+		return
+	}
+	tl.write(Event{
+		Kind:           KindPlanDirective,
+		Directive:      directive,
+		BlockedTools:   blockedTools,
+		BlockedTargets: blockedTargets,
+		FailureClass:   failureClass,
+		Rationale:      rationale,
+	})
+}
+
+// MemoryQuery writes a memory_query event capturing the MKCT query result
+// used by R2 to calibrate its planning constraints.
+//
+// Expectations:
+//   - No-op on nil receiver
+//   - space and entity are serialised when non-empty
+//   - sop_count, action, attention, decision are serialised
+func (tl *TaskLog) MemoryQuery(space, entity string, sopCount int, action string, attention, decision float64) {
+	if tl == nil {
+		return
+	}
+	tl.write(Event{
+		Kind:      KindMemoryQuery,
+		Space:     space,
+		Entity:    entity,
+		SOPCount:  sopCount,
+		Action:    action,
+		Attention: attention,
+		Decision:  decision,
+	})
+}
+
+// MemoryWrite writes a memory_write event when GGS persists a Megram to R5.
+//
+// Expectations:
+//   - No-op on nil receiver
+//   - state, level, space, and entity are serialised when non-empty
+func (tl *TaskLog) MemoryWrite(state, level, space, entity string) {
+	if tl == nil {
+		return
+	}
+	tl.write(Event{
+		Kind:   KindMemoryWrite,
+		State:  state,
+		Level:  level,
+		Space:  space,
+		Entity: entity,
+	})
 }
 
 // write appends one JSON line to the task log file. Adds timestamp, mutex-protected.
