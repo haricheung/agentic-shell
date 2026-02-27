@@ -3,7 +3,7 @@
 **Version**: 0.8
 **Status**: Production
 **Date**: 2026-02-27
-**Authors**: artoo engineering team
+**Authors**: Hari Cheung
 
 [toc]
 
@@ -11,7 +11,7 @@
 
 ## Abstract
 
-artoo is a multi-agent system for autonomous task execution on a local machine. A user submits a natural-language request; artoo decomposes it into subtasks, executes them in parallel or in sequence, validates each result against machine-checkable criteria, and replans when the result falls short — all without human intervention. The central innovation is a dual nested control loop borrowed from classical control theory: a fast inner loop (Executor + Agent-Validator) handles per-subtask correction in real time, while a slow outer loop (Goal Gradient Solver) computes a loss function over the full task outcome and issues mathematically grounded replanning directives. Experience from every task is encoded as Megrams and stored in the MKCT cognitive memory pyramid, which the Planner queries before each new task to exploit past successes and avoid past failures.
+artoo is a multi-agent system for autonomous task execution on a local machine. A user submits a natural-language request; artoo decomposes it into subtasks, executes them in parallel or in sequence, validates each result against machine-checkable criteria, and replans when the result falls short — all without human intervention. The central innovation is a dual nested control loop borrowed from classical control theory: a fast inner loop (Executor + Agent-Validator) handles per-subtask correction in real time, while a slow outer loop (Goal Gradient Solver — **GGS**) computes a loss function over the full task outcome and issues mathematically grounded replanning directives. Experience from every task is encoded as Megrams and stored in the **MKCT** (Megram / Knowledge / Common Sense / Thinking) cognitive memory pyramid, which the Planner queries before each new task to exploit past successes and avoid past failures.
 
 ---
 
@@ -35,7 +35,7 @@ The system's control structure is a single closed-loop pattern — **decision �
 
 These are not three separate mechanisms. The separation of scales ensures fast retries do not flood the planner, and system-level consolidation does not block execution.
 
-### 3. GGS as Dynamic-Differential Controller
+### 3. GGS (Goal Gradient Solver) as Dynamic-Differential Controller
 
 The GGS is the controller in the medium loop — not a replanner. The distinction is structural:
 
@@ -79,7 +79,7 @@ This is a first-class architectural constraint, not an infrastructure detail. It
 
 ### 8. Cognitive Memory Substrate
 
-Raw task experience is encoded as Megrams — atomic tuples carrying a magnitude (f), valence (σ), and decay rate (k). Megrams accumulate in a LevelDB store keyed by (space, entity) tags. The Planner queries two convolution channels before each task: the Attention channel (unsigned energy — where to look) and the Decision channel (signed preference — what to do). Above a significance threshold, the Dreamer background engine promotes clusters of Megrams into timeless Common Sense (C-level) SOPs and demotes stale ones via Trust Bankruptcy. The memory layer never blocks the operational path — all writes are fire-and-forget.
+Raw task experience is encoded as Megrams — atomic tuples carrying a magnitude (f), valence (σ), and decay rate (k). Megrams accumulate in a LevelDB store keyed by (space, entity) tags. The Planner queries two convolution channels before each task: the Attention channel (unsigned energy — where to look) and the Decision channel (signed preference — what to do). Above a significance threshold, the Dreamer background engine promotes clusters of Megrams into timeless Common Sense (C-level) SOPs (Standard Operating Procedures) and demotes stale ones via Trust Bankruptcy. The memory layer never blocks the operational path — all writes are fire-and-forget.
 
 ### 9. The Four Laws
 
@@ -101,7 +101,7 @@ The system must not degrade its own ability to function across tasks: convergenc
 
 Every architectural decision is evaluated against exactly two costs:
 
-- **Time cost** — latency felt by the user. Dominated by the count of *sequential* LLM calls in the critical path. Parallel calls add token cost but not time cost. The minimum sequential chain is: R1 → R2 → R3 → R4a → R4b = 5 calls. Each fast-loop retry adds 2 (R3 + R4a). Each replan adds 2 more (R2 + R4b).
+- **Time cost** — latency felt by the user. Dominated by the count of *sequential* LLM (Large Language Model) calls in the critical path. Parallel calls add token cost but not time cost. The minimum sequential chain is: R1 → R2 → R3 → R4a → R4b = 5 calls. Each fast-loop retry adds 2 (R3 + R4a). Each replan adds 2 more (R2 + R4b).
 - **Token cost** — API cost and context window pressure. Dominated by context size per call multiplied by parallel call count. N subtasks dispatched in parallel = N × context tokens simultaneously.
 
 The tension: parallelism reduces time cost but multiplies token cost. Every "inject more context" decision has an explicit cost to justify. Every design decision in this system should be able to answer: *does this add a sequential LLM call, and how many tokens does it add per call?* If both answers are "none", the decision is cost-free.
@@ -168,7 +168,7 @@ All inter-role communications must pass through a shared message bus that the Au
 
 ### Input Contract
 
-- Free-form text from the user (REPL or one-shot CLI)
+- Free-form text from the user (REPL — Read-Eval-Print Loop — or one-shot CLI — Command-Line Interface)
 - Rolling session history: last 5 `{input, result.Summary}` pairs
 
 ### Output Contract
@@ -302,7 +302,7 @@ ExecutionResult {
 | 4 | `applescript` | Control macOS apps (Mail, Calendar, Reminders, Music, etc.). |
 | 5 | `shortcuts` | Run a named Apple Shortcut (iCloud-synced). |
 | 6 | `shell` | General bash for counting, aggregation, or operations not covered above. |
-| 7 | `search` | Web search (DuckDuckGo by default; Google Custom Search when API key is set). |
+| 7 | `search` | Web search (DuckDuckGo by default; Serper.dev when `SERPER_API_KEY` is set). |
 
 ### Skills
 
@@ -423,7 +423,7 @@ ReplanRequest {
 
 **Loop position**: Infrastructure layer. Written to by GGS (R7); read by Planner (R2).
 
-### The MKCT Pyramid
+### The MKCT Pyramid (Megram · Knowledge · Common Sense · Thinking)
 
 ```
 [ UPWARD FLOW ]                                               [ DOWNWARD FLOW ]
@@ -476,7 +476,7 @@ ReplanRequest {
 | Layer | Name | Decay k | Description |
 |---|---|---|---|
 | M | Megram | per Quantization Matrix | Raw episodic fact; default layer on creation |
-| K | Knowledge | same as M | Task-scoped cache; pruned by Dreamer GC |
+| K | Knowledge | same as M | Task-scoped cache; pruned by Dreamer GC (Garbage Collector) |
 | C | Common Sense | 0.0 (timeless) | Promoted SOP or Constraint; LLM-distilled from M clusters |
 | T | Thinking | 0.0 (timeless) | System persona and Agent Laws; hardcoded in system prompt |
 
@@ -534,7 +534,7 @@ Runs as a background goroutine on a 5-minute timer. Never blocks the operational
 
 ### Storage: LevelDB
 
-Pure Go (syndtr/goleveldb), no CGO. Append-only event sourcing.
+Pure Go (syndtr/goleveldb), no CGO (C interop). Append-only event sourcing.
 
 Key schema (single-char prefix + `|` separator):
 ```
