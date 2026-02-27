@@ -3,6 +3,7 @@
 !.env.example
 .DS_Store
 *.png
+!docs/architecture.png
 
 # Binaries
 /artoo
