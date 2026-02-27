@@ -17,21 +17,94 @@ artoo is a multi-agent system for autonomous task execution on a local machine. 
 
 ## Design Principles
 
-### 1. Observable Message Bus
+### 1. Omniscience Replaces Negotiation
 
-All communication between roles passes through a single shared message bus. No role may call another directly. This constraint has two consequences: (a) every inter-role message is an observable event, so the Auditor can tap the bus read-only and detect boundary violations, correction storms, and convergence failures without instrumenting individual roles; (b) roles are fully decoupled — any role can be replaced, upgraded, or tested in isolation as long as it speaks the same message protocol.
+Human organizations negotiate because information is distributed — each member sees only their slice. This system eliminates that asymmetry entirely. The Metaagent is omniscient within its operational scope: it authored every subtask, holds the complete TaskSpec, observes every CorrectionSignal accumulating in the fast loop, receives every SubTaskOutcome with its full evidence trail, and has access to all prior memory. There is nothing to negotiate.
 
-### 2. Dual Nested Control Loops
+The consequence: replanning cycles are not about aligning partial views — they are **iterative discovery of what reality allows**. The plan is a hypothesis. Execution tests it against the real world. The gap signal is the reality check. This is a deliberate divergence from the biological model: the loop structure (decision → execution → correction) is borrowed; the communication patterns within the loop are not. Omniscience makes precise gradient computation possible and eliminates the need for peer-to-peer coordination entirely.
 
-The system runs two feedback loops simultaneously, nested inside each other:
+### 2. Nested Feedback Loops — One Pattern at Three Scales
 
-The **fast loop** (milliseconds) runs inside each Effector Agent. The Executor (R3) is the plant; the Agent-Validator (R4a) is the sensor and controller. R4a scores R3's output against per-subtask criteria and sends a CorrectionSignal back to R3 if the result falls short. This loop retries up to `maxRetries` times and terminates with a SubTaskOutcome.
+The system's control structure is a single closed-loop pattern — **decision → execution → correction** — instantiated at three nested scales simultaneously:
 
-The **medium loop** (seconds to minutes) runs inside the Metaagent. The Effector Agents collectively form the plant; Meta-Validator (R4b) is the sensor; Goal Gradient Solver (R7) is the controller; Planner (R2) is the actuator. R4b merges subtask outcomes and either accepts the result or sends a ReplanRequest to R7. R7 computes a loss function L(D, P, Ω) and its gradient ∇L, selects a macro-state from a 6-state decision table, and issues a PlanDirective to R2. R2 replans under the directive's hard constraints. The loop runs up to `maxReplans` rounds.
+| Scale | Decision | Execution | Correction | Criterion |
+|---|---|---|---|---|
+| Fast (action) | Agent-Validator issues retry feedback | Executor re-runs | Agent-Validator re-measures gap | Sub-task success criteria |
+| Medium (task) | Goal Gradient Solver adjusts plan | Planner re-dispatches | Meta-Validator re-merges outcomes | User intent within plausible range |
+| Slow (system) | Dreamer synthesizes new strategy | Next task planning | Next Meta-Validator cycle | Long-term quality across tasks |
 
-### 3. Cognitive Memory Substrate
+These are not three separate mechanisms. The separation of scales ensures fast retries do not flood the planner, and system-level consolidation does not block execution.
+
+### 3. GGS as Dynamic-Differential Controller
+
+The GGS is the controller in the medium loop — not a replanner. The distinction is structural:
+
+- A **replanner** reacts to the current failure snapshot and generates a new plan from scratch. It has no memory of how it got here.
+- A **dynamic-differential controller** maintains a history of gap measurements across correction cycles. It computes the trajectory of the gap — shrinking, stable, or growing — and scales corrections by both the current error and its rate of change.
+
+The gradient the GGS produces must preserve three properties:
+1. **Directional** — names *what* to change and *in what direction*, not merely that something failed
+2. **Compositional** — multiple subtask failures aggregated into one gradient (omniscience makes this possible)
+3. **History-aware** — a criterion failing identically across all attempts generates a stronger gradient than one that varies, distinguishing systematic wrong assumptions from transient environmental failures
+
+An implementation that produces a gradient without direction is a replanner. An implementation that ignores trajectory is a static replanner. Both lose the property that gives the GGS adaptive behavior.
+
+Formally: GGS is the controller; Meta-Validator is the sensor; Planner is the actuator; Effector Agents are the plant. The convergence kill-switch (2× consecutive worsening → force `abandon`) enforces Law 2: continuing beyond the divergence point is resource destruction, not best effort.
+
+### 4. Validation as the Primary Control Mechanism
+
+There is no separate retry policy, timeout manager, or error handler. The Agent-Validator's gap measurement **is** the retry criterion. If the gap is non-zero, execution continues. If the gap cannot be closed, the outcome is reported as failed and the Meta-Validator decides what to do. This ensures the retry criterion never drifts from the success criterion — they are the same signal.
+
+### 5. Independent Auditor with a Separate Principal
+
+The Auditor's principal is the human operator, not any agent. This is a structural property, not an access-control setting. An auditor that can be instructed by the Planner is a subordinate with a reporting function, not an auditor.
+
+Two properties must hold unconditionally:
+- **Non-participation**: the Auditor never sends messages to any agent. The moment it issues a correction it becomes a second controller and breaks the loop structure.
+- **Immutable isolated log**: the audit log is separate from Shared Memory. No agent can read, modify, or suppress it.
+
+The operational feedback loops are self-contained by design — efficient, but producing a structural blind spot about the system's own behavior. The Auditor is the deliberate compensation: it provides the external view that the loops cannot provide about themselves.
+
+### 6. Centralized Shared Memory
+
+One persistent store rather than per-agent private memories. The choice follows directly from the ephemerality of Effector Agents: a private memory for an agent spawned fresh per subtask and terminated on completion is meaningless — there is no persistent identity to accumulate knowledge into. Centralized memory also prevents the O(n²) reconciliation problem: if N agents hold diverging private stores, aligning them requires N² comparisons and an arbitration mechanism. One shared store with one Dreamer for reorganization avoids this entirely.
+
+Effector Agents never query Shared Memory directly. Access is **indirect**: R2 reads and calibrates memory at planning time, then injects the relevant context into each `SubTask.context` before dispatch. A direct memory query by an Executor would create an unobservable information path and duplicate calibration logic that belongs to R2.
+
+### 7. Observable Message Bus
+
+All communication between roles passes through a single shared message bus. No role may call another directly. This ensures: (a) every inter-role message is an observable event — the Auditor can tap the bus read-only without instrumenting individual roles; (b) roles are fully decoupled and independently testable; (c) the bus is non-blocking — slow subscribers drop messages rather than exerting back-pressure on publishers.
+
+This is a first-class architectural constraint, not an infrastructure detail. It must be established before any role is implemented. Retrofitting observability after point-to-point calls are in place requires restructuring the entire communication layer.
+
+### 8. Cognitive Memory Substrate
 
 Raw task experience is encoded as Megrams — atomic tuples carrying a magnitude (f), valence (σ), and decay rate (k). Megrams accumulate in a LevelDB store keyed by (space, entity) tags. The Planner queries two convolution channels before each task: the Attention channel (unsigned energy — where to look) and the Decision channel (signed preference — what to do). Above a significance threshold, the Dreamer background engine promotes clusters of Megrams into timeless Common Sense (C-level) SOPs and demotes stale ones via Trust Bankruptcy. The memory layer never blocks the operational path — all writes are fire-and-forget.
+
+### 9. The Four Laws
+
+Priority is strict: a lower law may never override a higher one.
+
+**Law 0 — Never deceive** *(highest priority)*
+The system must never misrepresent what it actually did or achieved. This sits above all other laws because deception destroys the feedback signal that all three loops depend on: a system that fabricates success learns the wrong lesson, corrupts memory, and makes the next task harder. Honesty is non-negotiable even when the honest answer is "I failed."
+
+**Law 1 — Never harm the user's environment without explicit confirmation**
+The system must not take irreversible actions on the user's data or environment without the user explicitly authorizing that specific action. Reversible actions (reading files, running queries, creating new files) do not require confirmation.
+
+**Law 2 — Best effort delivery** *(subject to Laws 0 and 1)*
+The system must pursue the user's goal as hard as possible within the bounds set by Laws 0 and 1. Stop when gap_trend is worsening for 2 consecutive replans — continuing is not best effort, it is resource destruction with no convergence signal.
+
+**Law 3 — Preserve own functioning capacity** *(subject to Laws 0, 1, and 2)*
+The system must not degrade its own ability to function across tasks: convergence integrity (stop on divergence), memory integrity (never write a MemoryEntry that misattributes failure cause), and cost integrity (respect the time and token cost model).
+
+### 10. Cost Model: Two Costs Only
+
+Every architectural decision is evaluated against exactly two costs:
+
+- **Time cost** — latency felt by the user. Dominated by the count of *sequential* LLM calls in the critical path. Parallel calls add token cost but not time cost. The minimum sequential chain is: R1 → R2 → R3 → R4a → R4b = 5 calls. Each fast-loop retry adds 2 (R3 + R4a). Each replan adds 2 more (R2 + R4b).
+- **Token cost** — API cost and context window pressure. Dominated by context size per call multiplied by parallel call count. N subtasks dispatched in parallel = N × context tokens simultaneously.
+
+The tension: parallelism reduces time cost but multiplies token cost. Every "inject more context" decision has an explicit cost to justify. Every design decision in this system should be able to answer: *does this add a sequential LLM call, and how many tokens does it add per call?* If both answers are "none", the decision is cost-free.
 
 ---
 
