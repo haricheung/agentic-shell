@@ -35,7 +35,7 @@ The system's control structure is a single closed-loop pattern — **decision �
 
 These are not three separate mechanisms. The separation of scales ensures fast retries do not flood the planner, and system-level consolidation does not block execution.
 
-### 3. GGS (Goal Gradient Solver) as Dynamic-Differential Controller
+### 3. Goal Gradient Solver (GGS) as Dynamic-Differential Controller
 
 The GGS is the controller in the medium loop — not a replanner. The distinction is structural:
 
