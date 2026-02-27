@@ -110,6 +110,10 @@ The tension: parallelism reduces time cost but multiplies token cost. Every "inj
 
 ## System Architecture
 
+![artoo system architecture](../architecture.png)
+
+The diagram shows the full operational flow. The **user** submits a task to the **Perceiver** (感知器), which forwards a structured goal to the **Metaagent** (规划器). Inside the Metaagent, the Planner decomposes the goal and fans it out as numbered subtasks (intent · criteria · context) to N parallel **Effector Agents** (效应器). Each Effector Agent runs its own internal fast loop — Executor → Validator → Dreamer — and returns phase feedback (partial results or uncertainty signals) upward to the Metaagent. The Metaagent's Meta-Validator and **GGS** (目标梯度求解器) evaluate the aggregate outcome, adjust the plan if needed, and eventually deliver the final result back to the user. **Shared Memory** (共享记忆体) sits above the hierarchy: both the Metaagent and the Effector Agents read from it (获取记忆 — fetch memory) and write back to it asynchronously via their Dreamer components (重整记忆 — consolidate memory).
+
 ```
 FAST LOOP (inside each Effector Agent)
 ┌─────────────────────────────────────────┐
