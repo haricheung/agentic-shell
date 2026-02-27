@@ -112,7 +112,7 @@ Effector Agent 从不直接查询 Shared Memory。访问是**间接的**：R2 �
 
 ![artoo 系统架构图](architecture.png)
 
-图示展示了完整的操作数据流。**用户**提交任务至 **Perceiver**，Perceiver 将结构化目标转发给 **Planner（Metaagent）**。Metaagent 内部，规划调度将目标分解并以编号子任务（意图 · 指标 · 上下文）的形式扇出至 N 个并行 **Effector Agent**。每个 Effector Agent 运行其内部快速回路——Executor → 验证器 → Dreamer——并将阶段性反馈（阶段性成果或不确定性信号）向上返回给 Metaagent。Metaagent 中的验证器与 **Goal Gradient Solver（GGS）**评估综合结果，必要时调整任务，最终将最终结果反馈给用户。**Shared Memory** 位于层级顶端：Metaagent 和 Effector Agent 均可读取（获取记忆），并通过各自的 Dreamer 异步写回（重整记忆）。
+图示展示了完整的操作数据流。**用户**提交任务至 **Perceiver**，Perceiver 将结构化目标转发给 **Planner（Metaagent）**。Metaagent 内部，规划调度将目标分解并以编号子任务（意图 · 指标 · 上下文）的形式扇出至 N 个并行 **Effector Agent**。每个 Effector Agent 运行其内部快速回路——Executor → Validator → Dreamer——并将阶段性反馈（阶段性成果或不确定性信号）向上返回给 Metaagent。Metaagent 中的 Meta-Validator 与 **Goal Gradient Solver（GGS）**评估综合结果，必要时调整任务，最终将最终结果反馈给用户。**Shared Memory** 位于层级顶端：Metaagent 和 Effector Agent 均可读取（获取记忆），并通过各自的 Dreamer 异步写回（重整记忆）。
 
 ```
 FAST LOOP (inside each Effector Agent)
