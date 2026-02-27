@@ -2462,3 +2462,16 @@ Operator had no user-facing way to see how many Megrams are stored per level (M/
 **Root cause**: R4a's prompt said "trust tool output as primary evidence" but did not forbid granting `met=true` based solely on R3's `output` prose when `tool_calls` contradicted it. The `tool_calls` clearly showed yt-dlp truncated with no "100%" line, and the only mp4 found was a post-hoc `ls` of a stale file. R4a had all the evidence to reject the claim but lacked an explicit rule to cross-check it.
 
 **Fix**: Added "Evidence grounding rule" to R4a system prompt: (1) `output` is R3's own claim — treat as a CLAIM, not fact; (2) `tool_calls` is the ground truth; (3) if `output` claims success but the primary action's `tool_call` entry shows interruption/error/truncation with no completion signal → contradiction → retry; (4) post-hoc verification (ls/find/stat) after a failed primary action does not prove the primary action succeeded.
+
+---
+
+## Issue #90 — Executor burns all 10 LLM iters on a stuck search loop
+
+**Symptom**
+R3 called `search "Elon Musk X Twitter February 27 2026"` on iter 1, got results that didn't satisfy criteria, then repeated the identical call on iters 2–10. The existing loop detector blocked each duplicate but only injected a warning — the model ignored it and kept retrying, wasting 9 LLM API calls before exhausting `maxToolCalls`.
+
+**Root cause**
+The consecutive-duplicate check fires correctly on every repeated call, but after the block it issues a `continue` — meaning the loop re-runs, makes another LLM call, gets the same tool call, and blocks it again indefinitely. The `⚠️ DUPLICATE CALL BLOCKED` warning in the prompt context was insufficient to break the model out of the stuck state.
+
+**Fix**
+Added `consecutiveDuplicates` counter to the executor tool-call loop. On the first duplicate the existing warning is injected as before (one chance to recover). If the model makes the same call again (second consecutive duplicate) the subtask is immediately terminated with `status: "failed"` — avoiding the remaining budget burn. The counter resets to 0 on any non-duplicate call.

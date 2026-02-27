@@ -229,6 +229,7 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 
 	var toolCallHistory []string
 	var toolResultsCtx strings.Builder
+	consecutiveDuplicates := 0
 
 	const maxToolCalls = 10
 	for i := 0; i < maxToolCalls; i++ {
@@ -278,16 +279,27 @@ func (e *Executor) execute(ctx context.Context, st types.SubTask, correction *ty
 		detail := tc.Command + tc.Path + tc.Query + tc.Pattern + tc.Name + firstN(tc.Script, 40)
 		currentSig := tc.Tool + ":" + firstN(detail, 60)
 
-		// Loop detection: identical consecutive call produces identical output — skip
-		// execution and inject a hard stop so the LLM must either output a final result
-		// or try a genuinely different tool/query.
+		// Loop detection: identical consecutive call → block execution and warn the LLM.
+		// After 2 consecutive blocked duplicates the model is irrecoverably stuck;
+		// fail the subtask immediately to avoid burning the remaining LLM budget.
 		if len(toolCallHistory) > 0 && currentSig == toolCallHistory[len(toolCallHistory)-1] {
-			slog.Warn("[R3] loop detected: identical call blocked", "tool", tc.Tool, "iter", i+1)
+			consecutiveDuplicates++
+			slog.Warn("[R3] loop detected: identical call blocked", "tool", tc.Tool, "iter", i+1, "consecutive", consecutiveDuplicates)
+			if consecutiveDuplicates >= 2 {
+				slog.Warn("[R3] hard loop kill: 2 consecutive duplicates, failing subtask", "tool", tc.Tool)
+				return types.ExecutionResult{
+					SubTaskID: st.SubTaskID,
+					Status:    "failed",
+					Output:    fmt.Sprintf("executor loop: [%s] called with identical parameters %d times consecutively; no progress possible", tc.Tool, consecutiveDuplicates+1),
+					ToolCalls: toolCallHistory,
+				}, toolCallHistory, nil
+			}
 			toolResultsCtx.WriteString(fmt.Sprintf(
 				"\n⚠️ DUPLICATE CALL BLOCKED: [%s] was already called with identical parameters — repeated calls return identical results and waste budget. You MUST now either:\n1. Output the final result using what you already have (even if partial), OR\n2. Use a COMPLETELY DIFFERENT query, tool, or approach.\nDo NOT repeat this call.\n",
 				tc.Tool))
 			continue
 		}
+		consecutiveDuplicates = 0
 
 		toolCallHistory = append(toolCallHistory, currentSig)
 
