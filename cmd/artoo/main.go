@@ -504,33 +504,91 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 		}
 	}()
 
+	// rlResult carries one readline result (line + error).
+	type rlResult struct {
+		line string
+		err  error
+	}
+
+	// rlCh is fed by a dedicated goroutine — the ONLY caller of rl.Readline().
+	// Isolating reads here lets the main loop add a short paste-detection window
+	// without risking concurrent access to the readline instance.
+	rlCh := make(chan rlResult, 32)
+	go func() {
+		for {
+			line, err := rl.Readline()
+			rlCh <- rlResult{line, err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// pending buffers one rlResult that arrived during paste accumulation but
+	// could not be consumed yet (e.g. an error that surfaced mid-paste).
+	var pending *rlResult
+	readLine := func() rlResult {
+		if pending != nil {
+			r := *pending
+			pending = nil
+			return r
+		}
+		return <-rlCh
+	}
+
 	for {
-		// readline handles: backspace, arrow keys, Ctrl+A/E, history (↑↓), Unicode/CJK.
-		line, err := rl.Readline()
-		if err == readline.ErrInterrupt {
-			// Ctrl+C while idle (no task running) — first press warns, close loop exits.
+		r := readLine()
+
+		if r.err == readline.ErrInterrupt {
+			// Ctrl+C while idle (no task running) — first press warns, second exits.
 			fmt.Println("\n\033[2m(Ctrl+C again or type 'exit' to quit)\033[0m")
-			line2, err2 := rl.Readline()
-			if err2 == readline.ErrInterrupt || strings.TrimSpace(line2) == "exit" || strings.TrimSpace(line2) == "quit" {
+			r2 := readLine()
+			if r2.err == readline.ErrInterrupt || strings.TrimSpace(r2.line) == "exit" || strings.TrimSpace(r2.line) == "quit" {
 				cancel()
 				return
 			}
-			line = line2
-			err = err2
+			r = r2
 		}
-		if err != nil {
+		if r.err != nil {
 			// io.EOF (Ctrl+D) or other error → exit cleanly
 			cancel()
 			break
 		}
 
-		input := strings.TrimSpace(line)
+		input := strings.TrimSpace(r.line)
 		if input == "" {
 			continue
 		}
 		if input == "exit" || input == "quit" {
 			cancel()
 			break
+		}
+
+		// Paste detection: lines arriving within 50 ms of each other are joined into
+		// one multi-line task. Paste arrives in <1 ms; manual typing is always >100 ms
+		// between lines. Skip when the line opens """ mode (it has its own accumulation).
+		if input != `"""` {
+			timer := time.NewTimer(50 * time.Millisecond)
+			collected := []string{input}
+		pasteLoop:
+			for {
+				select {
+				case r2 := <-rlCh:
+					if r2.err != nil {
+						r2c := r2
+						pending = &r2c // surface the error on the next main-loop iteration
+						break pasteLoop
+					}
+					timer.Reset(50 * time.Millisecond)
+					collected = append(collected, r2.line)
+				case <-timer.C:
+					break pasteLoop
+				}
+			}
+			timer.Stop()
+			if len(collected) > 1 {
+				input = strings.TrimSpace(strings.Join(collected, "\n"))
+			}
 		}
 
 		// Multi-line mode: type `"""` on its own to open/close a multi-paragraph block.
@@ -541,19 +599,19 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			var lines []string
 			aborted := false
 			for {
-				mline, merr := rl.Readline()
-				if merr == readline.ErrInterrupt {
+				r2 := readLine()
+				if r2.err == readline.ErrInterrupt {
 					aborted = true
 					break
 				}
-				if merr != nil {
+				if r2.err != nil {
 					cancel()
 					return
 				}
-				if strings.TrimSpace(mline) == `"""` {
+				if strings.TrimSpace(r2.line) == `"""` {
 					break
 				}
-				lines = append(lines, mline)
+				lines = append(lines, r2.line)
 			}
 			rl.SetPrompt("\033[36m>\033[0m ")
 			if aborted || len(lines) == 0 {
@@ -605,11 +663,12 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			// A \n inside SetPrompt causes readline to miscalculate cursor position and
 			// reprint the question line on every internal redraw, flooding the terminal.
 			fmt.Printf("\033[33m?\033[0m %s\n", question)
-			ans, err := rl.Readline()
-			if err != nil {
+			// Use readLine() so the readline goroutine remains the sole rl.Readline() caller.
+			r := readLine()
+			if r.err != nil {
 				return "", fmt.Errorf("no input")
 			}
-			return strings.TrimSpace(ans), nil
+			return strings.TrimSpace(r.line), nil
 		}
 
 		disp.Resume() // lift post-abort suppression before the new pipeline starts

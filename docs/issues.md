@@ -2465,6 +2465,17 @@ Operator had no user-facing way to see how many Megrams are stored per level (M/
 
 ---
 
+## Issue #91 — Pasting multi-line text fires each line as a separate command
+
+**Symptom**
+Pasting multiple lines into the REPL caused each physical line to be submitted as an independent command. For example, pasting a three-sentence task description would trigger three separate pipeline runs, each seeing only one sentence.
+
+**Root cause**
+`rl.Readline()` returns one line at a time. When the terminal receives a paste, all bytes arrive in the TTY buffer at once; readline buffers them internally and returns them one-by-one on successive calls. Each iteration of the REPL `for` loop consumed one line and dispatched it immediately, with no way to know more lines were already buffered.
+
+**Fix**
+Moved `rl.Readline()` to a dedicated goroutine that feeds a buffered channel (`rlCh`). The main loop reads from the channel and, after receiving the first line, opens a 50 ms accumulation window: additional lines arriving within 50 ms are joined with `\n` into a single input. Paste content arrives in <1 ms; manual typing between lines is always >100 ms. The `clarifyFn` closure was also updated to read from `readLine()` instead of calling `rl.Readline()` directly, preventing any concurrent access to the readline instance.
+
 ## Issue #90 — Executor burns all 10 LLM iters on a stuck search loop
 
 **Symptom**
