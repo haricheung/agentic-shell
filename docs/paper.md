@@ -74,7 +74,7 @@ The MKCT pyramid's dual-channel convolution — separating attention (unsigned s
 
 **Figure 1** shows the complete operational architecture. The message bus is the substrate through which every inter-role message flows; the Auditor taps it read-only. The Metaagent box encloses the three coordinating roles (R2, R4b, R7); N Effector Agent boxes each contain one Executor–Validator fast loop. Shared Memory (R5) sits outside both, written exclusively by R7 and read exclusively by R2.
 
-```
+<pre style="page-break-before: always; page-break-inside: avoid; break-before: always; break-inside: avoid; font-size: 6.5pt; line-height: 1.12; font-family: 'Courier New', Courier, monospace; background: #f8f9fa; border: 1px solid #ddd; border-radius: 3px; padding: 6pt 10pt; margin: 8pt 0; overflow: hidden; white-space: pre;">
 Figure 1: artoo Full Architecture
 
 ┌───────────────────────────────── MESSAGE BUS ──────────────────────────────────────┐
@@ -142,7 +142,7 @@ Figure 1: artoo Full Architecture
 └───────────────────────────────────────────────────────────────────────────────────┘
 
 Legend:  ══╗ Metaagent boundary   ──► message flow   ↕ bidirectional (fast loop)
-```
+</pre>
 
 ### 3.1 Roles and Hierarchy
 
@@ -376,9 +376,9 @@ The Caution action captures high-variance tools: an approach with both major suc
 
 Before generating a plan, R2 executes a deterministic calibration protocol with no LLM call:
 
-1. **Derive tags**: `space = IntentSlug(intent)`, `entity = "env:local"`
-2. **QueryC** → `[]SOPRecord`: C-level timeless SOPs for this (space, entity) pair; updates `last_recalled_at` on each hit (resetting decay)
-3. **QueryMK** → `Potentials{Attention, Decision, Action}`: live dual-channel convolution at current time
+1. **Derive tags**: space = slug derived from task intent; entity = local environment identifier
+2. **QueryC** — retrieve C-level timeless SOPs for this (space, entity) pair; each hit resets the entry's decay clock
+3. **QueryMK** — compute live dual-channel convolution potentials: Attention, Decision, and the resulting Action signal
 4. **Map Action → constraint**: Exploit → SHOULD PREFER; Avoid → MUST NOT; Caution → CAUTION; Ignore → omit
 5. **Append C-level SOPs**: $\sigma > 0$ → SHOULD PREFER; $\sigma \leq 0$ → MUST NOT
 6. **Merged MUST NOT set**: memory Avoid SOPs ∪ GGS `blocked_tools` ∪ GGS `blocked_targets`
@@ -445,7 +445,7 @@ The Auditor's design is modelled on project management oversight principles: a P
 - **Convergence failures**: gap trend not improving across correction cycles; the system is thrashing rather than converging
 - **Role drift**: systematic degradation in a role's behavior over time, undetectable from any single event
 
-R6 accumulates window statistics per 5-minute report period (`tasks_observed`, `total_corrections`, `gap_trends`, `boundary_violations`, `drift_alerts`, `anomalies`) and resets them after each report. An on-demand audit command (`/audit`) is available in the REPL; the Auditor responds within 3 seconds.
+R6 accumulates window statistics per 5-minute report period — task count, correction count, gap trends, boundary violations, drift alerts, and anomalies — and resets them after each report. An on-demand audit command is available in the REPL; the Auditor responds within 3 seconds.
 
 ---
 
@@ -484,7 +484,7 @@ The tension: parallelism reduces time cost but multiplies token cost. Decisions 
 | Memory calibration in Go code (no LLM call) | Zero | Zero | No LLM call added |
 | Memory entries capped at 10 | Zero | Bounded | No unbounded context growth |
 | Subtask parallelism | Fixed regardless of N | N × context | Time cost does not scale with subtask count |
-| `headTail(output, 4000)` | Zero | Bounded per result | Model sees start + end of long outputs |
+| Output head+tail truncation (4 KB limit) | Zero | Bounded per result | Model sees start + end of long outputs |
 | Calibration output as pre-formatted text | Zero | Small | No extra LLM call for formatting |
 
 ---
@@ -505,7 +505,7 @@ The Executor follows a deterministic tool priority chain:
 6. `shell` — general bash for counting and aggregation
 7. `search` — DuckDuckGo web search (always available; no API key required)
 
-The priority chain is enforced at the prompt level but also defended at the code level: `shell find` commands targeting personal paths are transparently redirected to `mdfind`; `-maxdepth` flags are stripped; tool results exceeding 4000 characters are truncated to first + last using `headTail()`.
+The priority chain is enforced at the prompt level but also defended in code: shell find commands targeting personal paths are transparently redirected to the Spotlight index; depth-limiting flags are stripped; tool results exceeding 4 KB are truncated to first + last, preserving both leading context and final output.
 
 ### 11.2 Model Tier Split
 
@@ -518,7 +518,7 @@ Both tiers fall back to shared `OPENAI_*` variables, allowing single-model deplo
 
 ### 11.3 Per-Task Decision Log
 
-Every key decision event is persisted to a per-task JSONL file at `~/.artoo/tasks/<task_id>.jsonl`. Event kinds include: `task_begin/end`, `subtask_begin/end`, `llm_call` (with full prompts for offline replay), `tool_call`, `criterion_verdict`, `correction`, `replan`, `ggs_decision` (D, P, Ω, L, ∇L, directive), `plan_directive` (blocked_tools, blocked_targets, failure_class), `memory_query` (space, entity, SOP count, action, potentials), and `memory_write` (state, level, space, entity).
+Every key decision event is persisted to a per-task structured log. Event kinds span the full lifecycle: task and subtask boundaries, LLM calls (with full prompts for offline replay), tool calls, criterion verdicts, corrections, replans, GGS decisions (D, P, Ω, L, ∇L, directive), plan directives (blocked tools and targets, failure class), memory queries (space, entity, SOP count, action, potentials), and memory writes (state, level, space, entity).
 
 This log provides full post-hoc auditability: every GGS decision, every memory interaction, and every correction can be replayed offline without re-running the task.
 
