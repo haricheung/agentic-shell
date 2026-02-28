@@ -16,6 +16,8 @@ Third, the **MKCT cognitive memory pyramid** (Megram · Knowledge · Common Sens
 
 Together, these mechanisms produce a system whose replanning is gradient-directed, whose memory is decay-weighted and self-organizing, and whose oversight is structurally guaranteed by a lateral Auditor whose principal is exclusively the human operator.
 
+**Keywords**: multi-agent systems, large language models, autonomous agents, goal gradient optimization, hierarchical control, plan correction, cognitive memory, episodic-to-semantic consolidation, dual-channel convolution, behavioral constraints
+
 ---
 
 ## 1. Introduction
