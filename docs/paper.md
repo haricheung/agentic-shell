@@ -70,22 +70,94 @@ The MKCT pyramid's dual-channel convolution — separating attention (unsigned s
 
 ## 3. System Architecture
 
+**Figure 1** shows the complete operational architecture. The message bus is the substrate through which every inter-role message flows; the Auditor taps it read-only. The Metaagent box encloses the three coordinating roles (R2, R4b, R7); N Effector Agent boxes each contain one Executor–Validator fast loop. Shared Memory (R5) sits outside both, written exclusively by R7 and read exclusively by R2.
+
+```
+Figure 1: artoo Full Architecture
+
+┌───────────────────────────────── MESSAGE BUS ──────────────────────────────────────┐
+│  All inter-role messages route through here              ┌──── R6  AUDITOR ──────┐ │
+│                                                          │  read-only bus tap    │ │
+│                                                          │  window stats · JSONL │ │
+│                                                          └──────────┬────────────┘ │
+└──────────────────────────────────────────────────────────────────── │ ─────────────┘
+                                                                       │ AuditReport
+ User                                                          Human Operator
+  │ free text
+  ▼
+ R1  PERCEIVER
+  │ TaskSpec
+  ▼
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                                  METAAGENT                                      ║
+║                                                                                  ║
+║   ┌──────────────────┐   [PlanDirective]    ┌─────────────────────────────┐    ║
+║   │   R2  PLANNER    │◄─────────────────────│          R7  GGS            │    ║
+║   │   (actuator)     │                      │  L = αD + β_eff·P + λΩ     │    ║
+║   │                  │                      │  ∇L = L_t − L_{t−1}        │    ║
+║   │   queries R5 ────┼──SOPs, Potentials◄───┤  → 6 macro-states           │    ║
+║   │   before plan    │                      │                             │    ║
+║   └────────┬─────────┘                      └───────────▲───────────┬─────┘    ║
+║            │                                             │           │ Megrams  ║
+║            │                          ┌──────────────────────────┐  │ (async)  ║
+║            │      ReplanRequest ──────►  R4b  META-VALIDATOR     │  │          ║
+║            │      OutcomeSummary ─────►  fan-in · task_criteria  │──┘          ║
+║            │                          └──────────────────────────┘             ║
+╚════════════│════════════════════════════════════════════════════════════════════╝
+             │ SubTask[] (fan-out · same sequence# = parallel)
+             │                                        ▲ SubTaskOutcome[] (fan-in)
+      ┌──────┴──────────────────────┬─────────────────┴──────────────┐
+      │                             │                                 │
+      │  EFFECTOR AGENT ×1          │  EFFECTOR AGENT ×2          ...│
+      │  ┌──────────────────────┐   │  ┌──────────────────────┐      │
+      │  │   R3  EXECUTOR       │   │  │   R3  EXECUTOR       │      │
+      │  │   (plant)            │   │  │   (plant)            │      │
+      │  └──────────┬───────────┘   │  └──────────┬───────────┘      │
+      │          ↕ CorrectionSignal │           ↕ CorrectionSignal    │
+      │  ┌──────────┴───────────┐   │  ┌──────────┴───────────┐      │
+      │  │  R4a  AGENT-VAL      │   │  │  R4a  AGENT-VAL      │      │
+      │  │  sensor + controller │   │  │  sensor + controller │      │
+      │  └──────────────────────┘   │  └──────────────────────┘      │
+      └─────────────────────────────┴────────────────────────────────┘
+
+┌─────────────────────── R5  SHARED MEMORY  (MKCT PYRAMID) ────────────────────────┐
+│                                                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────────┐   │
+│  │  T   THINKING     k=0.0   Agent Laws · System Persona  (hardcoded)       │   │
+│  ├───────────────────────────────────────────────────────────────────────────┤   │
+│  │  C   COMMON SENSE k=0.0   SOPs · Constraints  ◄── Dreamer consolidation  │   │
+│  ├───────────────────────────────────────────────────────────────────────────┤   │
+│  │  K   KNOWLEDGE    k>0     Task-Scoped Cache                               │   │
+│  ├───────────────────────────────────────────────────────────────────────────┤   │
+│  │  M   MEGRAM       k>0     Atomic Episodic Events  ◄── R7 GGS writes       │   │
+│  └───────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                   │
+│  Channel A   M_att = Σ |fᵢ| · e^(−kᵢΔt)   [Attention — unsigned energy ]       │
+│  Channel B   M_dec = Σ  σᵢfᵢ · e^(−kᵢΔt)  [Decision  — signed preference]      │
+│                                                                 reads ──► R2     │
+│  Dreamer (async, 5-min): GC (M_att < 0.1 → DELETE)                              │
+│                          Trust Bankruptcy (M_dec < 0 → strip k=0.0, demote)     │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+Legend:  ══╗ Metaagent boundary   ──► message flow   ↕ bidirectional (fast loop)
+```
+
 ### 3.1 Roles and Hierarchy
 
 artoo organizes seven roles into two tiers plus one lateral observer:
 
-```
-User input
-  └─ R1 Perceiver          — translates free-form input into structured TaskSpec
-       └─ R2 Planner        — decomposes TaskSpec into subtasks; queries R5 before planning
-            └─ [R3 Executor × N]      — executes one subtask per instance
-                 ↕ CorrectionSignal
-            └─ [R4a Agent-Validator × N] — per-subtask validation + fast retry loop
-                 └─ R4b Meta-Validator — fan-in; evaluates task_criteria; accept or replan
-                      └─ R7 GGS           — computes L, ∇L; selects macro-state; writes R5
-R5 Shared Memory           — MKCT cognitive substrate; serves R2; written by R7
-R6 Auditor                 — lateral observer; reports to human operator; never intervenes
-```
+| ID | Role | Tier | Loop Position |
+|---|---|---|---|
+| R1 | Perceiver | Entry | Reference signal |
+| R2 | Planner | Metaagent | Actuator (medium loop) |
+| R3 | Executor | Effector Agent | Plant (fast loop) |
+| R4a | Agent-Validator | Effector Agent | Sensor + Controller (fast loop) |
+| R4b | Meta-Validator | Metaagent | Sensor (medium loop) |
+| R5 | Shared Memory | Infrastructure | Cognitive substrate |
+| R6 | Auditor | Lateral observer | Outside both loops |
+| R7 | Goal Gradient Solver | Metaagent | Controller (medium loop) |
+
+Each role is defined as a structured Job Description: Responsibilities, Input Contract, Output Contract, Skills, and Constraints — the same format used in organizational management to achieve unambiguous accountability.
 
 ### 3.2 Observable Message Bus
 
