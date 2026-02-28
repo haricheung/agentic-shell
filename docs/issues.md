@@ -2465,6 +2465,17 @@ Operator had no user-facing way to see how many Megrams are stored per level (M/
 
 ---
 
+## Issue #92 — Ctrl+C task abort prints spurious "(Ctrl+C again...)" and corrupts terminal
+
+**Symptom**
+After aborting a running task with Ctrl+C, the REPL immediately printed "(Ctrl+C again or type 'exit' to quit)" and entered a confused state. Subsequent Ctrl+C presses echoed raw `^C` characters to the terminal. The `^[[A` escape sequence (arrow key) and streams of `^C` were visible, and the only recovery was killing the process.
+
+**Root cause**
+The readline goroutine introduced in issue #91 always forwards input events to `rlCh`, including the `ErrInterrupt` it receives when Ctrl+C fires. When a task is aborted, the signal handler cancels the task context (causing `waitResult` to break) AND the readline goroutine simultaneously sends `ErrInterrupt` to `rlCh`. On the next main-loop iteration, `readLine()` picks up this stale `ErrInterrupt` and misinterprets it as an idle Ctrl+C, printing the confirmation prompt — which then waited for a second Ctrl+C to quit, causing the cascade of raw escape output.
+
+**Fix**
+After `waitResult` breaks and `taskCtx.Err() != nil` (abort path), drain one result from `rlCh` with a 200 ms timeout. If it is an `ErrInterrupt`, discard it (it was the task-abort signal). If it is anything else, put it back via `pending` so it is processed normally on the next iteration.
+
 ## Issue #91 — Pasting multi-line text fires each line as a separate command
 
 **Symptom**

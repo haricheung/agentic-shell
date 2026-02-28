@@ -737,6 +737,23 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 		if ctx.Err() != nil {
 			return
 		}
+
+		// When the task was aborted by Ctrl+C (taskCtx.Err() != nil), the readline
+		// goroutine also received the interrupt and forwarded an ErrInterrupt to rlCh.
+		// Drain it here so the next readLine() call doesn't misinterpret the task-abort
+		// Ctrl+C as an idle Ctrl+C and print a spurious "(Ctrl+C again...)" message.
+		if taskCtx.Err() != nil {
+			select {
+			case r2 := <-rlCh:
+				if r2.err != readline.ErrInterrupt {
+					// Not the expected stale interrupt — put it back for next iteration.
+					r2c := r2
+					pending = &r2c
+				}
+			case <-time.After(200 * time.Millisecond):
+				// Nothing queued — nothing to drain.
+			}
+		}
 	}
 }
 
