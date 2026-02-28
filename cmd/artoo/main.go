@@ -434,7 +434,9 @@ func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input strin
 		return ctx.Err()
 	case result := <-resultCh:
 		printResult(result, input)
-		printCostStats(perceiverUsage, logReg.GetStats(result.TaskID))
+		stats := logReg.GetStats(result.TaskID)
+		printDecisionLog(logReg.ReadEvents(result.TaskID))
+		printCostStats(perceiverUsage, stats)
 	}
 	return nil
 }
@@ -653,7 +655,9 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 				// the next task starts. Abort() is a no-op on inTask=false, so no ✗ is shown.
 				disp.Abort()
 				printResult(result, input)
-				printCostStats(perceiverUsage, logReg.GetStats(result.TaskID))
+				stats := logReg.GetStats(result.TaskID)
+				printDecisionLog(logReg.ReadEvents(result.TaskID))
+				printCostStats(perceiverUsage, stats)
 				history = append(history, sessionEntry{Input: input, Summary: result.Summary})
 				if len(history) > maxHistory {
 					history = history[len(history)-maxHistory:]
@@ -812,6 +816,94 @@ func printCostStats(perceiverUsage llm.Usage, stats *tasklog.TaskStats) {
 	}
 
 	printLLMRow("total (LLM)", totalLLMCalls, totalToks, totalLLMMs)
+	fmt.Println()
+}
+
+// printDecisionLog prints a compact summary of memory calibration, GGS decisions,
+// and plan directives from the task JSONL log. Called after each completed task.
+func printDecisionLog(events []tasklog.Event) {
+	// Filter to the three decision-relevant event kinds.
+	var relevant []tasklog.Event
+	for _, e := range events {
+		switch e.Kind {
+		case tasklog.KindMemoryQuery, tasklog.KindGGSDecision, tasklog.KindPlanDirective:
+			relevant = append(relevant, e)
+		}
+	}
+	if len(relevant) == 0 {
+		return
+	}
+
+	const (
+		bold   = "\033[1m"
+		cyan   = "\033[36m"
+		green  = "\033[32m"
+		yellow = "\033[33m"
+		red    = "\033[31m"
+		dim    = "\033[2m"
+		reset  = "\033[0m"
+	)
+
+	fmt.Printf("\n%s%s📐 Decisions%s\n", bold, cyan, reset)
+
+	for _, e := range relevant {
+		switch e.Kind {
+		case tasklog.KindMemoryQuery:
+			actionCol := dim
+			switch e.Action {
+			case "Exploit":
+				actionCol = green
+			case "Avoid":
+				actionCol = red
+			case "Caution":
+				actionCol = yellow
+			}
+			fmt.Printf("  %smemory%s   [%s / %s]  sops=%d  %s%s%s  att=%.2f  dec=%+.2f\n",
+				dim, reset,
+				e.Space, e.Entity, e.SOPCount,
+				actionCol, e.Action, reset,
+				e.Attention, e.Decision)
+
+		case tasklog.KindGGSDecision:
+			dirCol := green
+			if e.Directive == "abandon" {
+				dirCol = red
+			} else if e.Directive == "refine" || e.Directive == "change_path" {
+				dirCol = yellow
+			}
+			gradSign := "+"
+			if e.GradL < 0 {
+				gradSign = ""
+			}
+			round := ""
+			if e.ReplanRound > 0 {
+				round = fmt.Sprintf("  rd=%d", e.ReplanRound)
+			}
+			fmt.Printf("  %sgss%s%s      D=%.2f  P=%.2f  Ω=%.2f  L=%.2f  ∇L=%s%.3f  %s→ %s%s\n",
+				dim, reset, round,
+				e.D, e.P, e.Omega, e.L,
+				gradSign, e.GradL,
+				dirCol, e.Directive, reset)
+
+		case tasklog.KindPlanDirective:
+			parts := []string{}
+			if len(e.BlockedTools) > 0 {
+				parts = append(parts, "tools="+strings.Join(e.BlockedTools, ","))
+			}
+			if len(e.BlockedTargets) > 0 {
+				n := len(e.BlockedTargets)
+				parts = append(parts, fmt.Sprintf("targets=%d", n))
+			}
+			if e.FailureClass != "" {
+				parts = append(parts, "class="+e.FailureClass)
+			}
+			detail := ""
+			if len(parts) > 0 {
+				detail = "  " + strings.Join(parts, "  ")
+			}
+			fmt.Printf("  %splan%s      %s%s\n", dim, reset, e.Directive, detail)
+		}
+	}
 	fmt.Println()
 }
 

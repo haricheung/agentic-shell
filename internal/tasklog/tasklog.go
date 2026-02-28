@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -464,6 +465,32 @@ func (tl *TaskLog) Stats() *TaskStats {
 		ToolCallCount: tc,
 		ToolElapsedMs: te,
 	}
+}
+
+// ReadEvents reads all JSONL events from a completed task log file.
+// Returns nil when the file does not exist (task had no log or file was removed).
+// Intended for post-task reporting; the file must already be closed (i.e. after Registry.Close).
+//
+// Expectations:
+//   - Returns nil when the task file does not exist
+//   - Returns one Event per valid JSONL line; silently skips malformed lines
+func (r *Registry) ReadEvents(taskID string) []Event {
+	path := filepath.Join(r.dir, taskID+".jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var events []Event
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var e Event
+		if err := json.Unmarshal([]byte(line), &e); err == nil {
+			events = append(events, e)
+		}
+	}
+	return events
 }
 
 // GetStats returns and removes the cached TaskStats for taskID.
