@@ -1,6 +1,6 @@
 # Omniscience over Negotiation: A Control-Theoretic Multi-Agent System with Goal Gradient Optimization and Cognitive Memory
 
-**Hari Cheung**
+**Hari Cheung**, **Claude Sonnet 4.6** (Anthropic), **Gemini 3.1 Pro** (Google)
 
 ---
 
