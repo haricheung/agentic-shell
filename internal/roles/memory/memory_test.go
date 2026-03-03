@@ -194,7 +194,7 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	return New(nil, dir)
+	return New(nil, dir, nil)
 }
 
 func TestWriteQueryMK_NewStoreReturnsIgnore(t *testing.T) {
@@ -283,13 +283,13 @@ func TestQueryC_OnlyReturnsCLevel(t *testing.T) {
 	mM := types.Megram{
 		ID: uuid.New().String(), Level: "M",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Space: "intent:find_files", Entity: "env:local",
+		Space:     "intent:find_files", Entity: "env:local",
 		F: 0.8, Sigma: 1.0, K: 0.0, State: "accept", Content: "M-level",
 	}
 	mC := types.Megram{
 		ID: uuid.New().String(), Level: "C",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Space: "intent:find_files", Entity: "env:local",
+		Space:     "intent:find_files", Entity: "env:local",
 		F: 0.9, Sigma: 1.0, K: 0.0, State: "accept", Content: "C-level SOP",
 	}
 	s.persistMegram(mM)
@@ -315,7 +315,7 @@ func TestQueryC_UpdatesLastRecalledAt(t *testing.T) {
 	m := types.Megram{
 		ID: uuid.New().String(), Level: "C",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Space: "intent:recall_test", Entity: "env:local",
+		Space:     "intent:recall_test", Entity: "env:local",
 		F: 0.9, Sigma: 1.0, K: 0.0, State: "accept",
 	}
 	s.persistMegram(m)
@@ -532,7 +532,7 @@ func TestQueryMK_DecayReducesAttentionOverTime(t *testing.T) {
 	m := types.Megram{
 		ID: uuid.New().String(), Level: "M",
 		CreatedAt: past,
-		Space: "intent:decay_test", Entity: "env:local",
+		Space:     "intent:decay_test", Entity: "env:local",
 		State: "accept", F: 0.9, Sigma: 1.0, K: 0.2,
 	}
 	s.persistMegram(m)
@@ -591,7 +591,7 @@ func TestQueryMK_RecallResetsDecayClock(t *testing.T) {
 	m := types.Megram{
 		ID: uuid.New().String(), Level: "M",
 		CreatedAt: past,
-		Space: "intent:recall_clock", Entity: "env:local",
+		Space:     "intent:recall_clock", Entity: "env:local",
 		State: "accept", F: 0.9, Sigma: 1.0, K: 0.2,
 	}
 	s.persistMegram(m)
@@ -625,7 +625,7 @@ func TestGCPass_DeletesExpiredKLevel(t *testing.T) {
 	m := types.Megram{
 		ID: uuid.New().String(), Level: "K",
 		CreatedAt: oldTime,
-		Space: "tool:shell", Entity: "path:old",
+		Space:     "tool:shell", Entity: "path:old",
 		State: "change_path", F: 0.1, Sigma: 0.0, K: 0.5,
 	}
 	s.persistMegram(m)
@@ -647,7 +647,7 @@ func TestGCPass_PreservesCLevel(t *testing.T) {
 	m := types.Megram{
 		ID: uuid.New().String(), Level: "C",
 		CreatedAt: oldTime,
-		Space: "intent:timeless_sop", Entity: "env:local",
+		Space:     "intent:timeless_sop", Entity: "env:local",
 		State: "success", F: 0.0001, Sigma: 1.0, K: 0.05,
 	}
 	s.persistMegram(m)
@@ -672,7 +672,7 @@ func TestTrustBankruptcyPass_SkipsMLevel(t *testing.T) {
 	m := types.Megram{
 		ID: mID, Level: "M",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Space: "intent:skip_m", Entity: "env:local",
+		Space:     "intent:skip_m", Entity: "env:local",
 		State: "abandon", F: 0.95, Sigma: -1.0, K: 0.0,
 	}
 	s.persistMegram(m)
@@ -786,7 +786,7 @@ func TestQueryC_PreservesSigmaInSOPRecord(t *testing.T) {
 	m := types.Megram{
 		ID: uuid.New().String(), Level: "C",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Space: "intent:sigma_test", Entity: "env:local",
+		Space:     "intent:sigma_test", Entity: "env:local",
 		State: "abandon", F: 0.95, Sigma: -1.0, K: 0.0,
 		Content: "do not use this approach",
 	}
@@ -840,13 +840,13 @@ func TestTrustBankruptcyPass_DemotesCLevel(t *testing.T) {
 	c := types.Megram{
 		ID: cID, Level: "C",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Space: "intent:demote_test", Entity: "env:local",
+		Space:     "intent:demote_test", Entity: "env:local",
 		State: "accept", F: 0.5, Sigma: 1.0, K: 0.0,
 	}
 	neg := types.Megram{
 		ID: uuid.New().String(), Level: "M",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Space: "intent:demote_test", Entity: "env:local",
+		Space:     "intent:demote_test", Entity: "env:local",
 		State: "abandon", F: 0.95, Sigma: -1.0, K: 0.0,
 	}
 	s.persistMegram(c)

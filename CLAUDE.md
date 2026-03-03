@@ -14,7 +14,7 @@ Data / log files written to `~/.artoo/` (override with `ARTOO_DATA_DIR`):
 
 | File | Contents |
 |---|---|
-| `memory.json` | Persistent episodic + procedural memory |
+| `memory.leveldb/` | MKCT pyramid LevelDB store (v0.9; replaces legacy memory.json) |
 | `audit.jsonl` | Structured audit events |
 | `audit_stats.json` | Persisted auditor window stats (tasks, corrections, trends, violations) |
 | `debug.log` | Internal role debug logs (redirected from stderr at startup) |

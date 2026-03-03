@@ -21,7 +21,6 @@ import (
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/llm"
 	"github.com/haricheung/agentic-shell/internal/roles/agentval"
-	"github.com/haricheung/agentic-shell/internal/tools"
 	"github.com/haricheung/agentic-shell/internal/roles/auditor"
 	"github.com/haricheung/agentic-shell/internal/roles/executor"
 	"github.com/haricheung/agentic-shell/internal/roles/ggs"
@@ -30,6 +29,7 @@ import (
 	"github.com/haricheung/agentic-shell/internal/roles/perceiver"
 	"github.com/haricheung/agentic-shell/internal/roles/planner"
 	"github.com/haricheung/agentic-shell/internal/tasklog"
+	"github.com/haricheung/agentic-shell/internal/tools"
 	"github.com/haricheung/agentic-shell/internal/types"
 	"github.com/haricheung/agentic-shell/internal/ui"
 )
@@ -85,8 +85,8 @@ func main() {
 	}
 
 	// Infrastructure roles
-	// LevelDB memory store replaces the old file-backed JSON store.
-	mem := memory.New(b, filepath.Join(cacheDir, "memory.leveldb"))
+	// LevelDB memory store with toolClient for Dreamer upward consolidation (v0.9).
+	mem := memory.New(b, filepath.Join(cacheDir, "memory.leveldb"), toolClient)
 	aud := auditor.New(b, b.NewTap(),
 		filepath.Join(cacheDir, "audit.jsonl"),
 		filepath.Join(cacheDir, "audit_stats.json"),
@@ -217,13 +217,13 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 
 	// taskDispatch tracks the sequential dispatch state for one parent task.
 	type taskDispatch struct {
-		ctx        context.Context
-		cancel     context.CancelFunc
-		expected   int                     // total subtasks from manifest (-1 = not yet received)
-		bySeq      map[int][]types.SubTask // sequence number -> subtasks
-		inFlight   int                     // subtasks currently executing
-		currentSeq int                     // sequence group now running (0 = not started)
-		prevOutputs []string               // outputs collected from completed sequence groups
+		ctx         context.Context
+		cancel      context.CancelFunc
+		expected    int                     // total subtasks from manifest (-1 = not yet received)
+		bySeq       map[int][]types.SubTask // sequence number -> subtasks
+		inFlight    int                     // subtasks currently executing
+		currentSeq  int                     // sequence group now running (0 = not started)
+		prevOutputs []string                // outputs collected from completed sequence groups
 	}
 
 	// completionSignal is sent by each agentval goroutine on finish.
@@ -479,6 +479,32 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 	intrCh := make(chan os.Signal, 1)
 	signal.Notify(intrCh, os.Interrupt)
 	defer signal.Stop(intrCh)
+
+	// rlResult carries one readline result (line + error).
+	type rlResult struct {
+		line string
+		err  error
+	}
+
+	// rlCh is fed by a dedicated goroutine — the ONLY caller of rl.Readline().
+	// Isolating reads here lets the main loop add a short paste-detection window
+	// without risking concurrent access to the readline instance.
+	rlCh := make(chan rlResult, 32)
+	go func() {
+		for {
+			line, err := rl.Readline()
+			rlCh <- rlResult{line, err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Signal handler: Ctrl+C during a running task aborts the task.
+	// Ctrl+C while idle injects ErrInterrupt into rlCh so the main loop's
+	// normal "first press warns, second press exits" path fires correctly,
+	// even when readline is not yet blocked on Readline() (e.g. between
+	// task completion and the next readLine() call).
 	go func() {
 		for {
 			select {
@@ -496,29 +522,13 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 					}
 					disp.Abort() // close the pipeline box immediately
 					fmt.Print("\r\033[K\n\033[33m⚠️  task aborted\033[0m  (type 'exit' or Ctrl+D to quit)\n")
+				} else {
+					select {
+					case rlCh <- rlResult{err: readline.ErrInterrupt}:
+					default:
+					}
 				}
-				// When idle (tc == nil), do nothing — readline's ErrInterrupt handles exit.
 			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	// rlResult carries one readline result (line + error).
-	type rlResult struct {
-		line string
-		err  error
-	}
-
-	// rlCh is fed by a dedicated goroutine — the ONLY caller of rl.Readline().
-	// Isolating reads here lets the main loop add a short paste-detection window
-	// without risking concurrent access to the readline instance.
-	rlCh := make(chan rlResult, 32)
-	go func() {
-		for {
-			line, err := rl.Readline()
-			rlCh <- rlResult{line, err}
-			if err != nil {
 				return
 			}
 		}

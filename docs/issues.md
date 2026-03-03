@@ -2497,3 +2497,88 @@ The consecutive-duplicate check fires correctly on every repeated call, but afte
 
 **Fix**
 Added `consecutiveDuplicates` counter to the executor tool-call loop. On the first duplicate the existing warning is injected as before (one chance to recover). If the model makes the same call again (second consecutive duplicate) the subtask is immediately terminated with `status: "failed"` — avoiding the remaining budget burn. The counter resets to 0 on any non-duplicate call.
+
+---
+
+
+## Issue #93 — `IntentSlug` produces empty slug for all CJK intents; cross-task memory blind for Chinese-language tasks
+
+**Symptom**
+During the `today_lunar_date` task (intent: `"查询今天的农历日期"`), R2's memory query returned `attention=7.816, action=Exploit` — a spuriously high signal that produced a meaningless `"SHOULD PREFER: Follow the same general approach"` constraint. Inspection showed `space="intent:"` (empty slug). All Chinese-language tasks share one degenerate LevelDB bucket; accumulated potentials are an incoherent aggregate of unrelated tasks (news lookups, calendar queries, coding questions).
+
+**Root cause**
+`IntentSlug(intent string)` strips every character outside `[a-z0-9]`. CJK characters are silently dropped. Any intent composed entirely of non-ASCII characters (Chinese, Japanese, Korean, Arabic, etc.) produces `space = "intent:"` — the minimum possible slug. Two consequences:
+
+1. **Write collision**: Every terminal Megram for a CJK-intent task is filed under `"intent:"`. Potentials accumulate across semantically unrelated tasks, making both `Attention` and `Decision` meaningless.
+2. **Read noise**: R2 queries `"intent:"` and receives potentials from the aggregate, not from the current task class. The `Exploit` signal is always high (many prior tasks) even for a completely new task type. The system believes it has strong positive memory for every Chinese-language task, regardless of actual experience.
+
+**Fix** (v0.9)
+Use `task_id` as the slug source instead of the raw intent string. R1 already generates a descriptive ASCII snake_case `task_id` (e.g. `today_lunar_date`, `find_largest_video`, `china_latest_news`). The tag becomes `space = "intent:" + taskID`.
+
+- `internal/roles/ggs/ggs.go`: `writeTerminalMegram` signature gains `taskID string` parameter; `Space` set to `"intent:" + taskID` instead of `memory.IntentSlug(intent)`.
+- `internal/roles/planner/planner.go`: `queryMKCTConstraints` signature gains `taskID string`; `space` set to `"intent:" + taskID`.
+- Both `plan()` and `replanWithDirective()` pass `spec.TaskID` to `queryMKCTConstraints`.
+- `IntentSlug` is retained in `memory.go` for backward compatibility and tests but is no longer called on the hot path.
+
+**Properties after fix**:
+- `today_lunar_date` → `space = "intent:today_lunar_date"` (isolated bucket)
+- `china_latest_news` → `space = "intent:china_latest_news"` (isolated bucket)
+- All CJK tasks produce correctly discriminating slugs via R1's already-correct task_id generation
+- Cross-task learning works correctly: repeated runs of the same task class accumulate in the same bucket regardless of input language
+
+---
+
+
+## Issue #94 — Dreamer upward consolidation never implemented; memory pyramid is write-only above M level
+
+**Symptom**
+After many task runs, `QueryC` (C-level SOP query) always returns an empty slice. R2 never receives articulated lessons from memory — only raw directional potentials from the M layer (`"SHOULD PREFER"` / `"MUST NOT"` with no explanation of why). The system cannot accumulate strategic knowledge across tasks; it can only signal a direction, not state a reason.
+
+**Root cause**
+`runDreamer()` called only `gcPass()` and `trustBankruptcyPass()`. The upward consolidation step was explicitly deferred with the comment:
+```go
+// Upward consolidation (LLM distillation into C-level SOPs) deferred to Phase 2.
+```
+The spec (dreamer.md §3, mvp-roles-v0.8.md §Dreamer) defined the promotion threshold and distillation mechanism, but neither was implemented. The C-level and K-level layers were structurally present in LevelDB but permanently empty.
+
+**Consequence**
+The memory pyramid acts as a one-way sink: GGS writes Megrams; the Dreamer GCs them when they decay; nothing is ever promoted. R2 reads raw dual-channel potentials but never reads a synthesised rule. The slow loop (Dreamer → R2) described in the architecture has no upward signal.
+
+**Fix** (v0.9)
+Implement `consolidationPass()` as Phase 3 of the Dreamer cycle, called after GC and Trust Bankruptcy on every 5-minute tick and post-task settle.
+
+Algorithm:
+1. Scan all non-consolidated M/K-level Megrams grouped by `(space, entity)`.
+2. For each group: compute live `M_attention` and `M_decision`.
+3. If `M_attention ≥ Λ_att = 5.0` AND `M_decision ≥ Λ_dec = 3.0` → distil **Best Practice** (σ=+1.0).
+4. If `M_attention ≥ Λ_att = 5.0` AND `M_decision ≤ −Λ_dec = −3.0` → distil **Constraint** (σ=−1.0).
+5. Call `distilSOP(ctx, space, entity, signal, megrams)` — one LLM call per qualifying group.
+6. Write resulting `Megram(Level=C, k=0.0, sigma=±1.0)` to LevelDB.
+7. Mark all source Megrams as `State="consolidated"` to skip them on future scans.
+
+`distilSOP` prompt:
+```
+You are synthesising accumulated task experience into a reusable rule.
+Space: <space>   Entity: <entity>   Signal: <Best Practice|Constraint>
+Source experiences (newest first, up to 10):
+<content_1>
+...
+Write ONE concise rule (≤2 sentences) that captures the generalised lesson.
+The rule must be actionable: a Planner reading it should know exactly what to do or avoid.
+Output ONLY the rule text, no preamble.
+```
+
+`memory.New` signature change:
+```go
+// v0.8: func New(b *bus.Bus, dbPath string) *Store
+// v0.9: func New(b *bus.Bus, dbPath string, llmClient *llm.Client) *Store
+```
+If `llmClient == nil`, Phase 3 is skipped (graceful degradation to v0.8 Dreamer behaviour).
+
+`main.go`: passes `toolClient` as the LLM client for Dreamer distillation (tool-tier is sufficient; no reasoning chain needed for SOP synthesis).
+
+Files changed:
+- `internal/roles/memory/memory.go` — `New` signature; `consolidationPass`; `distilSOP`; `runDreamer` calls Phase 3
+- `internal/roles/ggs/ggs.go` — `writeTerminalMegram` gains `taskID` param; uses `"intent:"+taskID`
+- `internal/roles/planner/planner.go` — `queryMKCTConstraints` gains `taskID` param; uses `"intent:"+taskID`
+- `cmd/artoo/main.go` — passes `toolClient` to `memory.New`

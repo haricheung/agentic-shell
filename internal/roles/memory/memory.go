@@ -18,6 +18,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 
 	"github.com/haricheung/agentic-shell/internal/bus"
+	"github.com/haricheung/agentic-shell/internal/llm"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
 
@@ -46,17 +47,26 @@ var quantizationMatrix = map[string]struct{ f, sigma, k float64 }{
 	"refine":          {f: 0.10, sigma: +0.5, k: 0.50},
 }
 
+// Dreamer consolidation thresholds (upward flow).
+const (
+	lambdaAtt = 5.0 // M_attention threshold for C-level promotion
+	lambdaDec = 3.0 // |M_decision| threshold for C-level promotion
+)
+
 // Store is the LevelDB-backed MKCT memory engine.
 // Write() is async (fire-and-forget channel); QueryC/QueryMK are synchronous.
 type Store struct {
 	b       *bus.Bus
 	db      *leveldb.DB
+	llm     *llm.Client       // used by Dreamer Phase 3 distillation; nil disables upward consolidation
 	writeCh chan types.Megram // async write queue; buffered to avoid blocking GGS hot path
 }
 
 // New opens (or creates) a LevelDB database at dbPath and returns a Store.
 // dbPath should be a directory path (LevelDB creates it if absent).
-func New(b *bus.Bus, dbPath string) *Store {
+// llmClient is used by the Dreamer's upward consolidation phase to distil C-level SOPs;
+// pass nil to disable consolidation and run only GC + Trust Bankruptcy (v0.8 behaviour).
+func New(b *bus.Bus, dbPath string, llmClient *llm.Client) *Store {
 	db, err := leveldb.OpenFile(dbPath, nil)
 	if err != nil {
 		// Write to stderr directly — main.go redirects log to debug.log before calling New(),
@@ -67,6 +77,7 @@ func New(b *bus.Bus, dbPath string) *Store {
 	}
 	return &Store{
 		b:       b,
+		llm:     llmClient,
 		writeCh: make(chan types.Megram, 1024),
 		db:      db,
 	}
@@ -316,12 +327,16 @@ func (s *Store) runDreamer(trigger string) {
 	slog.Info("[R5/Dreamer] consolidation cycle starting", "trigger", trigger)
 	gcScanned, gcDeleted := s.gcPass()
 	tbScanned, tbDemoted := s.trustBankruptcyPass()
-	// Upward consolidation (LLM distillation into C-level SOPs) deferred to Phase 2.
+	upPromoted := 0
+	if s.llm != nil {
+		upPromoted = s.consolidationPass(context.Background())
+	}
 	elapsed := time.Since(start)
 	slog.Info("[R5/Dreamer] consolidation cycle complete",
 		"elapsed_ms", elapsed.Milliseconds(),
 		"gc_scanned", gcScanned, "gc_deleted", gcDeleted,
-		"trust_scanned", tbScanned, "trust_demoted", tbDemoted)
+		"trust_scanned", tbScanned, "trust_demoted", tbDemoted,
+		"up_promoted", upPromoted)
 }
 
 // gcPass scans M and K-level Megrams and hard-deletes those with M_attention < 0.1.
@@ -414,6 +429,170 @@ func (s *Store) trustBankruptcyPass() (scanned, demoted int) {
 		}
 	}
 	return
+}
+
+// consolidationPass scans M/K-level Megrams grouped by (space, entity) and promotes
+// qualifying clusters to C-level SOPs via LLM distillation.
+// Returns the count of newly promoted C-level Megrams.
+//
+// Promotion thresholds (Λ_promote from dreamer.md):
+//   - M_attention ≥ λAtt=5.0 AND M_decision ≥ λDec=3.0  → Best Practice (σ=+1.0)
+//   - M_attention ≥ λAtt=5.0 AND M_decision ≤ −λDec=−3.0 → Constraint   (σ=−1.0)
+//
+// Expectations:
+//   - No-ops when s.llm is nil
+//   - Only scans M and K level Megrams
+//   - Skips Megrams with State="consolidated" (already promoted in a prior cycle)
+//   - Groups by (space, entity); computes live dual-channel potentials for each group
+//   - Promotes at most one new C-level Megram per (space, entity) group per cycle
+//   - Marks all source Megrams in a promoted group as State="consolidated"
+//   - Returns count of groups promoted this cycle
+func (s *Store) consolidationPass(ctx context.Context) int {
+	if s.llm == nil {
+		return 0
+	}
+
+	type groupKey struct{ space, entity string }
+	type groupEntry struct {
+		meg      types.Megram
+		decayAtt float64
+		decayDec float64
+	}
+	groups := make(map[groupKey][]groupEntry)
+
+	now := time.Now().UTC()
+	for _, lvl := range []string{"M", "K"} {
+		prefix := prefixLevel + lvl + "|"
+		iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
+		for iter.Next() {
+			id := string(iter.Key())[len(prefix):]
+			m, err := s.fetchMegram(id)
+			if err != nil {
+				continue
+			}
+			if m.State == "consolidated" {
+				continue
+			}
+			createdAt, err := time.Parse(time.RFC3339, m.CreatedAt)
+			if err != nil {
+				continue
+			}
+			decayOrigin := createdAt
+			if recallBytes, err := s.db.Get([]byte(prefixRecall+id), nil); err == nil {
+				if recalled, err := time.Parse(time.RFC3339, string(recallBytes)); err == nil {
+					if recalled.After(decayOrigin) {
+						decayOrigin = recalled
+					}
+				}
+			}
+			deltaDays := now.Sub(decayOrigin).Hours() / 24.0
+			decay := math.Exp(-m.K * deltaDays)
+			att := math.Abs(m.F) * decay
+			dec := m.Sigma * m.F * decay
+			k := groupKey{m.Space, m.Entity}
+			groups[k] = append(groups[k], groupEntry{meg: m, decayAtt: att, decayDec: dec})
+		}
+		iter.Release()
+	}
+
+	promoted := 0
+	for k, entries := range groups {
+		var totalAtt, totalDec float64
+		for _, e := range entries {
+			totalAtt += e.decayAtt
+			totalDec += e.decayDec
+		}
+		if totalAtt < lambdaAtt {
+			continue
+		}
+		var signal string
+		var sigma float64
+		if totalDec >= lambdaDec {
+			signal = "Best Practice"
+			sigma = +1.0
+		} else if totalDec <= -lambdaDec {
+			signal = "Constraint"
+			sigma = -1.0
+		} else {
+			continue
+		}
+
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].meg.CreatedAt > entries[j].meg.CreatedAt
+		})
+		contents := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if e.meg.Content != "" {
+				contents = append(contents, e.meg.Content)
+			}
+		}
+
+		rule, err := s.distilSOP(ctx, k.space, k.entity, signal, contents)
+		if err != nil {
+			slog.Warn("[R5/Dreamer] distilSOP failed", "space", k.space, "entity", k.entity, "error", err)
+			continue
+		}
+
+		sopMeg := types.Megram{
+			ID:        uuid.New().String(),
+			Level:     "C",
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			Space:     k.space,
+			Entity:    k.entity,
+			Content:   rule,
+			State:     signal,
+			F:         math.Abs(sigma),
+			Sigma:     sigma,
+			K:         0.0,
+		}
+		s.persistMegram(sopMeg)
+		slog.Info("[R5/Dreamer] promoted C-level SOP",
+			"space", k.space, "entity", k.entity, "signal", signal,
+			"att", totalAtt, "dec", totalDec, "rule", rule)
+
+		for _, e := range entries {
+			updated := e.meg
+			updated.State = "consolidated"
+			if data, err := json.Marshal(updated); err == nil {
+				_ = s.db.Put([]byte(prefixMegram+updated.ID), data, nil)
+			}
+		}
+		promoted++
+	}
+	return promoted
+}
+
+// distilSOP invokes the LLM to synthesise a single C-level rule from a cluster of Megram
+// content strings. Returns the rule text or an error.
+//
+// Expectations:
+//   - Returns non-empty rule string on success
+//   - Returns error when LLM call fails
+//   - Caps source experiences at 10 (newest first)
+//   - Prompt instructs LLM to output ONLY the rule text (no preamble)
+func (s *Store) distilSOP(ctx context.Context, space, entity, signal string, contents []string) (string, error) {
+	if len(contents) > 10 {
+		contents = contents[:10]
+	}
+	var sb strings.Builder
+	sb.WriteString("You are synthesising accumulated task experience into a reusable rule.\n\n")
+	sb.WriteString("Space: " + space + "\n")
+	sb.WriteString("Entity: " + entity + "\n")
+	sb.WriteString("Signal: " + signal + "\n\n")
+	sb.WriteString("Source experiences (newest first):\n")
+	for i, c := range contents {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, c))
+	}
+	sb.WriteString("\nWrite ONE concise rule (≤2 sentences) that captures the generalised lesson from these experiences.\n")
+	sb.WriteString("The rule must be actionable: a Planner reading it should know exactly what to do or avoid.\n")
+	sb.WriteString("Output ONLY the rule text, no preamble.")
+
+	rule, _, err := s.llm.Chat(ctx, "", sb.String())
+	if err != nil {
+		return "", err
+	}
+	rule = strings.TrimSpace(rule)
+	return rule, nil
 }
 
 // deleteMegram removes all keys associated with a Megram from LevelDB.

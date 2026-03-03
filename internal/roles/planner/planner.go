@@ -12,7 +12,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/haricheung/agentic-shell/internal/bus"
 	"github.com/haricheung/agentic-shell/internal/llm"
-	"github.com/haricheung/agentic-shell/internal/roles/memory"
 	"github.com/haricheung/agentic-shell/internal/tasklog"
 	"github.com/haricheung/agentic-shell/internal/types"
 )
@@ -180,7 +179,7 @@ func (p *Planner) plan(ctx context.Context, spec types.TaskSpec) error {
 	tl := p.logReg.Open(spec.TaskID, spec.Intent)
 
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
-	constraints := p.queryMKCTConstraints(ctx, spec.Intent, tl)
+	constraints := p.queryMKCTConstraints(ctx, spec.TaskID, tl)
 
 	today := time.Now().UTC().Format("2006-01-02")
 	var userPrompt string
@@ -202,8 +201,8 @@ func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, 
 	pdJSON, _ := json.MarshalIndent(pd, "", "  ")
 	specJSON, _ := json.MarshalIndent(spec, "", "  ")
 
-	// Query MKCT memory for this intent.
-	constraints := p.queryMKCTConstraints(ctx, spec.Intent, tl)
+	// Query MKCT memory for this task.
+	constraints := p.queryMKCTConstraints(ctx, spec.TaskID, tl)
 
 	// blocked_tools: tool names to avoid (logical failure directives: break_symmetry, change_approach).
 	if len(pd.BlockedTools) > 0 {
@@ -241,24 +240,26 @@ func (p *Planner) replanWithDirective(ctx context.Context, spec types.TaskSpec, 
 	return p.dispatch(ctx, spec, userPrompt, systemPrompt, tl)
 }
 
-// queryMKCTConstraints queries R5 for the given intent and returns a formatted
+// queryMKCTConstraints queries R5 for the given taskID and returns a formatted
 // constraint string for injection into the planning prompt. Returns "" when memory
 // is disabled (mem == nil) or when no relevant entries exist.
+// Uses "intent:"+taskID as the space tag instead of IntentSlug(intent) to ensure
+// CJK and non-ASCII intents produce correct discriminating tags (Issue #93).
 //
 // Expectations:
 //   - Returns "" when p.mem is nil
 //   - Returns "" when QueryC and QueryMK both return empty/Ignore results
-//   - Derives space tag as memory.IntentSlug(intent); entity as "env:local"
+//   - Derives space tag as "intent:"+taskID; entity as "env:local"
 //   - Includes "SHOULD PREFER" block when Action is Exploit
 //   - Includes "MUST NOT" block when Action is Avoid
 //   - Includes "CAUTION" block when Action is Caution
 //   - Appends C-level SOPs as "SHOULD PREFER" (σ>0) or "MUST NOT" (σ<0) lines
 //   - Logs a memory_query event to tl after computing constraints
-func (p *Planner) queryMKCTConstraints(ctx context.Context, intent string, tl *tasklog.TaskLog) string {
+func (p *Planner) queryMKCTConstraints(ctx context.Context, taskID string, tl *tasklog.TaskLog) string {
 	if p.mem == nil {
 		return ""
 	}
-	space := memory.IntentSlug(intent)
+	space := "intent:" + taskID
 	entity := "env:local"
 
 	sops, err1 := p.mem.QueryC(ctx, space, entity)
@@ -272,10 +273,17 @@ func (p *Planner) queryMKCTConstraints(ctx context.Context, intent string, tl *t
 
 	constraints := calibrateMKCT(sops, pots)
 	tl.MemoryQuery(space, entity, len(sops), pots.Action, pots.Attention, pots.Decision)
+	slog.Info("[R2] memory query",
+		"space", space,
+		"entity", entity,
+		"sops", len(sops),
+		"attention", pots.Attention,
+		"decision", pots.Decision,
+		"action", pots.Action,
+		"constraints_injected", constraints != "",
+	)
 	if constraints != "" {
-		slog.Debug("[R2] MKCT calibration", "sops", len(sops), "action", pots.Action)
-	} else {
-		slog.Debug("[R2] MKCT calibration: no relevant memory", "action", pots.Action)
+		slog.Info("[R2] memory constraints", "constraints", constraints)
 	}
 	return constraints
 }
@@ -558,4 +566,3 @@ func toPlanDirective(payload any) (types.PlanDirective, error) {
 	var pd types.PlanDirective
 	return pd, json.Unmarshal(b, &pd)
 }
-

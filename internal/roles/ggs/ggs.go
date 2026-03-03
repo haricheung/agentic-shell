@@ -303,6 +303,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 //   - FinalResult carries Loss (D=0), GradL, and Replans for trajectory checkpoint display
 //   - Calls outputFn so the REPL can display the result
 //   - Cleans up lPrev and replans state for the task
+//
 // processAccept handles the happy-path case: all subtasks matched, R4b accepted.
 // GGS records the final loss (D=0) and delivers FinalResult to the user.
 // This keeps GGS in the medium loop even when no replanning is needed —
@@ -852,12 +853,14 @@ func buildRationale(directive string, D, P, Omega, gradL float64, gapSummary str
 // ---------------------------------------------------------------------------
 
 // writeTerminalMegram writes one Megram to R5 on terminal states (accept/success/abandon).
-// Tags: space = intent slug derived from task intent; entity = "env:local".
+// Tags: space = "intent:<taskID>"; entity = "env:local".
+// Using taskID (ASCII snake_case from R1) instead of IntentSlug(intent) ensures CJK and
+// non-ASCII intents produce a correct discriminating space tag (Issue #93).
 // Also publishes MsgMegram to the bus for Auditor observability.
 //
 // Expectations:
 //   - No-ops when mem is nil
-//   - Uses IntentSlug to derive space tag from intent
+//   - Uses "intent:"+taskID as space tag (not IntentSlug(intent))
 //   - Sets f, sigma, k from quantization matrix for the given state
 //   - Publishes MsgMegram to bus for Auditor observability
 //   - Fires Write() async (non-blocking)
@@ -874,7 +877,7 @@ func (g *GGS) writeTerminalMegram(taskID, intent, content, state string) {
 		ID:        uuid.New().String(),
 		Level:     "M",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Space:     memory.IntentSlug(intent),
+		Space:     "intent:" + taskID,
 		Entity:    "env:local",
 		Content:   content,
 		State:     state,
