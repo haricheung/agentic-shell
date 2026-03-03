@@ -169,7 +169,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		g.logReg.Get(taskID).GGSDecision(D, P, Omega, L, gradL, "success", "", replanCount)
 
 		// Write terminal Megram to R5 (GGS is sole writer).
-		g.writeTerminalMegram(taskID, rr.Intent, summary, "success")
+		g.writeTerminalMegram(taskID, rr.Intent, buildTerminalContent(rr.Outcomes, "success", summary, rr.GapSummary), "success")
 
 		g.b.Publish(types.Message{
 			ID:        uuid.New().String(),
@@ -210,7 +210,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		g.logReg.Get(taskID).GGSDecision(D, P, Omega, L, gradL, "abandon", "", replanCount)
 
 		// Write terminal Megram to R5 (GGS is sole writer).
-		g.writeTerminalMegram(taskID, rr.Intent, rr.GapSummary, "abandon")
+		g.writeTerminalMegram(taskID, rr.Intent, buildTerminalContent(rr.Outcomes, "abandon", "", rr.GapSummary), "abandon")
 
 		g.b.Publish(types.Message{
 			ID:        uuid.New().String(),
@@ -357,7 +357,7 @@ func (g *GGS) processAccept(_ context.Context, os types.OutcomeSummary) {
 	g.mu.Unlock()
 
 	// Write terminal Megram to R5 (GGS is sole writer).
-	g.writeTerminalMegram(taskID, os.Intent, os.Summary, "accept")
+	g.writeTerminalMegram(taskID, os.Intent, buildTerminalContent(os.Outcomes, "accept", os.Summary, ""), "accept")
 
 	// GGS is the sole emitter of FinalResult — consistent path for accept, success, and abandon.
 	// Directive="accept"; Loss, GradL, Replans, PrevDirective for trajectory checkpoint display.
@@ -851,6 +851,80 @@ func buildRationale(directive string, D, P, Omega, gradL float64, gapSummary str
 // ---------------------------------------------------------------------------
 // R5 Memory write helpers — GGS is the sole writer to Shared Memory (R5).
 // ---------------------------------------------------------------------------
+
+// buildTerminalContent constructs a rich, actionable Megram content string for
+// terminal states (accept/success/abandon). Unlike the user-facing summary, this
+// is optimised for R2 memory recall: it names the tools that worked or failed and
+// includes the concrete commands/queries used, so future C-level SOPs can give R2
+// specific guidance ("use zhdate Python library via shell") rather than just a
+// directional signal ("this worked").
+//
+// Format:
+//   - accept/success: "Succeeded. Tools: <tool:target, ...>. Result: <summary>"
+//   - abandon:        "Failed. Tools tried: <tool:target, ...>. Gap: <gap_summary>"
+//
+// Expectations:
+//   - Uses matched outcomes' ToolCalls for accept/success
+//   - Uses failed outcomes' ToolCalls for abandon
+//   - Falls back to summary/gap_summary alone when no ToolCalls are present
+//   - Deduplicates tool:target pairs
+//   - Truncates individual target values to 120 chars to keep content readable
+func buildTerminalContent(outcomes []types.SubTaskOutcome, directive, summary, gapSummary string) string {
+	const maxTarget = 120
+	seen := make(map[string]bool)
+	var tools []string
+
+	wantMatched := directive == "accept" || directive == "success"
+	for _, o := range outcomes {
+		if wantMatched && o.Status != "matched" {
+			continue
+		}
+		if !wantMatched && o.Status != "failed" {
+			continue
+		}
+		for _, tc := range o.ToolCalls {
+			toolName, target := memory.ParseToolCall(tc)
+			if toolName == "" {
+				continue
+			}
+			if len(target) > maxTarget {
+				target = target[:maxTarget] + "…"
+			}
+			var entry string
+			if target != "" {
+				entry = toolName + ":" + target
+			} else {
+				entry = toolName
+			}
+			if seen[entry] {
+				continue
+			}
+			seen[entry] = true
+			tools = append(tools, entry)
+		}
+	}
+
+	toolStr := ""
+	if len(tools) > 0 {
+		toolStr = strings.Join(tools, ", ")
+	}
+
+	switch directive {
+	case "accept", "success":
+		if toolStr != "" {
+			return "Succeeded. Tools: " + toolStr + ". Result: " + summary
+		}
+		return "Succeeded. Result: " + summary
+	default: // abandon
+		if toolStr != "" {
+			return "Failed. Tools tried: " + toolStr + ". Gap: " + gapSummary
+		}
+		if gapSummary != "" {
+			return "Failed. Gap: " + gapSummary
+		}
+		return "Failed."
+	}
+}
 
 // writeTerminalMegram writes one Megram to R5 on terminal states (accept/success/abandon).
 // Tags: space = "intent:<taskID>"; entity = "env:local".

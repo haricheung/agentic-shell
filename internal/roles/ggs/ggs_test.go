@@ -892,3 +892,119 @@ func TestLaw2KillSwitch_ResetWhenGradientImproves(t *testing.T) {
 		t.Errorf("expected worseningCount reset to 0 after improving, got %d", c2)
 	}
 }
+
+// ── buildTerminalContent ─────────────────────────────────────────────────────
+
+func toolCallStr(tool, params string) string {
+	return tool + ": " + params + " → output"
+}
+
+func TestBuildTerminalContent_AcceptIncludesToolAndResult(t *testing.T) {
+	// accept: tool names and targets from matched outcomes appear in content
+	outcomes := []types.SubTaskOutcome{
+		{
+			Status:    "matched",
+			ToolCalls: []string{toolCallStr("shell", `{"command":"python3 -c 'import zhdate'"}`), toolCallStr("shell", `{"command":"python3 -c 'import zhdate'"}`)},
+		},
+	}
+	got := buildTerminalContent(outcomes, "accept", "today is 正月十六", "")
+	if !strings.Contains(got, "Succeeded") {
+		t.Errorf("expected 'Succeeded' prefix, got: %s", got)
+	}
+	if !strings.Contains(got, "shell") {
+		t.Errorf("expected tool name 'shell' in content, got: %s", got)
+	}
+	if !strings.Contains(got, "python3") {
+		t.Errorf("expected command fragment 'python3' in content, got: %s", got)
+	}
+	if !strings.Contains(got, "正月十六") {
+		t.Errorf("expected result summary in content, got: %s", got)
+	}
+}
+
+func TestBuildTerminalContent_AcceptDeduplicatesToolCalls(t *testing.T) {
+	// Duplicate (tool, target) pairs are written only once
+	tc := toolCallStr("shell", `{"command":"curl https://api.example.com"}`)
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched", ToolCalls: []string{tc, tc, tc}},
+	}
+	got := buildTerminalContent(outcomes, "accept", "done", "")
+	count := strings.Count(got, "curl")
+	if count != 1 {
+		t.Errorf("expected target deduplicated to 1 occurrence, got %d in: %s", count, got)
+	}
+}
+
+func TestBuildTerminalContent_AbandonIncludesFailedToolsAndGap(t *testing.T) {
+	// abandon: tool names and gap_summary appear; matched outcomes are ignored
+	outcomes := []types.SubTaskOutcome{
+		{Status: "failed", ToolCalls: []string{toolCallStr("shell", `{"command":"curl http://bad-api.com"}`)}},
+		{Status: "matched", ToolCalls: []string{toolCallStr("search", `{"query":"lunar date"}`)}},
+	}
+	got := buildTerminalContent(outcomes, "abandon", "", "API returned null fields")
+	if !strings.Contains(got, "Failed") {
+		t.Errorf("expected 'Failed' prefix, got: %s", got)
+	}
+	if !strings.Contains(got, "shell") {
+		t.Errorf("expected failed tool 'shell' in content, got: %s", got)
+	}
+	if strings.Contains(got, "search") {
+		t.Errorf("matched outcome tool 'search' should not appear in abandon content, got: %s", got)
+	}
+	if !strings.Contains(got, "API returned null fields") {
+		t.Errorf("expected gap_summary in content, got: %s", got)
+	}
+}
+
+func TestBuildTerminalContent_SuccessIncludesMatchedTools(t *testing.T) {
+	// success: same tool extraction logic as accept
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched", ToolCalls: []string{toolCallStr("mdfind", `{"query":"report.pdf"}`)}},
+	}
+	got := buildTerminalContent(outcomes, "success", "found the file", "")
+	if !strings.Contains(got, "Succeeded") {
+		t.Errorf("expected 'Succeeded' prefix, got: %s", got)
+	}
+	if !strings.Contains(got, "mdfind") {
+		t.Errorf("expected tool 'mdfind' in content, got: %s", got)
+	}
+}
+
+func TestBuildTerminalContent_FallbackWhenNoToolCalls(t *testing.T) {
+	// No ToolCalls present → falls back to summary only (no crash)
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched", ToolCalls: nil},
+	}
+	got := buildTerminalContent(outcomes, "accept", "all done", "")
+	if got != "Succeeded. Result: all done" {
+		t.Errorf("unexpected fallback content: %s", got)
+	}
+}
+
+func TestBuildTerminalContent_TargetTruncatedAt120Chars(t *testing.T) {
+	// Targets longer than 120 chars are truncated with ellipsis
+	longCmd := strings.Repeat("x", 200)
+	tc := toolCallStr("shell", `{"command":"`+longCmd+`"}`)
+	outcomes := []types.SubTaskOutcome{
+		{Status: "matched", ToolCalls: []string{tc}},
+	}
+	got := buildTerminalContent(outcomes, "accept", "ok", "")
+	if !strings.Contains(got, "…") {
+		t.Errorf("expected truncation ellipsis in content, got: %s", got)
+	}
+	// The target segment in the output should not exceed 120 + len("shell:") + len("…")
+	if len(got) > 500 {
+		t.Errorf("content suspiciously long (%d chars), truncation may not be working", len(got))
+	}
+}
+
+func TestBuildTerminalContent_AbandonFallbackWhenNoOutcomes(t *testing.T) {
+	// No outcomes at all → graceful fallback
+	got := buildTerminalContent(nil, "abandon", "", "budget exhausted")
+	if !strings.Contains(got, "Failed") {
+		t.Errorf("expected 'Failed' prefix, got: %s", got)
+	}
+	if !strings.Contains(got, "budget exhausted") {
+		t.Errorf("expected gap_summary in fallback, got: %s", got)
+	}
+}
