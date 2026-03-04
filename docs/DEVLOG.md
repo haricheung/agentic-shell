@@ -115,4 +115,71 @@ Layer 3 is now suppressed when layers 1 or 2 have content, eliminating the vacuo
 
 ---
 
+## 2026-03-04 (session 3) — Proof of improvement; memory pyramid threshold redesign discussion
+
+**Participants**: Hari, opencode
+
+### Proof of memory system improvement
+
+Hari asked for concrete evidence that the v0.9 changes actually improved performance. Three runs of the same lunar-date task class were compared:
+
+| Run | Space tag | Action | Attention | Elapsed | Replans |
+|-----|-----------|--------|-----------|---------|---------|
+| `today_lunar_date` (before fix, Mar 3) | `intent:` (broken) | Exploit (noise) | 7.816 | **253s** | 3 |
+| `lunar_date_today` (after fix, cold start) | `intent:lunar_date_today` | Ignore (correct) | 0 | **28s** | 0 |
+| `check_todays_date` (after fix, warm) | `intent:check_todays_date` | **Exploit (real)** | 0.90 | **37s** | 0 |
+
+9× faster on the warm run vs the broken v0.8 run. The CJK slug fix (#93) was the critical enabler — without it, the warm run would have queried the wrong bucket and received noise.
+
+### Diagnosis: QueryRecent is a patch, not a principle
+
+Hari questioned whether the `QueryRecent` fix (injecting raw Megram content directly) is too trivial and overfitted — essentially rebuilding the old flat-file system inside the pyramid rather than fixing the architecture.
+
+**Assessment: correct.** `QueryRecent` bypasses the pyramid rather than improving it. It works but is architecturally regressive.
+
+### Design discussion: mechanism vs. strategy
+
+Hari proposed reframing the pyramid thresholds around *epistemic confidence* rather than *frequency counting*:
+
+> "A single success could be regarded as knowledge. Many similar successes could be regarded as common sense. This is a mechanism, not a strategy — and a mechanism is more general."
+
+**Key insight**: the current `Λ_att = 5.0` threshold for C-level promotion assumes you need ~5 runs before something is worth knowing. But that's arbitrary frequency counting. The right model is:
+
+| Level | Semantic meaning | Promotion condition |
+|---|---|---|
+| M | Raw event — "this happened" | Written immediately (current) |
+| K | Verified knowledge — "this works" | 1 success (M_att ≥ 1.0) |
+| C | Common sense — "this is reliable" | K confirmed 3+ times without contradiction |
+| T | Law — never changes | Human-defined only |
+
+This means **K-level promotion should be eager** (single success → K immediately on next Dreamer tick), while **C-level promotion stays conservative** but requires K to already exist (two-stage: M → K → C).
+
+**On failures:** Hari was uncertain. Discussion conclusion:
+- Single failure: stays M (might be transient — network blip, rate limit)
+- Same `(space, entity)` failing twice: promote to K-level `Avoid`
+- Failure after prior K-level success: demote existing K back to M (soft invalidation — world may have changed)
+
+This asymmetry is correct epistemically: successes promote eagerly (one data point is enough to know something works), failures promote cautiously (one failure might be noise; pattern is required for structural conclusions).
+
+**Implication for QueryRecent:** once K-level promotion is eager (1 success → K after next Dreamer tick), `QueryRecent` becomes unnecessary. R2 gets concrete content from the K-level entries naturally via `QueryC`-equivalent — the mechanism delivers what the patch was approximating. `QueryRecent` can be deprecated.
+
+### Decision
+Implement the mechanism redesign as v0.10:
+1. Lower K-level promotion threshold: `M_att ≥ 1.0` (single success) → promote M → K immediately
+2. C-level threshold: `M_att ≥ 3.0` AND K already exists for that `(space, entity)`
+3. Failure asymmetry: single failure stays M; 2+ failures same space/entity → K-level Avoid; contradiction of existing K → demote K → M
+4. Extend `QueryC` (or add `QueryK`) so R2 reads both C and K level content — not just C
+5. Deprecate `QueryRecent` once K-level promotion is fast enough
+
+### Other fixes this session
+- **Issue #96** — LLM dial timeout: added `net.Dialer.Timeout: 10s`, `TLSHandshakeTimeout: 10s`, `ResponseHeaderTimeout: 30s` to `http.Transport`. Unreachable endpoints now fail in ≤10s instead of ≤120s.
+- **Issues #95, #96, #97** recorded in `docs/issues.md`
+
+### Commits
+- `1ac47cf` — `fix(llm): 10s dial timeout + TLS/header timeouts`
+- `927ba31` — `feat(memory): QueryRecent + 3-layer calibrateMKCT`
+- `b0fba42` — `docs(issues): record issues #95, #96, #97`
+
+---
+
 *This log is maintained by opencode. Each session appends a new dated entry.*
