@@ -115,13 +115,17 @@ Layer 3 is now suppressed when layers 1 or 2 have content, eliminating the vacuo
 
 ---
 
-## 2026-03-04 (session 3) — Proof of improvement; memory pyramid threshold redesign discussion
+## 2026-03-04 (session 3) — Proof of improvement; memory pyramid threshold redesign
 
 **Participants**: Hari, opencode
 
-### Proof of memory system improvement
+---
 
-Hari asked for concrete evidence that the v0.9 changes actually improved performance. Three runs of the same lunar-date task class were compared:
+**Hari**: give me some solid proof, for example, a complete session with clear evidence
+
+**opencode**: *(inspected task logs and debug.log, extracted timing and memory query data)*
+
+Three runs of the same lunar-date task class:
 
 | Run | Space tag | Action | Attention | Elapsed | Replans |
 |-----|-----------|--------|-----------|---------|---------|
@@ -129,50 +133,70 @@ Hari asked for concrete evidence that the v0.9 changes actually improved perform
 | `lunar_date_today` (after fix, cold start) | `intent:lunar_date_today` | Ignore (correct) | 0 | **28s** | 0 |
 | `check_todays_date` (after fix, warm) | `intent:check_todays_date` | **Exploit (real)** | 0.90 | **37s** | 0 |
 
-9× faster on the warm run vs the broken v0.8 run. The CJK slug fix (#93) was the critical enabler — without it, the warm run would have queried the wrong bucket and received noise.
+9× faster on the warm run vs the broken v0.8 run.
 
-### Diagnosis: QueryRecent is a patch, not a principle
+---
 
-Hari questioned whether the `QueryRecent` fix (injecting raw Megram content directly) is too trivial and overfitted — essentially rebuilding the old flat-file system inside the pyramid rather than fixing the architecture.
+**Hari**: your latest fixes are trivial to some extent and a little overfitting in some sense, do you think so? I think, we should adjust the upward thresholds for M, K, even for C, for example, a single success could be regarded as a knowledge, and many similar successes could be regarded as a common sense. but for failures, i do not know process them right now. In this way, we can build a mechanism not just a strategy (I think mechanism larger than strategy) and it will be compatible or more general, what do you think?
 
-**Assessment: correct.** `QueryRecent` bypasses the pyramid rather than improving it. It works but is architecturally regressive.
+**opencode**: You're making a deep point. Let me think through it carefully.
 
-### Design discussion: mechanism vs. strategy
+**You're right that the recent fixes are somewhat overfitting.** `QueryRecent` directly injecting raw Megram content is essentially rebuilding the old flat-file system inside the pyramid — it works, but it bypasses the architecture rather than fixing it. It's a patch, not a principle.
 
-Hari proposed reframing the pyramid thresholds around *epistemic confidence* rather than *frequency counting*:
+**Your mechanism idea is fundamentally stronger.** The key insight:
 
-> "A single success could be regarded as knowledge. Many similar successes could be regarded as common sense. This is a mechanism, not a strategy — and a mechanism is more general."
+> A single success = Knowledge (K). Many similar successes = Common Sense (C). This is a *mechanism*, not a strategy.
 
-**Key insight**: the current `Λ_att = 5.0` threshold for C-level promotion assumes you need ~5 runs before something is worth knowing. But that's arbitrary frequency counting. The right model is:
+This maps directly to how human memory actually works — one experience becomes a fact you know; repeated experiences become intuition you trust without thinking. The pyramid should encode this naturally through thresholds, not through special-cased injection logic.
 
-| Level | Semantic meaning | Promotion condition |
+**On the current thresholds:** `Λ_att = 5.0` for C-level promotion is too conservative. It assumes you need ~5 runs before something is worth knowing. But if R3 just succeeded on the first try using `zhdate`, R2 should already know about it — not wait for 4 more runs. The pyramid levels should reflect *confidence*, not just *frequency*:
+
+| Level | Meaning | Threshold idea |
 |---|---|---|
 | M | Raw event — "this happened" | Written immediately (current) |
-| K | Verified knowledge — "this works" | 1 success (M_att ≥ 1.0) |
-| C | Common sense — "this is reliable" | K confirmed 3+ times without contradiction |
+| K | Verified knowledge — "this works/fails" | 1 success OR 2+ failures with same pattern |
+| C | Common sense — "this is the reliable way" | K confirmed 3+ times without contradiction |
 | T | Law — never changes | Human-defined only |
 
-This means **K-level promotion should be eager** (single success → K immediately on next Dreamer tick), while **C-level promotion stays conservative** but requires K to already exist (two-stage: M → K → C).
+**On failures — your uncertainty is well-founded.** Failures are epistemically harder:
+- A single failure might be transient (network blip, rate limit) — don't promote it
+- A repeated failure on the same target (same API, same URL) is structural — should become K-level `Avoid`
+- A failure after a prior success on the same task may mean the world changed — should *demote* the existing K rather than add a new one
 
-**On failures:** Hari was uncertain. Discussion conclusion:
-- Single failure: stays M (might be transient — network blip, rate limit)
-- Same `(space, entity)` failing twice: promote to K-level `Avoid`
-- Failure after prior K-level success: demote existing K back to M (soft invalidation — world may have changed)
+So the asymmetry makes sense: **successes promote eagerly (1 → K), failures promote cautiously (require pattern matching or repetition)**. This also naturally handles your concern — the mechanism is general because it mirrors epistemic confidence, not task-specific heuristics.
 
-This asymmetry is correct epistemically: successes promote eagerly (one data point is enough to know something works), failures promote cautiously (one failure might be noise; pattern is required for structural conclusions).
+**What I'd propose to change:**
 
-**Implication for QueryRecent:** once K-level promotion is eager (1 success → K after next Dreamer tick), `QueryRecent` becomes unnecessary. R2 gets concrete content from the K-level entries naturally via `QueryC`-equivalent — the mechanism delivers what the patch was approximating. `QueryRecent` can be deprecated.
+1. **Lower K-level promotion threshold** — a single terminal `accept`/`success` Megram with positive σ and `M_att ≥ 1.0` promotes to K immediately (next Dreamer tick after the task)
+2. **C-level threshold stays higher** — `M_att ≥ 3.0` (not 5.0) for C promotion, but requires K-level entry to already exist (two-stage: M → K first, then K → C)
+3. **Failures** — single failure stays M; same `(space, entity)` failing twice promotes to K-level `Avoid`; contradicts an existing K success → demotes K back to M (soft invalidation)
+4. **Remove `QueryRecent`** — once K-level promotion happens fast (after 1 success), R2 gets concrete content from `QueryC`-equivalent at K level, naturally, without the bypass hack
 
-### Decision
-Implement the mechanism redesign as v0.10:
-1. Lower K-level promotion threshold: `M_att ≥ 1.0` (single success) → promote M → K immediately
-2. C-level threshold: `M_att ≥ 3.0` AND K already exists for that `(space, entity)`
-3. Failure asymmetry: single failure stays M; 2+ failures same space/entity → K-level Avoid; contradiction of existing K → demote K → M
-4. Extend `QueryC` (or add `QueryK`) so R2 reads both C and K level content — not just C
-5. Deprecate `QueryRecent` once K-level promotion is fast enough
+This way `QueryRecent` becomes unnecessary — the pyramid itself delivers content to R2 from the 2nd run because the first run's Megram was already promoted to K. The mechanism replaces the strategy.
+
+Does this align with your thinking? Want me to implement it?
+
+---
+
+**Hari**: please record all our dialogs to md and commit and push
+
+*(opencode recorded the session but summarised Hari's words instead of quoting them verbatim)*
+
+**Hari**: why did you record my talk? record our talks as-is, and you could add some other important details as you wish.
+
+*(opencode corrected the record — this entry is the as-is version)*
+
+---
+
+### Implementation plan (v0.10)
+1. Eager K-level promotion: `M_att ≥ 1.0` single success → M promotes to K on next Dreamer tick
+2. Two-stage C-level: requires existing K entry + `M_att ≥ 3.0` on K-level entries
+3. Failure asymmetry: single failure stays M; 2nd failure same `(space,entity)` → K-level Avoid; failure contradicting K success → demote K → M
+4. `QueryK` added so R2 reads K-level content (not just C) — makes `QueryRecent` redundant
+5. `QueryRecent` deprecated once K-level promotion is eager enough
 
 ### Other fixes this session
-- **Issue #96** — LLM dial timeout: added `net.Dialer.Timeout: 10s`, `TLSHandshakeTimeout: 10s`, `ResponseHeaderTimeout: 30s` to `http.Transport`. Unreachable endpoints now fail in ≤10s instead of ≤120s.
+- **Issue #96** — LLM dial timeout: `net.Dialer.Timeout: 10s`, `TLSHandshakeTimeout: 10s`, `ResponseHeaderTimeout: 30s`
 - **Issues #95, #96, #97** recorded in `docs/issues.md`
 
 ### Commits
