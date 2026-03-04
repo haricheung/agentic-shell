@@ -31,15 +31,15 @@ const (
 	MsgCorrectionSignal MessageType = "CorrectionSignal"
 	MsgSubTaskOutcome   MessageType = "SubTaskOutcome"
 	MsgReplanRequest    MessageType = "ReplanRequest"
-	MsgMemoryWrite      MessageType = "MemoryWrite"   // deprecated: GGS writes directly; kept for Auditor compat
-	MsgMemoryRead       MessageType = "MemoryRead"    // deprecated: Planner queries directly
+	MsgMemoryWrite      MessageType = "MemoryWrite"    // deprecated: GGS writes directly; kept for Auditor compat
+	MsgMemoryRead       MessageType = "MemoryRead"     // deprecated: Planner queries directly
 	MsgMemoryResponse   MessageType = "MemoryResponse" // deprecated: Planner queries directly
 	MsgMegram           MessageType = "Megram"         // R7 → R5 (bus-observable Megram write for Auditor)
 	MsgFinalResult      MessageType = "FinalResult"
-	MsgAuditQuery       MessageType = "AuditQuery"      // User → R6: request an on-demand report
-	MsgAuditReport      MessageType = "AuditReport"     // R6 → User: generated report
-	MsgPlanDirective    MessageType = "PlanDirective"   // R7 → R2: gradient-directed planning instruction
-	MsgOutcomeSummary   MessageType = "OutcomeSummary"  // R4b → R7: all subtasks matched; GGS delivers final result
+	MsgAuditQuery       MessageType = "AuditQuery"     // User → R6: request an on-demand report
+	MsgAuditReport      MessageType = "AuditReport"    // R6 → User: generated report
+	MsgPlanDirective    MessageType = "PlanDirective"  // R7 → R2: gradient-directed planning instruction
+	MsgOutcomeSummary   MessageType = "OutcomeSummary" // R4b → R7: all subtasks matched; GGS delivers final result
 )
 
 // Message is the envelope for all inter-role communication on the bus
@@ -83,7 +83,7 @@ type DispatchManifest struct {
 	SubTaskIDs   []string  `json:"subtask_ids"`
 	TaskSpec     *TaskSpec `json:"task_spec,omitempty"`
 	DispatchedAt string    `json:"dispatched_at"`
-	TaskCriteria []string  `json:"task_criteria"`  // task-level success criteria written by R2; R4b validates the merged output against these
+	TaskCriteria []string  `json:"task_criteria"` // task-level success criteria written by R2; R4b validates the merged output against these
 }
 
 // ExecutionResult is produced by R3 Executor and consumed by R4a Agent-Validator
@@ -127,8 +127,8 @@ type SubTaskOutcome struct {
 	SubTaskID        string               `json:"subtask_id"`
 	ParentTaskID     string               `json:"parent_task_id"`
 	Intent           string               `json:"intent"`
-	SuccessCriteria  []string             `json:"success_criteria"`          // copied from SubTask so R4b can check them
-	Status           string               `json:"status"`                    // "matched" | "failed"
+	SuccessCriteria  []string             `json:"success_criteria"` // copied from SubTask so R4b can check them
+	Status           string               `json:"status"`           // "matched" | "failed"
 	Output           any                  `json:"output"`
 	FailureReason    *string              `json:"failure_reason"`
 	GapTrajectory    []GapTrajectoryPoint `json:"gap_trajectory"`
@@ -139,13 +139,13 @@ type SubTaskOutcome struct {
 // ReplanRequest is produced by R4b and consumed by R7 (GGS). GGS owns gradient computation.
 type ReplanRequest struct {
 	TaskID          string           `json:"task_id"`
-	Intent          string           `json:"intent"`                  // task intent; GGS uses for terminal Megram space tag
+	Intent          string           `json:"intent"` // task intent; GGS uses for terminal Megram space tag
 	GapSummary      string           `json:"gap_summary"`
 	FailedSubTasks  []string         `json:"failed_subtasks"`
 	CorrectionCount int              `json:"correction_count"`
-	ElapsedMs       int64            `json:"elapsed_ms"`              // wall-clock ms since task started; for Ω computation
-	Outcomes        []SubTaskOutcome `json:"outcomes"`                // full outcome data for GGS gradient computation
-	Recommendation  string           `json:"recommendation"`          // "replan" | "abandon"
+	ElapsedMs       int64            `json:"elapsed_ms"`     // wall-clock ms since task started; for Ω computation
+	Outcomes        []SubTaskOutcome `json:"outcomes"`       // full outcome data for GGS gradient computation
+	Recommendation  string           `json:"recommendation"` // "replan" | "abandon"
 }
 
 // LossBreakdown carries the GGS loss components for a replan round.
@@ -161,15 +161,15 @@ type LossBreakdown struct {
 type PlanDirective struct {
 	TaskID          string        `json:"task_id"`
 	Loss            LossBreakdown `json:"loss"`
-	PrevDirective   string        `json:"prev_directive"`    // macro-state from previous round; "init" on first round
-	Directive       string        `json:"directive"`         // "refine" | "change_path" | "change_approach" | "break_symmetry"
-	BlockedTools    []string      `json:"blocked_tools"`     // tool names R2 must not use; populated for break_symmetry + change_approach (logical)
-	BlockedTargets  []string      `json:"blocked_targets"`   // specific failed inputs (queries/commands/paths); populated for change_path + refine (environmental); accumulates across rounds
-	FailedCriterion string        `json:"failed_criterion"`  // primary criterion driving D
-	FailureClass    string        `json:"failure_class"`     // "logical" | "environmental" | "mixed"
-	BudgetPressure  float64       `json:"budget_pressure"`   // Ω value for display
-	GradL           float64       `json:"grad_l"`            // ∇L = L_t − L_{t-1}; 0 on first round
-	Rationale       string        `json:"rationale"`         // human-readable explanation; logged by Auditor
+	PrevDirective   string        `json:"prev_directive"`   // macro-state from previous round; "init" on first round
+	Directive       string        `json:"directive"`        // "refine" | "change_path" | "change_approach" | "break_symmetry"
+	BlockedTools    []string      `json:"blocked_tools"`    // tool names R2 must not use; populated for break_symmetry + change_approach (logical)
+	BlockedTargets  []string      `json:"blocked_targets"`  // specific failed inputs (queries/commands/paths); populated for change_path + refine (environmental); accumulates across rounds
+	FailedCriterion string        `json:"failed_criterion"` // primary criterion driving D
+	FailureClass    string        `json:"failure_class"`    // "logical" | "environmental" | "mixed"
+	BudgetPressure  float64       `json:"budget_pressure"`  // Ω value for display
+	GradL           float64       `json:"grad_l"`           // ∇L = L_t − L_{t-1}; 0 on first round
+	Rationale       string        `json:"rationale"`        // human-readable explanation; logged by Auditor
 }
 
 // RoleCost records LLM usage for one role in a completed task.
@@ -218,12 +218,12 @@ type MemoryResponse struct {
 
 // AuditEvent is written to the audit log by R6 Auditor
 type AuditEvent struct {
-	EventID     string `json:"event_id"`
-	Timestamp   string `json:"timestamp"`
-	FromRole    Role   `json:"from_role"`
-	ToRole      Role   `json:"to_role"`
-	MessageType string `json:"message_type"`
-	Anomaly     string `json:"anomaly"` // "boundary_violation" | "convergence_failure" | "drift" | "none"
+	EventID     string  `json:"event_id"`
+	Timestamp   string  `json:"timestamp"`
+	FromRole    Role    `json:"from_role"`
+	ToRole      Role    `json:"to_role"`
+	MessageType string  `json:"message_type"`
+	Anomaly     string  `json:"anomaly"` // "boundary_violation" | "convergence_failure" | "drift" | "none"
 	Detail      *string `json:"detail"`
 }
 
@@ -241,14 +241,14 @@ type ToolHealth struct {
 
 // AuditReport is a summary produced by R6 for the human operator
 type AuditReport struct {
-	ReportID           string             `json:"report_id"`
-	Period             AuditPeriod        `json:"period"`
-	TasksObserved      int                `json:"tasks_observed"`
-	BoundaryViolations []string           `json:"boundary_violations"`
-	ConvergenceHealth  ConvergenceHealth  `json:"convergence_health"`
-	DriftAlerts        []string           `json:"drift_alerts"`
-	Anomalies          []string           `json:"anomalies"`
-	ToolHealth         ToolHealth         `json:"tool_health"`
+	ReportID           string            `json:"report_id"`
+	Period             AuditPeriod       `json:"period"`
+	TasksObserved      int               `json:"tasks_observed"`
+	BoundaryViolations []string          `json:"boundary_violations"`
+	ConvergenceHealth  ConvergenceHealth `json:"convergence_health"`
+	DriftAlerts        []string          `json:"drift_alerts"`
+	Anomalies          []string          `json:"anomalies"`
+	ToolHealth         ToolHealth        `json:"tool_health"`
 }
 
 type AuditPeriod struct {
@@ -294,7 +294,6 @@ type FinalResult struct {
 	PrevDirective string        `json:"prev_directive"` // macro-state from previous round; "init" on first round
 }
 
-
 // ---------------------------------------------------------------------------
 // MKCT Memory Engine types (R5 v0.8)
 // ---------------------------------------------------------------------------
@@ -304,16 +303,16 @@ type FinalResult struct {
 // All writes are append-only; error correction appends negative-σ Megrams.
 type Megram struct {
 	ID             string  `json:"id"`
-	Level          string  `json:"level"`                    // "M" | "K" | "C" | "T"
-	CreatedAt      string  `json:"created_at"`               // RFC3339
+	Level          string  `json:"level"`                      // "M" | "K" | "C" | "T"
+	CreatedAt      string  `json:"created_at"`                 // RFC3339
 	LastRecalledAt string  `json:"last_recalled_at,omitempty"` // RFC3339; updated on QueryC hit
-	Space          string  `json:"space"`                    // inverted index tag: "tool:<name>" | "intent:<slug>"
-	Entity         string  `json:"entity"`                   // inverted index tag: "path:<val>" | "env:local"
-	Content        string  `json:"content"`                  // error log, summary, or lesson
-	State          string  `json:"state"`                    // GGS macro-state: accept|success|abandon|...
-	F              float64 `json:"f"`                        // initial stimulus magnitude [0, 1]
-	Sigma          float64 `json:"sigma"`                    // valence direction [-1.0, +1.0]
-	K              float64 `json:"k"`                        // time decay rate: 0.0 | 0.05 | 0.2 | 0.5
+	Space          string  `json:"space"`                      // inverted index tag: "tool:<name>" | "intent:<slug>"
+	Entity         string  `json:"entity"`                     // inverted index tag: "path:<val>" | "env:local"
+	Content        string  `json:"content"`                    // error log, summary, or lesson
+	State          string  `json:"state"`                      // GGS macro-state: accept|success|abandon|...
+	F              float64 `json:"f"`                          // initial stimulus magnitude [0, 1]
+	Sigma          float64 `json:"sigma"`                      // valence direction [-1.0, +1.0]
+	K              float64 `json:"k"`                          // time decay rate: 0.0 | 0.05 | 0.2 | 0.5
 }
 
 // SOPRecord is a C-level memory entry (best practice or constraint) returned by QueryC.
@@ -344,6 +343,10 @@ type MemoryService interface {
 	QueryC(ctx context.Context, space, entity string) ([]SOPRecord, error)
 	// QueryMK computes live dual-channel convolution potentials for a (space, entity) pair.
 	QueryMK(ctx context.Context, space, entity string) (Potentials, error)
+	// QueryRecent returns up to n most recent M/K-level Megrams for the given (space, entity)
+	// pair sorted newest-first. Used by Planner to inject concrete past experience directly
+	// into R2's prompt without waiting for Dreamer C-level promotion.
+	QueryRecent(ctx context.Context, space, entity string, n int) ([]Megram, error)
 	// RecordNegativeFeedback appends a negative-σ Megram to cancel stale positive potentials.
 	RecordNegativeFeedback(ctx context.Context, ruleID, content string)
 	// Close drains the pending write queue. Called by Run() on context cancellation.
@@ -381,8 +384,8 @@ type MegRamGroup struct {
 //   - CLevel contains one SOPRecord per C-level Megram currently in the store
 //   - Groups is nil when verbose=false; populated by SummaryVerbose()
 type MemorySummary struct {
-	LevelCounts map[string]int `json:"level_counts"` // "M"→N, "K"→N, "C"→N, "T"→N
-	CLevel      []SOPRecord    `json:"c_level"`       // all promoted SOPs and constraints
+	LevelCounts map[string]int `json:"level_counts"`     // "M"→N, "K"→N, "C"→N, "T"→N
+	CLevel      []SOPRecord    `json:"c_level"`          // all promoted SOPs and constraints
 	Groups      []MegRamGroup  `json:"groups,omitempty"` // populated by SummaryVerbose() only
 }
 

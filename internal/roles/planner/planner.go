@@ -264,19 +264,24 @@ func (p *Planner) queryMKCTConstraints(ctx context.Context, taskID string, tl *t
 
 	sops, err1 := p.mem.QueryC(ctx, space, entity)
 	pots, err2 := p.mem.QueryMK(ctx, space, entity)
+	recent, err3 := p.mem.QueryRecent(ctx, space, entity, 3)
 	if err1 != nil {
 		slog.Warn("[R2] QueryC failed", "error", err1)
 	}
 	if err2 != nil {
 		slog.Warn("[R2] QueryMK failed", "error", err2)
 	}
+	if err3 != nil {
+		slog.Warn("[R2] QueryRecent failed", "error", err3)
+	}
 
-	constraints := calibrateMKCT(sops, pots)
+	constraints := calibrateMKCT(sops, pots, recent)
 	tl.MemoryQuery(space, entity, len(sops), pots.Action, pots.Attention, pots.Decision)
 	slog.Info("[R2] memory query",
 		"space", space,
 		"entity", entity,
 		"sops", len(sops),
+		"recent", len(recent),
 		"attention", pots.Attention,
 		"decision", pots.Decision,
 		"action", pots.Action,
@@ -288,34 +293,29 @@ func (p *Planner) queryMKCTConstraints(ctx context.Context, taskID string, tl *t
 	return constraints
 }
 
-// calibrateMKCT builds a planning constraint string from MKCT QueryC and QueryMK results.
-// SOPs with σ>0 become SHOULD PREFER lines; SOPs with σ≤0 become MUST NOT lines.
-// Potential action (Exploit/Avoid/Caution) adds a general heuristic line.
+// calibrateMKCT builds a planning constraint string from MKCT query results.
+// Injects three layers in priority order:
+//  1. C-level SOPs (Dreamer-distilled rules) — highest authority
+//  2. Recent M/K Megram content (raw past experience) — concrete tool evidence
+//  3. Dual-channel potential heuristic (Exploit/Avoid/Caution) — directional signal
+//
+// Layer 2 is the key fix over the previous MKCT implementation: raw Megram content
+// (which includes tools used, commands run, and outcomes) is injected directly so R2
+// has concrete evidence from the first warm run, without waiting for Dreamer promotion.
 //
 // Expectations:
-//   - Returns "" when sops is empty and pots.Action is "Ignore"
+//   - Returns "" when sops is empty, recent is empty, and pots.Action is "Ignore"
 //   - Includes "SHOULD PREFER" block when pots.Action is "Exploit"
 //   - Includes "MUST NOT" block when pots.Action is "Avoid"
 //   - Includes "CAUTION" block when pots.Action is "Caution"
 //   - Positive-σ SOPs appear under "SHOULD PREFER (proven best practices)"
 //   - Non-positive-σ SOPs appear under "MUST NOT (proven constraints)"
-func calibrateMKCT(sops []types.SOPRecord, pots types.Potentials) string {
+//   - Recent success Megrams (state=accept/success) injected under "SHOULD PREFER (recent experience)"
+//   - Recent failure Megrams (state=abandon) injected under "MUST NOT (recent experience)"
+func calibrateMKCT(sops []types.SOPRecord, pots types.Potentials, recent []types.Megram) string {
 	var sb strings.Builder
 
-	// General heuristic from dual-channel potentials.
-	switch pots.Action {
-	case "Exploit":
-		sb.WriteString("SHOULD PREFER (memory: this approach worked well for similar tasks):\n")
-		sb.WriteString("  - Follow the same general approach that succeeded previously.\n")
-	case "Avoid":
-		sb.WriteString("MUST NOT (memory: this approach consistently failed for similar tasks):\n")
-		sb.WriteString("  - Do not repeat the approach that failed previously.\n")
-	case "Caution":
-		sb.WriteString("CAUTION (memory: mixed results for similar tasks):\n")
-		sb.WriteString("  - Validate each step carefully before committing.\n")
-	}
-
-	// C-level SOPs: best practices (σ>0) and constraints (σ≤0).
+	// Layer 1 — C-level SOPs (Dreamer-distilled; highest authority).
 	var mustNots, shouldPrefers []string
 	for _, sop := range sops {
 		line := "  - " + sop.Content
@@ -326,9 +326,6 @@ func calibrateMKCT(sops []types.SOPRecord, pots types.Potentials) string {
 		}
 	}
 	if len(mustNots) > 0 {
-		if sb.Len() > 0 {
-			sb.WriteString("\n")
-		}
 		sb.WriteString("MUST NOT (proven constraints from accumulated experience):\n")
 		for _, c := range mustNots {
 			sb.WriteString(c + "\n")
@@ -343,6 +340,58 @@ func calibrateMKCT(sops []types.SOPRecord, pots types.Potentials) string {
 			sb.WriteString(c + "\n")
 		}
 	}
+
+	// Layer 2 — Recent M/K Megram content (raw past experience injected directly).
+	// Success states (accept/success): inject under SHOULD PREFER.
+	// Failure states (abandon): inject under MUST NOT.
+	var recentSuccess, recentFailure []string
+	for _, m := range recent {
+		if m.Content == "" {
+			continue
+		}
+		line := "  - " + m.Content
+		switch m.State {
+		case "accept", "success":
+			recentSuccess = append(recentSuccess, line)
+		case "abandon":
+			recentFailure = append(recentFailure, line)
+		}
+	}
+	if len(recentFailure) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("MUST NOT (recent experience — these approaches failed):\n")
+		for _, c := range recentFailure {
+			sb.WriteString(c + "\n")
+		}
+	}
+	if len(recentSuccess) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("SHOULD PREFER (recent experience — these approaches succeeded):\n")
+		for _, c := range recentSuccess {
+			sb.WriteString(c + "\n")
+		}
+	}
+
+	// Layer 3 — Dual-channel potential heuristic (directional signal only).
+	// Only shown when layers 1+2 produced no content, to avoid redundancy.
+	if sb.Len() == 0 {
+		switch pots.Action {
+		case "Exploit":
+			sb.WriteString("SHOULD PREFER (memory signal: this task class succeeded previously):\n")
+			sb.WriteString("  - Follow the same general approach that succeeded previously.\n")
+		case "Avoid":
+			sb.WriteString("MUST NOT (memory signal: this task class consistently failed):\n")
+			sb.WriteString("  - Do not repeat the approach that failed previously.\n")
+		case "Caution":
+			sb.WriteString("CAUTION (memory signal: mixed results for this task class):\n")
+			sb.WriteString("  - Validate each step carefully before committing.\n")
+		}
+	}
+
 	return sb.String()
 }
 

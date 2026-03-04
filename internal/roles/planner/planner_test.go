@@ -10,41 +10,41 @@ import (
 // --- calibrateMKCT ---
 
 func TestCalibrateMKCT_EmptyReturnsEmpty(t *testing.T) {
-	// Returns "" when sops is empty and pots.Action is "Ignore"
-	got := calibrateMKCT(nil, types.Potentials{Action: "Ignore"})
+	// Returns "" when sops, recent, and pots are all empty/Ignore
+	got := calibrateMKCT(nil, types.Potentials{Action: "Ignore"}, nil)
 	if got != "" {
 		t.Errorf("expected empty string, got %q", got)
 	}
 }
 
 func TestCalibrateMKCT_ExploitIncludesShouldPrefer(t *testing.T) {
-	// Includes "SHOULD PREFER" block when pots.Action is Exploit
-	got := calibrateMKCT(nil, types.Potentials{Action: "Exploit"})
+	// Layer 3: includes "SHOULD PREFER" heuristic when no layers 1/2 content and action is Exploit
+	got := calibrateMKCT(nil, types.Potentials{Action: "Exploit"}, nil)
 	if !strings.Contains(got, "SHOULD PREFER") {
 		t.Errorf("expected SHOULD PREFER for Exploit action, got %q", got)
 	}
 }
 
 func TestCalibrateMKCT_AvoidIncludesMustNot(t *testing.T) {
-	// Includes "MUST NOT" block when pots.Action is Avoid
-	got := calibrateMKCT(nil, types.Potentials{Action: "Avoid"})
+	// Layer 3: includes "MUST NOT" heuristic when no layers 1/2 content and action is Avoid
+	got := calibrateMKCT(nil, types.Potentials{Action: "Avoid"}, nil)
 	if !strings.Contains(got, "MUST NOT") {
 		t.Errorf("expected MUST NOT for Avoid action, got %q", got)
 	}
 }
 
 func TestCalibrateMKCT_CautionIncludesCaution(t *testing.T) {
-	// Includes "CAUTION" block when pots.Action is Caution
-	got := calibrateMKCT(nil, types.Potentials{Action: "Caution"})
+	// Layer 3: includes "CAUTION" heuristic when no layers 1/2 content and action is Caution
+	got := calibrateMKCT(nil, types.Potentials{Action: "Caution"}, nil)
 	if !strings.Contains(got, "CAUTION") {
 		t.Errorf("expected CAUTION for Caution action, got %q", got)
 	}
 }
 
 func TestCalibrateMKCT_PositiveSigmaUnderShouldPrefer(t *testing.T) {
-	// Positive-σ SOPs appear under "SHOULD PREFER (proven best practices)"
+	// Layer 1: positive-σ SOPs appear under "SHOULD PREFER (proven best practices)"
 	sops := []types.SOPRecord{{ID: "1", Content: "use mdfind for file search", Sigma: 1.0}}
-	got := calibrateMKCT(sops, types.Potentials{Action: "Ignore"})
+	got := calibrateMKCT(sops, types.Potentials{Action: "Ignore"}, nil)
 	if !strings.Contains(got, "SHOULD PREFER") {
 		t.Errorf("expected SHOULD PREFER section for positive-sigma SOP, got %q", got)
 	}
@@ -54,14 +54,61 @@ func TestCalibrateMKCT_PositiveSigmaUnderShouldPrefer(t *testing.T) {
 }
 
 func TestCalibrateMKCT_NegativeSigmaUnderMustNot(t *testing.T) {
-	// Non-positive-σ SOPs appear under "MUST NOT (proven constraints)"
+	// Layer 1: non-positive-σ SOPs appear under "MUST NOT (proven constraints)"
 	sops := []types.SOPRecord{{ID: "2", Content: "never use shell find on /", Sigma: -1.0}}
-	got := calibrateMKCT(sops, types.Potentials{Action: "Ignore"})
+	got := calibrateMKCT(sops, types.Potentials{Action: "Ignore"}, nil)
 	if !strings.Contains(got, "MUST NOT") {
 		t.Errorf("expected MUST NOT section for negative-sigma SOP, got %q", got)
 	}
 	if !strings.Contains(got, "never use shell find") {
 		t.Errorf("expected SOP content in MUST NOT block, got %q", got)
+	}
+}
+
+func TestCalibrateMKCT_RecentSuccessUnderShouldPrefer(t *testing.T) {
+	// Layer 2: recent accept/success Megrams injected under "SHOULD PREFER (recent experience)"
+	recent := []types.Megram{
+		{State: "accept", Content: "Succeeded. Tools: shell:python3 -c 'import zhdate'. Result: 正月十六"},
+	}
+	got := calibrateMKCT(nil, types.Potentials{Action: "Ignore"}, recent)
+	if !strings.Contains(got, "SHOULD PREFER") {
+		t.Errorf("expected SHOULD PREFER for recent success, got %q", got)
+	}
+	if !strings.Contains(got, "zhdate") {
+		t.Errorf("expected Megram content (tool name) injected, got %q", got)
+	}
+	if !strings.Contains(got, "recent experience") {
+		t.Errorf("expected 'recent experience' label, got %q", got)
+	}
+}
+
+func TestCalibrateMKCT_RecentFailureUnderMustNot(t *testing.T) {
+	// Layer 2: recent abandon Megrams injected under "MUST NOT (recent experience)"
+	recent := []types.Megram{
+		{State: "abandon", Content: "Failed. Tools tried: shell:curl http://opendata.baidu.com/api.php?resource_id=39043. Gap: API returned null fields"},
+	}
+	got := calibrateMKCT(nil, types.Potentials{Action: "Ignore"}, recent)
+	if !strings.Contains(got, "MUST NOT") {
+		t.Errorf("expected MUST NOT for recent failure, got %q", got)
+	}
+	if !strings.Contains(got, "opendata.baidu.com") {
+		t.Errorf("expected Megram content (failed URL) injected, got %q", got)
+	}
+}
+
+func TestCalibrateMKCT_Layer3SuppressedWhenLayer2Present(t *testing.T) {
+	// Layer 3 heuristic is suppressed when layer 2 already has content
+	recent := []types.Megram{
+		{State: "accept", Content: "Succeeded. Tools: search:lunar date 2026. Result: 正月十六"},
+	}
+	got := calibrateMKCT(nil, types.Potentials{Action: "Exploit"}, recent)
+	// Should NOT contain the generic layer 3 fallback sentence
+	if strings.Contains(got, "Follow the same general approach") {
+		t.Errorf("layer 3 heuristic should be suppressed when layer 2 has content, got %q", got)
+	}
+	// Should contain the concrete layer 2 content
+	if !strings.Contains(got, "lunar date 2026") {
+		t.Errorf("expected layer 2 content to be present, got %q", got)
 	}
 }
 

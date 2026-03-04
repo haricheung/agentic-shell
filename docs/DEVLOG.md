@@ -71,4 +71,48 @@ When constraints are injected:
 
 ---
 
+## 2026-03-04 (session 2) — Memory content gap: MKCT pyramid worse than old flat file
+
+**Participants**: Hari, opencode
+
+### Finding
+Hari observed that the old rough memory system (flat `memory.json` + keyword scan + direct content injection into R2 prompt) performed *better* than the new MKCT pyramid. This is correct and has a precise cause.
+
+**What the old system injected into R2:**
+```
+SHOULD PREFER (prior successes — these approaches worked):
+  - Used mdfind then shell ls -lS. Found /Downloads/agentic-shell-demo.mov (85M).
+MUST NOT (prior failures — do not repeat these approaches):
+  - Baidu Open Data API resource_id=39043 returns 89 entries, all date fields None.
+```
+Concrete tool names, concrete commands, concrete outcomes. R2 could reason and copy.
+
+**What the new MKCT system injected:**
+```
+SHOULD PREFER (memory: this approach worked well for similar tasks):
+  - Follow the same general approach that succeeded previously.
+```
+One generic vacuous sentence. The actual Megram `Content` field — even after our earlier fix to enrich it with tool names — was thrown away by the dual-channel convolution math in `QueryMK`. `QueryMK` produces only `{Attention, Decision, Action}` — a scalar direction, not content. And C-level SOP promotion requires `M_att ≥ 5.0` (≈5 runs), so R2 gets nothing actionable until well after cold start.
+
+### Root cause
+`calibrateMKCT` only read from `QueryC` (C-level SOPs, always empty until Dreamer promotes) and `QueryMK` (direction-only potentials). The raw Megram `Content` was unreachable from R2.
+
+### Fix
+Added `QueryRecent(ctx, space, entity, n)` to `MemoryService` interface and `Store`. Returns up to `n` most recent M/K-level non-consolidated Megrams newest-first — bypassing the convolution math to surface raw content directly.
+
+Updated `calibrateMKCT` to inject three layers in priority order:
+1. **C-level SOPs** (Dreamer-distilled rules) — highest authority, empty until warm
+2. **Recent M/K Megram content** (raw past experience) — available from 2nd run; contains `"Succeeded. Tools: shell:python3 -c 'import zhdate'..."` or `"Failed. Tools tried: shell:curl http://opendata.baidu.com/..."`
+3. **Dual-channel potential heuristic** — only shown when layers 1+2 are both empty (cold start fallback)
+
+Layer 3 is now suppressed when layers 1 or 2 have content, eliminating the vacuous "Follow the same general approach" sentence.
+
+**Result**: from the 2nd run onward, R2 sees concrete tool names, commands, and outcomes — same quality as the old flat-file system, but now embedded in the pyramid architecture so it will continue to improve via Dreamer consolidation over time.
+
+### Commits
+- `c6d1102` — richer terminal Megram content (tools in accept/success/abandon)
+- next commit — `QueryRecent` + 3-layer `calibrateMKCT`
+
+---
+
 *This log is maintained by opencode. Each session appends a new dated entry.*

@@ -205,6 +205,53 @@ func (s *Store) QueryMK(ctx context.Context, space, entity string) (types.Potent
 	}, nil
 }
 
+// QueryRecent returns up to n most recent M/K-level Megrams for the given (space, entity)
+// pair, sorted newest-first by CreatedAt. Skips consolidated entries.
+// Used by Planner to inject concrete past experience directly into R2's prompt without
+// waiting for Dreamer C-level promotion — mirrors the behaviour of the old file-backed
+// memory system which injected raw content directly.
+//
+// Expectations:
+//   - Returns at most n entries
+//   - Only returns M and K level entries (not C or T)
+//   - Skips entries with State="consolidated"
+//   - Sorted newest-first by CreatedAt
+//   - Returns empty slice (not error) when no entries match
+func (s *Store) QueryRecent(_ context.Context, space, entity string, n int) ([]types.Megram, error) {
+	prefix := idxPrefix(space, entity)
+	iter := s.db.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
+	defer iter.Release()
+
+	var results []types.Megram
+	for iter.Next() {
+		id := megIDFromIdxKey(string(iter.Key()), prefix)
+		if id == "" {
+			continue
+		}
+		m, err := s.fetchMegram(id)
+		if err != nil {
+			continue
+		}
+		if m.Level != "M" && m.Level != "K" {
+			continue
+		}
+		if m.State == "consolidated" {
+			continue
+		}
+		results = append(results, m)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].CreatedAt > results[j].CreatedAt
+	})
+	if len(results) > n {
+		results = results[:n]
+	}
+	return results, nil
+}
+
 // RecordNegativeFeedback appends a negative-σ Megram that mathematically cancels
 // a stale positive potential. This implements the "Soft Overwrite" from Module 4.
 //

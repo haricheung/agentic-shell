@@ -1039,3 +1039,104 @@ func TestSummaryVerbose_SortedByLevelThenSpace(t *testing.T) {
 		t.Errorf("expected third group K-level, got %s", got.Groups[2].Level)
 	}
 }
+
+// ── QueryRecent ──────────────────────────────────────────────────────────────
+
+func TestQueryRecent_EmptyWhenNoEntries(t *testing.T) {
+	s := newTestStore(t)
+	results, err := s.QueryRecent(context.Background(), "intent:no_such_task", "env:local", 5)
+	if err != nil {
+		t.Fatalf("QueryRecent failed: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("expected 0 results, got %d", len(results))
+	}
+}
+
+func TestQueryRecent_ReturnsMKLevelNewestFirst(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	persist := func(content, state, ts string) {
+		s.persistMegram(types.Megram{
+			ID: uuid.New().String(), Level: "M", CreatedAt: ts,
+			Space: "intent:test_recent", Entity: "env:local",
+			Content: content, State: state, F: 1.0, Sigma: 1.0, K: 0.05,
+		})
+	}
+	persist("oldest content", "accept", "2026-03-01T10:00:00Z")
+	persist("middle content", "accept", "2026-03-02T10:00:00Z")
+	persist("newest content", "accept", "2026-03-03T10:00:00Z")
+
+	results, err := s.QueryRecent(ctx, "intent:test_recent", "env:local", 5)
+	if err != nil {
+		t.Fatalf("QueryRecent failed: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+	if results[0].Content != "newest content" {
+		t.Errorf("expected newest first, got: %s", results[0].Content)
+	}
+	if results[2].Content != "oldest content" {
+		t.Errorf("expected oldest last, got: %s", results[2].Content)
+	}
+}
+
+func TestQueryRecent_RespectsNLimit(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for i := 0; i < 5; i++ {
+		s.persistMegram(types.Megram{
+			ID:        uuid.New().String(),
+			Level:     "M",
+			CreatedAt: "2026-03-0" + string(rune('1'+i)) + "T10:00:00Z",
+			Space:     "intent:limit_test",
+			Entity:    "env:local",
+			Content:   "entry",
+			State:     "accept",
+			F:         1.0, Sigma: 1.0, K: 0.05,
+		})
+	}
+
+	results, err := s.QueryRecent(ctx, "intent:limit_test", "env:local", 2)
+	if err != nil {
+		t.Fatalf("QueryRecent failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Errorf("expected 2 results with n=2, got %d", len(results))
+	}
+}
+
+func TestQueryRecent_SkipsCLevelAndConsolidated(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	s.persistMegram(types.Megram{
+		ID: uuid.New().String(), Level: "C", CreatedAt: "2026-03-03T10:00:00Z",
+		Space: "intent:skip_test", Entity: "env:local", Content: "c-level sop",
+		State: "Best Practice", F: 1.0, Sigma: 1.0, K: 0.0,
+	})
+	s.persistMegram(types.Megram{
+		ID: uuid.New().String(), Level: "M", CreatedAt: "2026-03-02T10:00:00Z",
+		Space: "intent:skip_test", Entity: "env:local", Content: "consolidated megram",
+		State: "consolidated", F: 1.0, Sigma: 1.0, K: 0.05,
+	})
+	s.persistMegram(types.Megram{
+		ID: uuid.New().String(), Level: "M", CreatedAt: "2026-03-01T10:00:00Z",
+		Space: "intent:skip_test", Entity: "env:local", Content: "valid megram",
+		State: "accept", F: 1.0, Sigma: 1.0, K: 0.05,
+	})
+
+	results, err := s.QueryRecent(ctx, "intent:skip_test", "env:local", 10)
+	if err != nil {
+		t.Fatalf("QueryRecent failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result (only valid M-level non-consolidated), got %d", len(results))
+	}
+	if results[0].Content != "valid megram" {
+		t.Errorf("expected 'valid megram', got: %s", results[0].Content)
+	}
+}
