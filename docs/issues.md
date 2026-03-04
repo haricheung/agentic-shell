@@ -2582,3 +2582,109 @@ Files changed:
 - `internal/roles/ggs/ggs.go` — `writeTerminalMegram` gains `taskID` param; uses `"intent:"+taskID`
 - `internal/roles/planner/planner.go` — `queryMKCTConstraints` gains `taskID` param; uses `"intent:"+taskID`
 - `cmd/artoo/main.go` — passes `toolClient` to `memory.New`
+
+---
+
+
+## Issue #95 — Ctrl+C does nothing when pressed while idle between tasks
+
+**Symptom**
+Pressing Ctrl+C while artoo is idle (no task running — e.g. after a task completed and before the next prompt) produced no response. The process appeared frozen. Neither the "Ctrl+C again to quit" warning nor a clean exit occurred. The only escape was Ctrl+D or typing `exit`.
+
+**Root cause**
+The signal handler goroutine was declared *before* `rlCh` and `rlResult` in `runREPL`. The `else` branch for the idle case (when `taskCancel == nil`) contained the comment:
+```go
+// When idle (tc == nil), do nothing — readline's ErrInterrupt handles exit.
+```
+This was correct only when `rl.Readline()` was already blocking, meaning readline had already called into the TTY and was waiting for a keypress. However, between task completion and the next `readLine()` call, the main loop was doing bookkeeping (draining stale interrupts, updating history, clearing task state). During this window, `rl.Readline()` had not yet been called — so the signal arrived, the handler did nothing, and the interrupt was consumed and lost. The main loop eventually reached `readLine()` but no `ErrInterrupt` was queued.
+
+**Fix**
+Two changes:
+1. Moved the signal handler goroutine declaration to *after* `rlCh` and `rlResult` are defined so the goroutine can reference them.
+2. Changed the idle branch from a no-op to:
+```go
+select {
+case rlCh <- rlResult{err: readline.ErrInterrupt}:
+default:
+}
+```
+This injects a synthetic `ErrInterrupt` directly into `rlCh`. On the main loop's next `readLine()` call — regardless of whether `rl.Readline()` is blocking yet — it will see the interrupt and follow the normal "first press warns, second press exits" path.
+
+Files changed:
+- `cmd/artoo/main.go`
+
+---
+
+
+## Issue #96 — LLM call hangs for minutes when endpoint is unreachable
+
+**Symptom**
+When the network was unavailable or the API endpoint was unreachable (e.g. VPN disconnected, DNS failure, or the server at `genaiapi.cloudsway.net` was down), artoo appeared completely frozen. The task would eventually fail with:
+```
+[R2] planning failed  error="llm: http request: Post "https://...": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+```
+But this took up to ~2 minutes to surface. During that window the REPL was unresponsive with no indication of the problem.
+
+**Root cause**
+`http.Client{Timeout: 120 * time.Second}` was the only timeout guard. `http.Client.Timeout` covers the entire round trip from `Do()` call to response body read — it does run during the TCP connect phase. However, on macOS the kernel-level TCP connect attempt can hold open for several minutes before the OS returns a "connection refused" or "network unreachable" error, depending on the network state. This meant the `http.Client.Timeout` of 120s was the earliest the failure could surface, with no fast-fail path for completely unreachable hosts.
+
+**Fix**
+Added a custom `http.Transport` with three granular timeouts:
+
+| Timeout | Value | Covers |
+|---|---|---|
+| `net.Dialer.Timeout` | 10s | TCP connection establishment — fails fast when host unreachable |
+| `TLSHandshakeTimeout` | 10s | TLS negotiation stall after TCP connect |
+| `ResponseHeaderTimeout` | 30s | Server connected but not sending response headers |
+| `http.Client.Timeout` | 120s | Overall safety net (slow response body, streaming) |
+
+The `net.Dialer.Timeout` is the critical fix: TCP connect now aborts in 10s instead of waiting for the OS TCP stack timeout. An unreachable endpoint now fails in ≤10s rather than ≤120s.
+
+Files changed:
+- `internal/llm/client.go`
+
+---
+
+
+## Issue #97 — MKCT memory pyramid better at accumulation than recall: C-level SOPs never reached R2
+
+**Symptom**
+After the MKCT LevelDB pyramid replaced the old flat `memory.json` system, R2's planning quality regressed. The old system produced concrete constraints like:
+```
+SHOULD PREFER: Used mdfind then shell ls -lS — found /Downloads/agentic-shell-demo.mov (85M)
+MUST NOT: Baidu Open Data API resource_id=39043 returns null fields for all dates
+```
+The new MKCT system produced only:
+```
+SHOULD PREFER (memory: this approach worked well for similar tasks):
+  - Follow the same general approach that succeeded previously.
+```
+
+**Root cause**
+`calibrateMKCT` read from two sources:
+1. `QueryC` — C-level SOPs (Dreamer-distilled). Requires `M_att ≥ 5.0` (≈5+ runs of the same task) before promotion. Always empty in practice.
+2. `QueryMK` — dual-channel convolution producing `{Attention, Decision, Action}`. A scalar direction — the actual Megram `Content` field is discarded by the convolution math.
+
+The raw Megram `Content` (which since issue #94 contained `"Succeeded. Tools: shell:python3 -c 'import zhdate'..."`) was unreachable by R2. It was written correctly, accumulated correctly, and would eventually be distilled by the Dreamer — but only after the C-level threshold was reached. Until then, R2 received a vacuous directional sentence.
+
+Additionally, the layer-3 heuristic (`"Follow the same general approach"`) was shown even when the M-level Megrams contained rich tool-level evidence, making the injected constraint actively misleading — it signalled confidence without substance.
+
+**Fix**
+Added `QueryRecent(ctx, space, entity, n int) ([]Megram, error)` to `MemoryService` interface and `Store`. Returns up to `n` most recent M/K-level non-consolidated Megrams, sorted newest-first, bypassing the convolution math entirely.
+
+Updated `calibrateMKCT` to inject three layers in priority order:
+
+**Layer 1 — C-level SOPs** (Dreamer-distilled rules, `QueryC`): highest authority, injected as `MUST NOT (proven constraints)` / `SHOULD PREFER (proven best practices)`. Empty until warm but timeless once promoted.
+
+**Layer 2 — Recent M/K Megram content** (`QueryRecent`, last 3 entries): raw past experience injected directly. Available from the 2nd run. Success states (`accept`/`success`) → `SHOULD PREFER (recent experience)`. Failure states (`abandon`) → `MUST NOT (recent experience)`. Content includes tool names and commands: `"Succeeded. Tools: shell:python3 -c 'import zhdate'... Result: 正月十六"`.
+
+**Layer 3 — Dual-channel potential heuristic** (direction only): shown only when layers 1 and 2 are both empty (cold start). Suppressed whenever any concrete content is available, eliminating the vacuous fallback sentence.
+
+**Result**: from the 2nd run onward, R2 sees the same quality of concrete evidence as the old flat-file system, while retaining the pyramid's accumulation and Dreamer consolidation path for long-run improvement.
+
+Files changed:
+- `internal/types/types.go` — `QueryRecent` added to `MemoryService` interface
+- `internal/roles/memory/memory.go` — `Store.QueryRecent` implementation
+- `internal/roles/planner/planner.go` — `queryMKCTConstraints` calls `QueryRecent`; `calibrateMKCT` gains `recent []Megram` parameter and 3-layer logic
+- `internal/roles/memory/memory_test.go` — 4 new tests for `QueryRecent`
+- `internal/roles/planner/planner_test.go` — 3 new tests for layer-2 injection and layer-3 suppression
