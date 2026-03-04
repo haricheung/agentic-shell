@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -82,7 +83,17 @@ func NewTier(prefix string) *Client {
 		model:          get("MODEL", "OPENAI_MODEL"),
 		label:          label,
 		enableThinking: enableThinking,
-		httpClient:     &http.Client{Timeout: 120 * time.Second},
+		httpClient: &http.Client{
+			Timeout: 120 * time.Second,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
+		},
 	}
 }
 
