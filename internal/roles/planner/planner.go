@@ -108,15 +108,16 @@ Rules:
 
 // Planner is R2. It decomposes TaskSpec into SubTasks and handles replanning.
 type Planner struct {
-	llm    *llm.Client
-	b      *bus.Bus
-	logReg *tasklog.Registry
-	mem    types.MemoryService // R5; may be nil (memory disabled)
+	llm      *llm.Client
+	b        *bus.Bus
+	logReg   *tasklog.Registry
+	mem      types.MemoryService // R5; may be nil (memory disabled)
+	outputFn func(taskID, summary string, output any)
 }
 
 // New creates a Planner. mem may be nil to disable MKCT memory queries (e.g. in tests).
-func New(b *bus.Bus, llmClient *llm.Client, logReg *tasklog.Registry, mem types.MemoryService) *Planner {
-	return &Planner{llm: llmClient, b: b, logReg: logReg, mem: mem}
+func New(b *bus.Bus, llmClient *llm.Client, logReg *tasklog.Registry, mem types.MemoryService, outputFn func(taskID, summary string, output any)) *Planner {
+	return &Planner{llm: llmClient, b: b, logReg: logReg, mem: mem, outputFn: outputFn}
 }
 
 // Run listens for TaskSpec and PlanDirective messages.
@@ -146,6 +147,7 @@ func (p *Planner) Run(ctx context.Context) {
 			go func(s types.TaskSpec) {
 				if err := p.plan(ctx, s); err != nil {
 					slog.Error("[R2] planning failed", "error", err)
+					p.publishAbandon(s.TaskID, fmt.Sprintf("R2 planning failed: %v", err))
 				}
 			}(spec)
 
@@ -168,9 +170,30 @@ func (p *Planner) Run(ctx context.Context) {
 			go func(s types.TaskSpec, directive types.PlanDirective) {
 				if err := p.replanWithDirective(ctx, s, directive); err != nil {
 					slog.Error("[R2] replanning failed", "error", err)
+					p.publishAbandon(s.TaskID, fmt.Sprintf("R2 replanning failed: %v", err))
 				}
 			}(spec, pd)
 		}
+	}
+}
+
+func (p *Planner) publishAbandon(taskID, reason string) {
+	summary := "❌ " + reason
+	p.b.Publish(types.Message{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now().UTC(),
+		From:      types.RolePlanner,
+		To:        types.RoleUser,
+		Type:      types.MsgFinalResult,
+		Payload: types.FinalResult{
+			TaskID:    taskID,
+			Summary:   summary,
+			Directive: "abandon",
+		},
+	})
+	// Deliver to resultCh so the REPL/one-shot handler unblocks.
+	if p.outputFn != nil {
+		p.outputFn(taskID, summary, nil)
 	}
 }
 

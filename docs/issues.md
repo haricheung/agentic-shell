@@ -2687,4 +2687,39 @@ Files changed:
 - `internal/roles/memory/memory.go` — `Store.QueryRecent` implementation
 - `internal/roles/planner/planner.go` — `queryMKCTConstraints` calls `QueryRecent`; `calibrateMKCT` gains `recent []Megram` parameter and 3-layer logic
 - `internal/roles/memory/memory_test.go` — 4 new tests for `QueryRecent`
+
+---
+
+
+## Issue #98 — Planner abandon hangs REPL forever — `publishAbandon` bypasses `resultCh`
+
+**Symptom**
+When the LLM call fails during planning (e.g. network timeout, malformed response), the REPL hangs indefinitely. The Auditor reports "unexpected R2→User for FinalResult" and the display shows the pipeline closing, but no prompt returns. The user must kill the process.
+
+**Root cause**
+`Planner.publishAbandon()` published a `FinalResult` message to the bus only. The REPL's `waitResult` loop reads from `resultCh`, which is only written by `outputFn` — a callback held by MetaVal and GGS. The Planner had no access to `outputFn`, so its abandon `FinalResult` reached the display (bus tap) and Auditor (bus tap) but never reached `resultCh`. The REPL blocked forever on `case result := <-resultCh`.
+
+**Fix**
+Added `outputFn` callback to the `Planner` struct and `New()` constructor (same pattern as MetaVal and GGS). `publishAbandon` now calls `p.outputFn(taskID, summary, nil)` after the bus publish, delivering the abandon result to `resultCh` so the REPL unblocks.
+
+Files changed: [spec v0.9]
+- `internal/roles/planner/planner.go` — added `outputFn` field; `New()` accepts callback; `publishAbandon` calls it
+- `cmd/artoo/main.go` — pass `outputFn` to `planner.New()`
+
+---
+
+
+## Issue #99 — Readline prompt `> ` not re-rendered after task completes
+
+**Symptom**
+After a task finishes (pipeline box closes, result and cost stats printed), the cursor appears at the bottom-left but the `> ` prompt is missing. The terminal accepts input but shows no visual prompt indicator.
+
+**Root cause**
+The readline goroutine calls `rl.Readline()` immediately after sending the previous input, printing the `> ` prompt while the task is still running. The display spinner repeatedly writes `\r\033[K` (carriage return + erase to EOL) to animate status updates, overwriting the prompt. When the task ends and `endTask()` prints the pipeline footer, readline is still blocked in `Readline()` — it doesn't know its prompt was destroyed and won't re-render it.
+
+**Fix**
+Added `rl.Refresh()` call after `printCostStats()` in the `waitResult` loop. `Refresh()` checks `IsReading()` internally, making it safe to call from the REPL goroutine while readline is blocked in its dedicated read goroutine. This re-renders the `> ` prompt on the current line after all task output is printed.
+
+Files changed: [spec v0.9]
+- `cmd/artoo/main.go` — `rl.Refresh()` after cost stats in `waitResult`
 - `internal/roles/planner/planner_test.go` — 3 new tests for layer-2 injection and layer-3 suppression

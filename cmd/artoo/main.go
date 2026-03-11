@@ -106,7 +106,7 @@ func main() {
 	logReg := tasklog.NewRegistry(filepath.Join(cacheDir, "tasks"))
 
 	// Logical roles
-	plan := planner.New(b, brainClient, logReg, mem)
+	plan := planner.New(b, brainClient, logReg, mem, outputFn)
 	mv := metaval.New(b, toolClient, outputFn, logReg)
 	gs := ggs.New(b, outputFn, mem, logReg) // R7 — Goal Gradient Solver; sole writer to R5
 	exec := executor.New(b, toolClient)
@@ -448,10 +448,10 @@ type sessionEntry struct {
 }
 
 func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-chan types.FinalResult, auditReportCh <-chan types.AuditReport, cancel context.CancelFunc, cacheDir string, disp *ui.Display, abortTaskCh chan<- string, logReg *tasklog.Registry, mem *memory.Store) {
-	fmt.Println("\033[1m\033[36m⚡ artoo\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.artoo/debug.log)\033[0m")
+	fmt.Println("\033[1m\033[36m🤖 artoo\033[0m — agentic shell  \033[2m(exit/Ctrl-D to quit | Ctrl+C aborts task | debug: ~/.artoo/debug.log)\033[0m")
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:            "\033[36m>\033[0m ",
+		Prompt:            "🧑 \033[36m>\033[0m ",
 		HistoryFile:       filepath.Join(cacheDir, "history"),
 		HistorySearchFold: true,
 		InterruptPrompt:   "^C",
@@ -623,7 +623,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 				}
 				lines = append(lines, r2.line)
 			}
-			rl.SetPrompt("\033[36m>\033[0m ")
+			rl.SetPrompt("🧑 \033[36m>\033[0m ")
 			if aborted || len(lines) == 0 {
 				fmt.Println("\033[2m(multi-line input cancelled)\033[0m")
 				continue
@@ -727,6 +727,9 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 				stats := logReg.GetStats(result.TaskID)
 				printDecisionLog(logReg.ReadEvents(result.TaskID))
 				printCostStats(perceiverUsage, stats)
+				// Re-render the readline prompt — the display spinner overwrote
+				// it during the task, and readline doesn't know it was erased.
+				rl.Refresh()
 				history = append(history, sessionEntry{Input: input, Summary: result.Summary})
 				if len(history) > maxHistory {
 					history = history[len(history)-maxHistory:]
@@ -794,7 +797,7 @@ func printResult(result types.FinalResult, rawInput string) {
 		dim   = "\033[2m"
 		reset = "\033[0m"
 	)
-	fmt.Printf("\n%s%s📋 Result%s\n", bold, green, reset)
+	fmt.Printf("\n%s%s🤖 Result%s\n", bold, green, reset)
 	if rawInput != "" {
 		fmt.Printf("%s  › %s%s\n", dim, ui.ClipQuestion(rawInput), reset)
 	}
