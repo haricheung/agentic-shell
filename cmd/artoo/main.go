@@ -183,7 +183,7 @@ func main() {
 			case <-ctx.Done():
 			}
 		}()
-		if err := runTask(ctx, b, toolClient, input, resultCh, logReg); err != nil {
+		if err := runTask(ctx, b, toolClient, input, resultCh, logReg, mem); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			cancel()
 			os.Exit(1)
@@ -412,7 +412,7 @@ func runSubtaskDispatcher(ctx context.Context, b *bus.Bus, exec *executor.Execut
 	}
 }
 
-func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input string, resultCh <-chan types.FinalResult, logReg *tasklog.Registry) error {
+func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input string, resultCh <-chan types.FinalResult, logReg *tasklog.Registry, mem types.MemoryService) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	clarifyFn := func(question string) (string, error) {
 		fmt.Printf("? %s\n> ", question)
@@ -422,7 +422,7 @@ func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input strin
 		return "", fmt.Errorf("no input")
 	}
 
-	p := perceiver.New(b, llmClient, clarifyFn)
+	p := perceiver.New(b, llmClient, clarifyFn, mem)
 	pr, err := p.Process(ctx, input, "")
 	if err != nil {
 		return fmt.Errorf("perceiver: %w", err)
@@ -798,7 +798,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 		}
 
 		disp.Resume() // lift post-abort suppression before the new pipeline starts
-		p := perceiver.New(b, llmClient, clarifyFn)
+		p := perceiver.New(b, llmClient, clarifyFn, mem)
 		pr, err := p.Process(taskCtx, input, buildSessionContext(history))
 		if err != nil {
 			taskMu.Lock()

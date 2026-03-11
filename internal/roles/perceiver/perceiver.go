@@ -18,10 +18,7 @@ const systemPrompt = `You are R1 — Perceiver. Translate raw user input into a 
 
 Output rules — choose ONE:
 
-If the input is a simple conversational query that needs NO tools (greetings, identity questions, chitchat, factual Q&A you can answer from general knowledge, simple math, translations):
-{"direct_response": "<your answer>"}
-
-If the task requires tools, file access, system commands, or multi-step execution:
+If the task is clear enough to act on:
 {"task_id":"<short_snake_case_id>","intent":"<one-sentence goal>","constraints":{"scope":null,"deadline":null},"raw_input":"..."}
 
 If genuinely ambiguous AND the answer would materially change the plan:
@@ -49,18 +46,106 @@ Session history rules:
 type Perceiver struct {
 	llm *llm.Client
 	b   *bus.Bus
+	mem types.MemoryService // may be nil; used by fast path to consult global:user memories
 	// clarify is a function called when R1 needs user input; returns user's answer
 	clarify func(question string) (string, error)
 }
 
 // New creates a Perceiver.
-func New(b *bus.Bus, llmClient *llm.Client, clarifyFn func(string) (string, error)) *Perceiver {
-	return &Perceiver{llm: llmClient, b: b, clarify: clarifyFn}
+func New(b *bus.Bus, llmClient *llm.Client, clarifyFn func(string) (string, error), mem types.MemoryService) *Perceiver {
+	return &Perceiver{llm: llmClient, b: b, clarify: clarifyFn, mem: mem}
 }
 
 // maxClarificationRounds caps how many times R1 may ask the user a clarifying question
 // before giving up and proceeding with its best interpretation.
 const maxClarificationRounds = 2
+
+// chatPrompt is a lightweight system prompt used for the fast-path direct response.
+// It answers simple conversational queries without the TaskSpec machinery.
+const chatPrompt = `You are Artoo — a helpful AI assistant. Answer the user's question directly and concisely. Use the user's language. No JSON, no structured output — just a natural conversational reply.`
+
+// isConversational returns true when the input is a simple conversational query
+// that needs no tools, file access, or multi-step execution. These inputs bypass
+// the full pipeline and get a direct LLM response.
+//
+// Expectations:
+//   - Returns true for common greetings (hi, hello, hey, 你好, etc.)
+//   - Returns true for identity questions (who are you, what are you, 你是谁)
+//   - Returns true for simple factual Q&A (what is X, explain Y, translate Z)
+//   - Returns false for inputs containing action verbs that need tools (find, search, open, play, etc.)
+//   - Returns false for inputs longer than 100 runes (likely complex tasks)
+//   - Returns false for empty input
+func isConversational(input string) bool {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return false
+	}
+
+	// Long inputs are likely complex tasks.
+	if len([]rune(s)) > 100 {
+		return false
+	}
+
+	lower := strings.ToLower(s)
+
+	// Action verbs that signal tool-needing tasks — reject fast path.
+	actionVerbs := []string{
+		"find", "search", "open", "play", "send", "create", "delete", "remove",
+		"list", "show me", "download", "install", "run", "execute", "check",
+		"查找", "搜索", "打开", "播放", "发送", "创建", "删除", "下载", "安装",
+		"运行", "执行", "查看", "列出", "显示",
+		"remind", "提醒", "schedule", "安排", "set alarm", "设置闹钟",
+	}
+	for _, v := range actionVerbs {
+		if strings.Contains(lower, v) {
+			return false
+		}
+	}
+
+	// Greetings — always fast path.
+	greetings := []string{
+		"hi", "hello", "hey", "yo", "sup", "howdy", "good morning", "good afternoon",
+		"good evening", "good night", "thanks", "thank you", "bye", "goodbye",
+		"你好", "嗨", "早上好", "晚上好", "下午好", "谢谢", "再见",
+	}
+	for _, g := range greetings {
+		if lower == g || strings.HasPrefix(lower, g+" ") || strings.HasPrefix(lower, g+"!") ||
+			strings.HasPrefix(lower, g+",") || strings.HasPrefix(lower, g+"，") {
+			return true
+		}
+	}
+
+	// Identity / about-me questions.
+	identityPatterns := []string{
+		"who are you", "what are you", "what's your name", "what is your name",
+		"introduce yourself", "tell me about yourself",
+		"你是谁", "你叫什么", "介绍一下你自己", "自我介绍",
+	}
+	for _, p := range identityPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+
+	// Short inputs (≤ 8 words / ≤ 15 runes for CJK) without action verbs are likely conversational.
+	words := strings.Fields(s)
+	runes := []rune(s)
+	if len(words) <= 8 && len(runes) <= 30 {
+		// Additional check: starts with a question word → conversational.
+		questionStarts := []string{
+			"what", "who", "why", "how", "when", "where", "is ", "are ", "do ", "does ",
+			"can ", "could ", "would ", "should ", "will ",
+			"什么", "谁", "为什么", "怎么", "什么时候", "哪里", "是不是", "能不能",
+		}
+		for _, qs := range questionStarts {
+			if strings.HasPrefix(lower, qs) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
 
 // ProcessResult holds the output of Perceiver.Process().
 type ProcessResult struct {
@@ -80,6 +165,33 @@ type ProcessResult struct {
 //   - Asks at most maxClarificationRounds clarifying questions before committing
 //   - Accumulates LLM usage across all rounds
 func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string) (ProcessResult, error) {
+	// Code-level fast path: detect simple conversational inputs before the LLM call
+	// and answer with a lightweight chat prompt (no TaskSpec parsing, no pipeline).
+	if isConversational(rawInput) {
+		slog.Info("[R1] fast path detected", "input", rawInput)
+
+		// Build the user prompt with memory + session context.
+		var parts []string
+
+		// Query global:user memories so the fast path knows identity, preferences, etc.
+		if p.mem != nil {
+			memories := p.queryGlobalMemories(ctx)
+			if memories != "" {
+				parts = append(parts, "Your stored memories (obey these):\n"+memories)
+			}
+		}
+		if sessionContext != "" {
+			parts = append(parts, "Recent session history:\n"+sessionContext)
+		}
+		parts = append(parts, rawInput)
+
+		raw, usage, err := p.llm.Chat(ctx, chatPrompt, strings.Join(parts, "\n\n"))
+		if err != nil {
+			return ProcessResult{Usage: usage}, fmt.Errorf("perceiver: fast path: %w", err)
+		}
+		return ProcessResult{DirectResponse: raw, Usage: usage}, nil
+	}
+
 	input := rawInput
 	var totalUsage llm.Usage
 	for round := 0; round < maxClarificationRounds; round++ {
@@ -90,11 +202,6 @@ func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string
 		totalUsage.ElapsedMs += usage.ElapsedMs
 		if err != nil {
 			return ProcessResult{Usage: totalUsage}, fmt.Errorf("perceiver: %w", err)
-		}
-
-		// Direct response — no pipeline needed.
-		if result.DirectResponse != "" {
-			return ProcessResult{DirectResponse: result.DirectResponse, Usage: totalUsage}, nil
 		}
 
 		if !needsClarification {
@@ -125,9 +232,6 @@ func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string
 	totalUsage.ElapsedMs += usage.ElapsedMs
 	if err != nil {
 		return ProcessResult{Usage: totalUsage}, fmt.Errorf("perceiver: %w", err)
-	}
-	if result.DirectResponse != "" {
-		return ProcessResult{DirectResponse: result.DirectResponse, Usage: totalUsage}, nil
 	}
 	taskID, err := p.publish(result.Spec)
 	return ProcessResult{TaskID: taskID, Usage: totalUsage}, err
@@ -164,15 +268,6 @@ func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) 
 
 	raw = llm.StripFences(raw)
 
-	// Check for direct response (fast path — no pipeline needed).
-	var directCheck struct {
-		DirectResponse string `json:"direct_response"`
-	}
-	if err := json.Unmarshal([]byte(raw), &directCheck); err == nil && directCheck.DirectResponse != "" {
-		slog.Info("[R1] direct response (fast path)", "length", len(directCheck.DirectResponse))
-		return perceiveResult{DirectResponse: directCheck.DirectResponse}, false, "", usage, nil
-	}
-
 	// Check for clarification request.
 	var clarCheck struct {
 		NeedsClarification bool   `json:"needs_clarification"`
@@ -193,4 +288,28 @@ func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) 
 	spec.RawInput = input
 
 	return perceiveResult{Spec: spec}, false, "", usage, nil
+}
+
+// queryGlobalMemories retrieves C-level SOPs and recent Megrams from the global:user
+// space and formats them as a text block for inclusion in the fast-path prompt.
+func (p *Perceiver) queryGlobalMemories(ctx context.Context) string {
+	if p.mem == nil {
+		return ""
+	}
+	var lines []string
+	sops, err := p.mem.QueryC(ctx, "global:user", "env:local")
+	if err == nil {
+		for _, s := range sops {
+			lines = append(lines, "- "+s.Content)
+		}
+	}
+	recent, err := p.mem.QueryRecent(ctx, "global:user", "env:local", 3)
+	if err == nil {
+		for _, m := range recent {
+			if m.Content != "" {
+				lines = append(lines, "- "+m.Content)
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
