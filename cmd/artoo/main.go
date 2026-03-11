@@ -633,16 +633,21 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 
 		// /memory — print a live summary of the MKCT pyramid without touching the pipeline.
 		if input == "/memory" {
+			rl.Clean()
 			printMemorySummary(mem.Summary())
+			rl.Refresh()
 			continue
 		}
 		if input == "/memory verbose" {
+			rl.Clean()
 			printMemorySummaryVerbose(mem.SummaryVerbose())
+			rl.Refresh()
 			continue
 		}
 
 		// /audit — request an on-demand audit report directly from R6, bypassing the pipeline.
 		if input == "/audit" {
+			rl.Clean()
 			b.Publish(types.Message{
 				ID:        uuid.New().String(),
 				Timestamp: time.Now().UTC(),
@@ -658,6 +663,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			case <-ctx.Done():
 				return
 			}
+			rl.Refresh()
 			continue
 		}
 
@@ -667,6 +673,10 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 		taskCancel = tCancel
 		currentTaskID = "" // will be set after Process() returns the ID
 		taskMu.Unlock()
+
+		// Clean the already-printed prompt before the pipeline starts.
+		// The readline goroutine printed it immediately after sending the input.
+		rl.Clean()
 
 		clarifyFn := func(question string) (string, error) {
 			// Print the question as plain output — NOT embedded in the readline prompt.

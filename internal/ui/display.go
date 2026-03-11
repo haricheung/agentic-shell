@@ -34,7 +34,7 @@ var roleEmoji = map[types.Role]string{
 	types.RoleMemory:    "💾",
 	types.RoleAuditor:   "📡",
 	types.RoleGGS:       "📈",
-	types.RoleUser:      "👤",
+	types.RoleUser:      "🧑",
 }
 
 var msgColor = map[types.MessageType]string{
@@ -258,7 +258,7 @@ func (d *Display) startTask() {
 	d.started = time.Now()
 	d.inTask = true
 	d.setStatus("initializing...")
-	fmt.Printf("\n%s┌─── ⚡ agsh pipeline %s%s\n", ansiDim, strings.Repeat("─", 40), ansiReset)
+	fmt.Printf("\n%s┌─── 🤖 artoo pipeline %s%s\n", ansiDim, strings.Repeat("─", 40), ansiReset)
 }
 
 func (d *Display) endTask(success bool) {
@@ -424,11 +424,15 @@ func msgDetail(msg types.Message) string {
 	case types.MsgFinalResult:
 		var fr types.FinalResult
 		if remarshal(msg.Payload, &fr) == nil {
-			detail := fmt.Sprintf("D=%.2f ∇L=%+.2f Ω=%.0f%%", fr.Loss.D, fr.GradL, fr.Loss.Omega*100)
-			if fr.Replans > 0 {
-				detail += fmt.Sprintf(" | %d replan(s)", fr.Replans)
+			// Only show GGS metrics when they're populated (non-zero).
+			// Planner abandon sends FinalResult with zero Loss/GradL.
+			if fr.Loss.D > 0 || fr.Loss.Omega > 0 || fr.GradL != 0 {
+				detail := fmt.Sprintf("D=%.2f ∇L=%+.2f Ω=%.0f%%", fr.Loss.D, fr.GradL, fr.Loss.Omega*100)
+				if fr.Replans > 0 {
+					detail += fmt.Sprintf(" | %d replan(s)", fr.Replans)
+				}
+				return detail
 			}
-			return detail
 		}
 	}
 	return ""
