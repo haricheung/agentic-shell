@@ -656,6 +656,56 @@ func (s *Store) deleteMegram(id, level string) {
 	_ = s.db.Write(batch, nil)
 }
 
+// DeleteByPrefix scans all Megrams and deletes those whose ID starts with the
+// given prefix. Returns the number of Megrams deleted. Used by /forget command.
+//
+// Expectations:
+//   - Returns 0 when no Megram ID starts with prefix
+//   - Deletes all index keys (m|, x|, l|, r|) for each matched Megram
+//   - Returns the count of deleted Megrams
+func (s *Store) DeleteByPrefix(prefix string) int {
+	deleted := 0
+	iter := s.db.NewIterator(util.BytesPrefix([]byte(prefixMegram)), nil)
+	for iter.Next() {
+		id := string(iter.Key())[len(prefixMegram):]
+		if strings.HasPrefix(id, prefix) {
+			var m types.Megram
+			if err := json.Unmarshal(iter.Value(), &m); err != nil {
+				continue
+			}
+			s.deleteMegram(id, m.Level)
+			deleted++
+		}
+	}
+	iter.Release()
+	return deleted
+}
+
+// DeleteAll removes every Megram and all associated index keys from LevelDB.
+// Returns the count of deleted Megrams. Used by /forget all.
+//
+// Expectations:
+//   - Deletes all m|, x|, l|, r| keys for every Megram
+//   - Returns the total number of Megrams deleted
+func (s *Store) DeleteAll() int {
+	deleted := 0
+	iter := s.db.NewIterator(util.BytesPrefix([]byte(prefixMegram)), nil)
+	var ids []string
+	for iter.Next() {
+		ids = append(ids, string(iter.Key())[len(prefixMegram):])
+	}
+	iter.Release()
+	for _, id := range ids {
+		m, err := s.fetchMegram(id)
+		if err != nil {
+			continue
+		}
+		s.deleteMegram(id, m.Level)
+		deleted++
+	}
+	return deleted
+}
+
 // fetchMegram retrieves a Megram by ID from LevelDB.
 func (s *Store) fetchMegram(id string) (types.Megram, error) {
 	data, err := s.db.Get([]byte(prefixMegram+id), nil)
@@ -884,6 +934,7 @@ func (s *Store) SummaryVerbose() types.MemorySummary {
 		g.Megrams = append(g.Megrams, types.MegRamRecord{
 			ID:        m.ID,
 			State:     m.State,
+			Content:   m.Content,
 			Sigma:     m.Sigma,
 			F:         m.F,
 			K:         m.K,

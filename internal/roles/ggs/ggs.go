@@ -158,6 +158,12 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		directive = "abandon"
 	}
 
+	// R4b safety net: honour "abandon" recommendation when replan budget exhausted.
+	if rr.Recommendation == "abandon" && directive != "abandon" && directive != "success" {
+		slog.Warn("[R7] R4b recommends abandon: overriding directive", "task", taskID, "directive", directive, "replanCount", replanCount)
+		directive = "abandon"
+	}
+
 	slog.Info("[R7] GGS compute", "task", taskID, "round", replanCount, "D", D, "P", P, "Omega", Omega, "L", L, "gradL", gradL, "gradient", gradient, "directive", directive)
 
 	// "success" macro-state: D ≤ δ, Ω < θ — close enough, deliver result without routing to R2.
@@ -167,6 +173,7 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		output := mergeMatchedOutputs(rr.Outcomes)
 
 		g.logReg.Get(taskID).GGSDecision(D, P, Omega, L, gradL, "success", "", replanCount)
+		g.logReg.Close(taskID, "success")
 
 		// Write terminal Megram to R5 (GGS is sole writer).
 		g.writeTerminalMegram(taskID, rr.Intent, buildTerminalContent(rr.Outcomes, "success", summary, rr.GapSummary), "success")
@@ -202,12 +209,13 @@ func (g *GGS) process(ctx context.Context, rr types.ReplanRequest) {
 		return
 	}
 
-	// "abandon" macro-state: Ω ≥ θ or Law 2 kill-switch.
+	// "abandon" macro-state: Ω ≥ θ, Law 2 kill-switch, or R4b safety-net recommendation.
 	if directive == "abandon" {
 		slog.Info("[R7] task ABANDON", "task", taskID, "Omega", Omega, "threshold", abandonOmega)
 		summary := buildAbandonSummary(rr)
 
 		g.logReg.Get(taskID).GGSDecision(D, P, Omega, L, gradL, "abandon", "", replanCount)
+		g.logReg.Close(taskID, "abandoned")
 
 		// Write terminal Megram to R5 (GGS is sole writer).
 		g.writeTerminalMegram(taskID, rr.Intent, buildTerminalContent(rr.Outcomes, "abandon", "", rr.GapSummary), "abandon")

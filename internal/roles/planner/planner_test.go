@@ -270,3 +270,34 @@ func TestMemTokenize_EmptyInput(t *testing.T) {
 		t.Errorf("expected nil for whitespace input, got %v", got)
 	}
 }
+
+// --- extractJSON ---
+
+func TestExtractJSON_AlreadyJSON(t *testing.T) {
+	// Returns s unchanged when s starts with '{' or '['
+	obj := `{"task_criteria":[],"subtasks":[]}`
+	if got := extractJSON(obj); got != obj {
+		t.Errorf("expected unchanged, got %q", got)
+	}
+	arr := `[{"subtask_id":"a"}]`
+	if got := extractJSON(arr); got != arr {
+		t.Errorf("expected unchanged, got %q", got)
+	}
+}
+
+func TestExtractJSON_SkipsProsePreamble(t *testing.T) {
+	// Skips prose preamble and returns the JSON substring
+	raw := "I need to determine what location.\n\n{\"task_criteria\":[],\"subtasks\":[]}"
+	got := extractJSON(raw)
+	if !strings.HasPrefix(got, "{") {
+		t.Errorf("expected JSON object, got %q", got)
+	}
+}
+
+func TestExtractJSON_NoJSON(t *testing.T) {
+	// Returns s unchanged when no '{' or '[' is found
+	raw := "just some prose with no JSON"
+	if got := extractJSON(raw); got != raw {
+		t.Errorf("expected unchanged, got %q", got)
+	}
+}

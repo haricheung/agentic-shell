@@ -285,6 +285,7 @@ func (p *Planner) queryMKCTConstraints(ctx context.Context, taskID string, tl *t
 	space := "intent:" + taskID
 	entity := "env:local"
 
+	// Task-specific query (existing behavior).
 	sops, err1 := p.mem.QueryC(ctx, space, entity)
 	pots, err2 := p.mem.QueryMK(ctx, space, entity)
 	recent, err3 := p.mem.QueryRecent(ctx, space, entity, 3)
@@ -297,6 +298,14 @@ func (p *Planner) queryMKCTConstraints(ctx context.Context, taskID string, tl *t
 	if err3 != nil {
 		slog.Warn("[R2] QueryRecent failed", "error", err3)
 	}
+
+	// Global space query — always check "global:user" for cross-cutting memories
+	// (persona, preferences, environment facts). These are recalled on EVERY task
+	// regardless of task_id. Injected via /remember or future MKCT v2 auto-promotion.
+	globalSOPs, _ := p.mem.QueryC(ctx, "global:user", entity)
+	globalRecent, _ := p.mem.QueryRecent(ctx, "global:user", entity, 3)
+	sops = append(sops, globalSOPs...)
+	recent = append(recent, globalRecent...)
 
 	constraints := calibrateMKCT(sops, pots, recent)
 	tl.MemoryQuery(space, entity, len(sops), pots.Action, pots.Attention, pots.Decision)
@@ -313,6 +322,27 @@ func (p *Planner) queryMKCTConstraints(ctx context.Context, taskID string, tl *t
 	if constraints != "" {
 		slog.Info("[R2] memory constraints", "constraints", constraints)
 	}
+
+	// Publish MemoryRecall to bus for pipeline display visibility.
+	p.b.Publish(types.Message{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now().UTC(),
+		From:      types.RolePlanner,
+		To:        types.RoleMemory,
+		Type:      types.MsgMemoryRecall,
+		Payload: types.MemoryRecall{
+			TaskID:      taskID,
+			Space:       space,
+			Entity:      entity,
+			SOPs:        len(sops),
+			Recent:      len(recent),
+			Attention:   pots.Attention,
+			Decision:    pots.Decision,
+			Action:      pots.Action,
+			Constraints: constraints,
+		},
+	})
+
 	return constraints
 }
 
@@ -553,7 +583,7 @@ func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string) error {
 	var subTasks []types.SubTask
 	var taskCriteria []string
 
-	trimmed := strings.TrimSpace(raw)
+	trimmed := extractJSON(strings.TrimSpace(raw))
 	if strings.HasPrefix(trimmed, "{") {
 		var wrapper struct {
 			TaskCriteria []string        `json:"task_criteria"`
@@ -619,6 +649,23 @@ func (p *Planner) emitSubTasks(spec types.TaskSpec, raw string) error {
 	}
 
 	return nil
+}
+
+// extractJSON finds the first top-level JSON object or array in s, skipping
+// any prose preamble the LLM may have emitted before the actual JSON.
+// Returns the original string unchanged if no JSON structure is found.
+//
+// Expectations:
+//   - Returns s unchanged when s starts with '{' or '['
+//   - Skips prose preamble and returns the JSON substring when '{' or '[' appears later
+//   - Returns s unchanged when no '{' or '[' is found
+func extractJSON(s string) string {
+	for i, c := range s {
+		if c == '{' || c == '[' {
+			return s[i:]
+		}
+	}
+	return s
 }
 
 func toTaskSpec(payload any) (types.TaskSpec, error) {

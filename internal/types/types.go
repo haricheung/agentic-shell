@@ -35,6 +35,7 @@ const (
 	MsgMemoryRead       MessageType = "MemoryRead"     // deprecated: Planner queries directly
 	MsgMemoryResponse   MessageType = "MemoryResponse" // deprecated: Planner queries directly
 	MsgMegram           MessageType = "Megram"         // R7 → R5 (bus-observable Megram write for Auditor)
+	MsgMemoryRecall     MessageType = "MemoryRecall"   // R2 → bus: memory query result for pipeline display
 	MsgFinalResult      MessageType = "FinalResult"
 	MsgAuditQuery       MessageType = "AuditQuery"     // User → R6: request an on-demand report
 	MsgAuditReport      MessageType = "AuditReport"    // R6 → User: generated report
@@ -357,6 +358,7 @@ type MemoryService interface {
 type MegRamRecord struct {
 	ID        string  `json:"id"`
 	State     string  `json:"state"`
+	Content   string  `json:"content,omitempty"` // populated in verbose mode
 	Sigma     float64 `json:"sigma"`
 	F         float64 `json:"f"`
 	K         float64 `json:"k"`
@@ -387,6 +389,20 @@ type MemorySummary struct {
 	LevelCounts map[string]int `json:"level_counts"`     // "M"→N, "K"→N, "C"→N, "T"→N
 	CLevel      []SOPRecord    `json:"c_level"`          // all promoted SOPs and constraints
 	Groups      []MegRamGroup  `json:"groups,omitempty"` // populated by SummaryVerbose() only
+}
+
+// MemoryRecall is the payload for MsgMemoryRecall published by R2 after querying MKCT.
+// Provides pipeline display visibility into what memory returned.
+type MemoryRecall struct {
+	TaskID      string  `json:"task_id"`
+	Space       string  `json:"space"`
+	Entity      string  `json:"entity"`
+	SOPs        int     `json:"sops"`         // C-level entries found
+	Recent      int     `json:"recent"`       // M/K recent entries found
+	Attention   float64 `json:"attention"`
+	Decision    float64 `json:"decision"`
+	Action      string  `json:"action"`       // Ignore | Exploit | Avoid | Caution
+	Constraints string  `json:"constraints"`  // the formatted constraint string injected into R2 prompt
 }
 
 // Ensure imports are used

@@ -312,41 +312,13 @@ func aggregateFailureClassFromOutcomes(outcomes []types.SubTaskOutcome) string {
 	}
 }
 
-// safetyNetLoss computes a LossBreakdown for the safety-net abandon path.
-// GGS is bypassed on this path so D is computed locally as failed/total.
-// The UI detects failure via FinalResult.Directive == "abandon" (v0.8).
-//
-// Expectations:
-//   - Returns D = 1.0 when outcomes slice is empty (failure is the invariant)
-//   - Returns D > 0 when at least one outcome is failed
-//   - Returns D = 1.0 when all outcomes are failed
-//   - Returns D = 0.5 when exactly half the outcomes are failed
-//   - Returns D = 1.0 (fallback) when all outcomes are matched but we still abandoned
-func safetyNetLoss(outcomes []types.SubTaskOutcome) types.LossBreakdown {
-	if len(outcomes) == 0 {
-		return types.LossBreakdown{D: 1.0}
-	}
-	failed := 0
-	for _, o := range outcomes {
-		if o.Status == "failed" {
-			failed++
-		}
-	}
-	d := float64(failed) / float64(len(outcomes))
-	if d == 0.0 {
-		// Safety net always represents failure; ensure D > 0 for UI detection.
-		d = 1.0
-	}
-	return types.LossBreakdown{D: d}
-}
-
 // triggerReplan handles the replan path for both the hard gate (code-enforced
-// failed subtask check) and the LLM-driven replan verdict. It writes a
-// procedural memory entry, publishes a ReplanRequest to R7 (GGS), and resets
-// the tracker. In v0.7 GGS owns gradient computation; R4b delivers raw outcome data.
+// failed subtask check) and the LLM-driven replan verdict. It publishes a
+// ReplanRequest to R7 (GGS), and resets the tracker. GGS owns gradient
+// computation and terminal state (abandon/success) handling.
 //
 // Expectations:
-//   - Abandons and publishes FinalResult when replanCount >= maxReplans (safety net)
+//   - Sends Recommendation="abandon" to GGS when replanCount >= maxReplans
 //   - Resets tracker.outcomes so the next round starts clean
 //   - Increments replanCounts before checking the limit
 //   - Sends ReplanRequest to R7 (GGS), not R2 (Planner)
@@ -365,52 +337,15 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 	tl := m.logReg.Get(taskID)
 	tl.Replan(gapSummary, replanCount)
 
-	// Safety net: hard-abandon after maxReplans regardless of GGS directive.
-	// GGS should have issued abandon before this point via Ω ≥ 0.8, but this
-	// prevents infinite looping if GGS is slow or unavailable.
+	// Always route through GGS so it computes proper loss (D, P, Ω, L, ∇L)
+	// and writes terminal Megrams. When replanCount >= maxReplans, signal
+	// "abandon" via Recommendation — GGS honours this and force-abandons
+	// after computing the full loss breakdown.
+	recommendation := "replan"
 	if replanCount >= maxReplans {
-		slog.Info("[R4b] task ABANDONED (safety net)", "task", taskID, "replan_rounds", replanCount)
-		m.logReg.Close(taskID, "abandoned")
-		// Build a human-readable reason from the last failure outcomes so the
-		// user sees WHY it failed, not just which subtask ID.
-		var reasons []string
-		for _, o := range outcomes {
-			if o.Status == "failed" && o.FailureReason != nil && *o.FailureReason != "" {
-				reasons = append(reasons, *o.FailureReason)
-			}
-		}
-		detail := gapSummary
-		if len(reasons) > 0 {
-			detail = strings.Join(reasons, "; ")
-		}
-		summary := fmt.Sprintf("❌ Task abandoned after %d failed attempts. %s", replanCount, detail)
-		m.b.Publish(types.Message{
-			ID:        uuid.New().String(),
-			Timestamp: time.Now().UTC(),
-			From:      types.RoleMetaVal,
-			To:        types.RoleUser,
-			Type:      types.MsgFinalResult,
-			Payload: types.FinalResult{
-				TaskID:    taskID,
-				Summary:   summary,
-				Loss:      safetyNetLoss(outcomes),
-				Replans:   replanCount,
-				Directive: "abandon",
-			},
-		})
-		if m.outputFn != nil {
-			m.outputFn(taskID, summary, nil)
-		}
-		m.mu.Lock()
-		delete(m.trackers, taskID)
-		delete(m.replanCounts, taskID)
-		delete(m.taskStart, taskID)
-		m.mu.Unlock()
-		return
+		recommendation = "abandon"
+		slog.Info("[R4b] recommending abandon to GGS", "task", taskID, "replan_rounds", replanCount)
 	}
-
-	// GGS is the sole writer to R5 — it writes the "abandon" / action-state Megrams.
-	// R4b no longer writes procedural MemoryEntry; gap information reaches R5 via GGS.
 
 	// Compute elapsed time for GGS Ω calculation.
 	var elapsedMs int64
@@ -426,7 +361,7 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 		CorrectionCount: totalCorrections,
 		ElapsedMs:       elapsedMs,
 		Outcomes:        outcomes,
-		Recommendation:  "replan",
+		Recommendation:  recommendation,
 	}
 	slog.Info("[R4b] sending ReplanRequest to GGS", "task", taskID, "round", replanCount, "gap", gapSummary, "elapsed_ms", elapsedMs)
 	m.b.Publish(types.Message{
@@ -439,7 +374,14 @@ func (m *MetaValidator) triggerReplan(ctx context.Context, tracker *manifestTrac
 	})
 
 	m.mu.Lock()
-	tracker.outcomes = nil
+	if recommendation == "abandon" {
+		// Terminal — GGS will handle FinalResult; clean up per-task state.
+		delete(m.trackers, taskID)
+		delete(m.replanCounts, taskID)
+		delete(m.taskStart, taskID)
+	} else {
+		tracker.outcomes = nil
+	}
 	m.mu.Unlock()
 }
 

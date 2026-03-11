@@ -1140,3 +1140,47 @@ func TestQueryRecent_SkipsCLevelAndConsolidated(t *testing.T) {
 		t.Errorf("expected 'valid megram', got: %s", results[0].Content)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DeleteByPrefix tests
+// ---------------------------------------------------------------------------
+
+func TestDeleteByPrefix_NoMatch(t *testing.T) {
+	// Returns 0 when no Megram ID starts with prefix
+	s := newTestStore(t)
+	defer s.Close()
+	s.persistMegram(types.Megram{
+		ID: "abc123", Level: "M", CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Space: "intent:test", Entity: "env:local", Content: "test",
+		State: "accept", F: 0.9, Sigma: 1.0, K: 0.05,
+	})
+	if got := s.DeleteByPrefix("zzz"); got != 0 {
+		t.Errorf("expected 0 deleted, got %d", got)
+	}
+}
+
+func TestDeleteByPrefix_DeletesMatched(t *testing.T) {
+	// Deletes Megrams whose ID starts with prefix and returns count
+	s := newTestStore(t)
+	defer s.Close()
+	s.persistMegram(types.Megram{
+		ID: "abc123", Level: "M", CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Space: "intent:test", Entity: "env:local", Content: "to delete",
+		State: "accept", F: 0.9, Sigma: 1.0, K: 0.05,
+	})
+	s.persistMegram(types.Megram{
+		ID: "def456", Level: "M", CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Space: "intent:test", Entity: "env:local", Content: "keep",
+		State: "accept", F: 0.9, Sigma: 1.0, K: 0.05,
+	})
+	if got := s.DeleteByPrefix("abc"); got != 1 {
+		t.Errorf("expected 1 deleted, got %d", got)
+	}
+	// Verify the deleted one is gone and the other remains
+	if _, err := s.fetchMegram("abc123"); err == nil {
+		t.Error("expected abc123 to be deleted")
+	}
+	if _, err := s.fetchMegram("def456"); err != nil {
+		t.Error("expected def456 to still exist")
+	}
+}

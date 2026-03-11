@@ -39,6 +39,7 @@ Temporal reference rules:
 Session history rules:
 - Use provided history to resolve ambiguous pronouns ("it", "that", "those files") and reactions ("wrong", "again", "bullshit") — always infer intent, never ask about these.
 - A negative reaction ("wrong", "no", "that's not right") means restate the previous intent with stricter success criteria or a different approach.
+- A task amendment or modifier ("用中文回答"/"answer in Chinese", "详细一点"/"more detail", "用表格展示"/"show as table", "shorter", "translate that to X") means REDO the previous task with the modifier applied. Combine the previous intent with the new constraint into a single intent.
 - Only ask for clarification when the task domain is genuinely unknown and guessing would produce useless work.`
 
 // Perceiver is R1. It translates user input into TaskSpec via the bus.

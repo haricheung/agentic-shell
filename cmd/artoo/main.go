@@ -631,6 +631,14 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			input = strings.Join(lines, "\n")
 		}
 
+		// /help — print available commands.
+		if input == "/help" {
+			rl.Clean()
+			printHelp()
+			rl.Refresh()
+			continue
+		}
+
 		// /memory — print a live summary of the MKCT pyramid without touching the pipeline.
 		if input == "/memory" {
 			rl.Clean()
@@ -641,6 +649,96 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 		if input == "/memory verbose" {
 			rl.Clean()
 			printMemorySummaryVerbose(mem.SummaryVerbose())
+			rl.Refresh()
+			continue
+		}
+
+		// /remember — inject a Megram into MKCT memory.
+		// Usage: /remember <content>                    — C-level at global:user (default)
+		//        /remember <level> <content>             — specified level at global:user
+		//        /remember <level> <space> <content>     — specified level + space
+		//   level: M (episodic), K (knowledge), C (timeless SOP), T (persona)
+		//   space: defaults to "global:user" (recalled on EVERY task)
+		//          use "intent:<id>" or "tool:<name>" for task/tool-specific memories
+		// Examples:
+		//   /remember My name is Artoo, a dedicated AI Assistant
+		//   /remember C Always respond in the user's preferred language
+		//   /remember M intent:weather mdfind works for CJK files
+		//   /remember T Always respond helpfully and honestly
+		if strings.HasPrefix(input, "/remember ") {
+			rl.Clean()
+			rest := strings.TrimPrefix(input, "/remember ")
+			parts := strings.SplitN(rest, " ", 3)
+
+			// Parse: is the first word a valid level?
+			level := "C"
+			space := "global:user"
+			content := rest
+			firstWord := strings.ToUpper(parts[0])
+			if (firstWord == "M" || firstWord == "K" || firstWord == "C" || firstWord == "T") && len(parts) >= 2 {
+				level = firstWord
+				// Is the second word a space tag (contains ":")?
+				if len(parts) >= 3 && strings.Contains(parts[1], ":") {
+					space = parts[1]
+					content = parts[2]
+				} else {
+					content = strings.SplitN(rest, " ", 2)[1]
+				}
+			}
+			// Level-specific quantization defaults.
+			var f, sigma, k float64
+			var state string
+			switch level {
+			case "T":
+				f, sigma, k, state = 1.0, +1.0, 0.0, "persona"
+			case "C":
+				f, sigma, k, state = 1.0, +1.0, 0.0, "user-injected"
+			case "K":
+				f, sigma, k, state = 0.90, +1.0, 0.05, "user-injected"
+			default: // M
+				f, sigma, k, state = 0.90, +1.0, 0.05, "user-injected"
+			}
+			meg := types.Megram{
+				ID:        uuid.New().String(),
+				Level:     level,
+				CreatedAt: time.Now().UTC().Format(time.RFC3339),
+				Space:     space,
+				Entity:    "env:local",
+				Content:   content,
+				State:     state,
+				F:         f,
+				Sigma:     sigma,
+				K:         k,
+			}
+			mem.Write(meg)
+			fmt.Printf("✓ Persisted %s-level Megram [%s / env:local]\n  %s\n", level, space, content)
+			rl.Refresh()
+			continue
+		}
+
+		// /forget — delete Megrams from memory.
+		// Usage: /forget <id-prefix>  — delete by ID prefix
+		//        /forget all          — delete ALL Megrams (full reset)
+		if strings.HasPrefix(input, "/forget") && (input == "/forget" || strings.HasPrefix(input, "/forget ")) {
+			rl.Clean()
+			arg := strings.TrimSpace(strings.TrimPrefix(input, "/forget"))
+			if arg == "" {
+				fmt.Println("Usage: /forget <id-prefix>  — delete by ID prefix")
+				fmt.Println("       /forget all          — delete ALL Megrams")
+				rl.Refresh()
+				continue
+			}
+			if arg == "all" {
+				deleted := mem.DeleteAll()
+				fmt.Printf("✓ Deleted all %d Megram(s) — memory reset\n", deleted)
+			} else {
+				deleted := mem.DeleteByPrefix(arg)
+				if deleted == 0 {
+					fmt.Printf("No Megram found matching prefix %q\n", arg)
+				} else {
+					fmt.Printf("✓ Deleted %d Megram(s) matching %q\n", deleted, arg)
+				}
+			}
 			rl.Refresh()
 			continue
 		}
@@ -788,7 +886,7 @@ func buildSessionContext(history []sessionEntry) string {
 	}
 	var sb strings.Builder
 	for i, e := range history {
-		fmt.Fprintf(&sb, "[%d] User: %s\n    Result: %s\n", i+1, e.Input, firstN(e.Summary, 120))
+		fmt.Fprintf(&sb, "[%d] User: %s\n    Result: %s\n", i+1, e.Input, firstN(e.Summary, 300))
 	}
 	return sb.String()
 }
@@ -1006,6 +1104,36 @@ func printDecisionLog(events []tasklog.Event) {
 	fmt.Println()
 }
 
+func printHelp() {
+	const (
+		b = "\033[1m"    // bold
+		c = "\033[36m"   // cyan
+		d = "\033[2m"    // dim
+		r = "\033[0m"    // reset
+	)
+	fmt.Println()
+	fmt.Println(b + c + "🤖 Artoo Commands" + r)
+	fmt.Println()
+	fmt.Println(b + "/help" + r + "                    Show this help message")
+	fmt.Println()
+	fmt.Println(b + c + "Memory" + r)
+	fmt.Println("  " + b + "/memory" + r + "                Show MKCT pyramid summary (level counts, C-level SOPs)")
+	fmt.Println("  " + b + "/memory verbose" + r + "        Show all Megrams with metadata and content")
+	fmt.Println("  " + b + "/remember" + r + " <content>    Inject a C-level memory at global:user (recalled on every task)")
+	fmt.Println("  " + b + "/remember" + r + " <level> ...  Inject at specific level (M/K/C/T), optionally with space tag")
+	fmt.Println("      " + d + "/remember My name is Artoo" + r + "                        → C, global:user")
+	fmt.Println("      " + d + "/remember T Always respond helpfully" + r + "               → T, global:user")
+	fmt.Println("      " + d + "/remember M intent:weather mdfind works for CJK" + r + "    → M, intent:weather")
+	fmt.Println("  " + b + "/forget" + r + " <id-prefix>    Delete Megram(s) by ID prefix (from /memory verbose)")
+	fmt.Println("  " + b + "/forget all" + r + "            Delete ALL Megrams (full memory reset)")
+	fmt.Println()
+	fmt.Println(b + c + "System" + r)
+	fmt.Println("  " + b + "/audit" + r + "                 Request an on-demand audit report from R6")
+	fmt.Println("  " + b + "Ctrl+C" + r + "                 Abort current task (REPL stays alive)")
+	fmt.Println("  " + b + "Ctrl+D" + r + "                 Exit REPL")
+	fmt.Println()
+}
+
 func printMemorySummary(s types.MemorySummary) {
 	const (
 		bold  = "\033[1m"
@@ -1124,6 +1252,13 @@ func printMemorySummaryVerbose(s types.MemorySummary) {
 				fmt.Printf("    %-18s  σ=%+.1f  f=%.2f  k=%.2f  att=%.2f  dec=%+.2f  %s%s%s\n",
 					r.State, r.Sigma, r.F, r.K, r.Attention, r.Decision,
 					dim, age, reset)
+				if r.Content != "" {
+					content := r.Content
+					if len(content) > 120 {
+						content = content[:120] + "…"
+					}
+					fmt.Printf("      %s%s%s\n", dim, content, reset)
+				}
 			}
 		}
 	}

@@ -47,6 +47,7 @@ var msgColor = map[types.MessageType]string{
 	types.MsgReplanRequest:    ansiRed,
 	types.MsgPlanDirective:    ansiYellow,
 	types.MsgOutcomeSummary:   ansiGreen,
+	types.MsgMemoryRecall:     ansiCyan,
 	types.MsgMemoryWrite:      ansiDim,
 	types.MsgMemoryRead:       ansiDim,
 	types.MsgMemoryResponse:   ansiDim,
@@ -63,6 +64,7 @@ var msgStatus = map[types.MessageType]string{
 	types.MsgReplanRequest:    "📈 computing gradient...",
 	types.MsgPlanDirective:    "📐 replanning with directive...",
 	types.MsgOutcomeSummary:   "📈 recording final loss...",
+	types.MsgMemoryRecall:     "📐 planning with memory...",
 	types.MsgMemoryWrite:      "💾 saving memory...",
 	types.MsgMemoryRead:       "💾 recalling...",
 	types.MsgMemoryResponse:   "📐 planning...",
@@ -374,6 +376,20 @@ func msgDetail(msg types.Message) string {
 		var c types.CorrectionSignal
 		if remarshal(msg.Payload, &c) == nil {
 			return fmt.Sprintf("attempt %d — %s", c.AttemptNumber, clip(c.WhatWasWrong, 40))
+		}
+	case types.MsgMemoryRecall:
+		var mr types.MemoryRecall
+		if remarshal(msg.Payload, &mr) == nil {
+			detail := fmt.Sprintf("[%s / %s]  sops=%d recent=%d  att=%.2f dec=%+.2f → %s",
+				mr.Space, mr.Entity, mr.SOPs, mr.Recent, mr.Attention, mr.Decision, mr.Action)
+			if mr.Constraints != "" {
+				// Show first constraint line as preview
+				lines := strings.SplitN(mr.Constraints, "\n", 3)
+				if len(lines) >= 2 {
+					detail += "  " + clip(strings.TrimSpace(lines[1]), 50)
+				}
+			}
+			return detail
 		}
 	case types.MsgDispatchManifest:
 		var m types.DispatchManifest

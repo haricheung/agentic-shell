@@ -2723,3 +2723,134 @@ Added `rl.Refresh()` call after `printCostStats()` in the `waitResult` loop. `Re
 Files changed: [spec v0.9]
 - `cmd/artoo/main.go` — `rl.Refresh()` after cost stats in `waitResult`
 - `internal/roles/planner/planner_test.go` — 3 new tests for layer-2 injection and layer-3 suppression
+
+---
+
+
+## Issue #101 — R1 cannot resolve task amendments ("用中文回答" after weather query)
+
+**Symptom**
+After a weather task returned results in English, user said "用中文回答" (answer in Chinese).
+R1 treated it as a standalone new task ("respond to the user's request using Chinese language")
+instead of redoing the previous weather task in Chinese. Output was a generic "OK I'll use
+Chinese now" with no weather content.
+
+**Root cause (shallow)**
+R1's session history rules only handle two follow-up types: pronoun resolution ("it", "that")
+and negative reactions ("wrong", "again"). Task amendments — modifiers that apply a constraint
+to the previous result — were unrecognised. Examples: "用中文回答" (language), "详细一点"
+(detail), "用表格展示" (format), "shorter", "translate that to X".
+
+**Root cause (deep)**
+R1 has no access to persistent memory. It relies entirely on a volatile in-memory 5-entry
+session history (`buildSessionContext`) that dies on restart. Even within a session, summaries
+are truncated to 300 chars. A human remembers yesterday's conversation; artoo cannot. This is
+an architectural gap: only R2 queries MKCT, but R1 is where conversational context resolution
+happens.
+
+**Fix (immediate, v0.9)**
+1. `internal/roles/perceiver/perceiver.go` — Added task amendment rule to session history
+   instructions. Guidance to combine previous intent + new constraint into a single intent.
+2. `cmd/artoo/main.go` — Increased session summary limit from 120 to 300 chars in
+   `buildSessionContext` so R1 sees more of the previous result.
+
+**Fix (structural, MKCT v2 — see `docs/mkct-v2-reflexion.md` §4)**
+Give R1 access to `MemoryService`. New `QueryRecentGlobal(n)` method returns the N most
+recent Megrams across all spaces (chronological, cross-session). R1 uses this as primary
+context, with volatile session history as supplementary detail. Combined with Reflexion-style
+Insight content (§1), R1 sees meaningful past task summaries, not tool traces. Resolves
+cross-session follow-ups like "用中文回答" referring to yesterday's weather query.
+
+---
+
+
+## Issue #102 — R2 parse failure when LLM emits prose preamble before JSON plan
+
+**Symptom**
+User said "pm2.5呢" (follow-up). R2 produced a valid plan but the LLM response started
+with prose: `"I need to determine what location and date were used in the previous weather
+query before fetching PM2.5 data."` followed by the JSON. Parser failed with
+`invalid character 'I' looking for beginning of value`.
+
+**Root cause**
+`emitSubTasks` expects the response to start with `{` or `[` after `StripFences`. But
+`StripFences` only handles markdown code fences and `<think>` blocks — not plain-text
+preamble. Some models (especially reasoning models like DeepSeek-R1) emit "thinking aloud"
+prose before the JSON output.
+
+**Fix** (`internal/roles/planner/planner.go`)
+Added `extractJSON()` helper that scans for the first `{` or `[` in the response and returns
+the substring from that point. Called in `emitSubTasks` before the prefix check. Falls back
+to the original string if no JSON delimiter is found.
+
+Files changed:
+- `internal/roles/planner/planner.go` — `extractJSON()` + call in `emitSubTasks`
+- `internal/roles/planner/planner_test.go` — 3 tests for extractJSON
+
+---
+
+
+## Issue #103 — `/memory verbose` does not show Megram content
+
+**Symptom**
+`/memory verbose` displayed metadata (state, σ, f, k, att, dec, age) for each Megram but
+NOT the `Content` field. Impossible to inspect what memories actually contain.
+
+**Root cause**
+`MegRamRecord` struct lacked a `Content` field. `SummaryVerbose()` populated records without
+content. `printMemorySummaryVerbose()` had no line to display it.
+
+**Fix**
+1. `internal/types/types.go` — Added `Content string` to `MegRamRecord`
+2. `internal/roles/memory/memory.go` — `SummaryVerbose()` populates `Content` from Megram
+3. `cmd/artoo/main.go` — `printMemorySummaryVerbose()` prints content (truncated to 120 chars)
+   as a dim line below each Megram's metadata row
+
+---
+
+
+## Issue #104 — Pipeline display does not show memory recall results
+
+**Symptom**
+The pipeline display shows R1→R2→SubTask→R3→R4a flow lines but nothing about memory queries.
+User cannot determine whether memory was consulted, what was found, or if it returned empty.
+Memory recall was only logged to `debug.log` via slog, invisible in the UI.
+
+**Root cause**
+R2 queries memory synchronously in `queryMKCTConstraints()` but never publishes the result
+to the bus. The display only renders bus messages, so memory queries are invisible.
+
+**Fix**
+1. `internal/types/types.go` — New `MsgMemoryRecall` message type + `MemoryRecall` payload
+   struct with space, entity, SOPs/recent counts, attention, decision, action, and constraints
+2. `internal/roles/planner/planner.go` — R2 publishes `MsgMemoryRecall` to bus after querying
+   MKCT, carrying the full query result
+3. `internal/ui/display.go` — Added color (cyan), spinner label, and `msgDetail` formatting
+   for `MsgMemoryRecall`. Flow line shows:
+   `R2 ──[MemoryRecall: [intent:foo / env:local]  sops=0 recent=1  att=0.90 dec=+0.90 → Exploit  ...]──► R5`
+
+
+## Issue #105 — Ω=0% on abandon + failure Megrams missing from memory
+
+**Symptom**
+1. FinalResult displays `D=0.33 ∇L=+0.00 Ω=0%` after 3 replans and 3m45s — Ω should be ~90%.
+2. `/memory verbose` shows no abandon/failure Megrams. Failures are not preserved in R5 for
+   future decision-making.
+
+**Root cause**
+MetaVal's safety net in `triggerReplan()` fires when `replanCount >= maxReplans (3)` and
+short-circuits GGS entirely. It publishes `FinalResult` directly with `safetyNetLoss()`,
+which only computes D (P, Ω, L all zero). GGS never receives the final `ReplanRequest`,
+so it never computes proper loss, never writes the terminal abandon Megram to R5, and never
+closes the task log.
+
+**Fix**
+1. `internal/roles/metaval/metaval.go` — Remove direct `FinalResult` publish from safety net.
+   Always send `ReplanRequest` to GGS. When `replanCount >= maxReplans`, set
+   `Recommendation: "abandon"` instead of `"replan"`. Clean up MetaVal per-task state
+   (trackers, replanCounts, taskStart) on the abandon recommendation path since GGS handles
+   the terminal state. Remove dead `safetyNetLoss()` function.
+2. `internal/roles/ggs/ggs.go` — Honour `Recommendation == "abandon"` by forcing abandon
+   directive (after computing full D, P, Ω, L, ∇L). Add `logReg.Close()` on both abandon
+   and success paths in `process()` so the task log is always flushed on terminal states.
+3. `internal/roles/metaval/metaval_test.go` — Remove 5 `safetyNetLoss` tests (dead code).
