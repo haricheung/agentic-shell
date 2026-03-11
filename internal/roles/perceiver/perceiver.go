@@ -18,7 +18,10 @@ const systemPrompt = `You are R1 — Perceiver. Translate raw user input into a 
 
 Output rules — choose ONE:
 
-If the task is clear enough to act on:
+If the input is a simple conversational query that needs NO tools (greetings, identity questions, chitchat, factual Q&A you can answer from general knowledge, simple math, translations):
+{"direct_response": "<your answer>"}
+
+If the task requires tools, file access, system commands, or multi-step execution:
 {"task_id":"<short_snake_case_id>","intent":"<one-sentence goal>","constraints":{"scope":null,"deadline":null},"raw_input":"..."}
 
 If genuinely ambiguous AND the answer would materially change the plan:
@@ -59,32 +62,50 @@ func New(b *bus.Bus, llmClient *llm.Client, clarifyFn func(string) (string, erro
 // before giving up and proceeding with its best interpretation.
 const maxClarificationRounds = 2
 
+// ProcessResult holds the output of Perceiver.Process().
+type ProcessResult struct {
+	TaskID         string    // non-empty when a TaskSpec was published to the pipeline
+	DirectResponse string    // non-empty when R1 answered directly (no pipeline needed)
+	Usage          llm.Usage // accumulated LLM usage across all rounds
+}
+
 // Process takes raw user input, possibly asks a clarifying question, and publishes a TaskSpec.
-// It returns the task ID and accumulated LLM usage so the caller can correlate the eventual
-// FinalResult and report per-role cost. sessionContext is a summary of recent REPL history;
-// pass "" for one-shot mode.
-func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string) (string, llm.Usage, error) {
+// When the input is a simple conversational query (greeting, identity question, factual Q&A),
+// R1 answers directly via ProcessResult.DirectResponse and the pipeline is skipped entirely.
+// sessionContext is a summary of recent REPL history; pass "" for one-shot mode.
+//
+// Expectations:
+//   - Returns DirectResponse for simple conversational queries that need no tools
+//   - Returns TaskID for actionable tasks that need the pipeline
+//   - Asks at most maxClarificationRounds clarifying questions before committing
+//   - Accumulates LLM usage across all rounds
+func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string) (ProcessResult, error) {
 	input := rawInput
 	var totalUsage llm.Usage
 	for round := 0; round < maxClarificationRounds; round++ {
-		spec, needsClarification, question, usage, err := p.perceive(ctx, input, sessionContext)
+		result, needsClarification, question, usage, err := p.perceive(ctx, input, sessionContext)
 		totalUsage.PromptTokens += usage.PromptTokens
 		totalUsage.CompletionTokens += usage.CompletionTokens
 		totalUsage.TotalTokens += usage.TotalTokens
 		totalUsage.ElapsedMs += usage.ElapsedMs
 		if err != nil {
-			return "", totalUsage, fmt.Errorf("perceiver: %w", err)
+			return ProcessResult{Usage: totalUsage}, fmt.Errorf("perceiver: %w", err)
+		}
+
+		// Direct response — no pipeline needed.
+		if result.DirectResponse != "" {
+			return ProcessResult{DirectResponse: result.DirectResponse, Usage: totalUsage}, nil
 		}
 
 		if !needsClarification {
-			taskID, err := p.publish(spec)
-			return taskID, totalUsage, err
+			taskID, err := p.publish(result.Spec)
+			return ProcessResult{TaskID: taskID, Usage: totalUsage}, err
 		}
 
 		// Ask user for clarification
 		answer, err := p.clarify(question)
 		if err != nil {
-			return "", totalUsage, fmt.Errorf("perceiver: clarification: %w", err)
+			return ProcessResult{Usage: totalUsage}, fmt.Errorf("perceiver: clarification: %w", err)
 		}
 		// Empty answer means "just do your best" — stop asking and proceed.
 		if strings.TrimSpace(answer) == "" {
@@ -97,16 +118,19 @@ func (p *Perceiver) Process(ctx context.Context, rawInput, sessionContext string
 
 	// Max rounds reached or user gave empty answer — one final call with instruction to commit.
 	finalInput := input + "\n\n[Instruction: proceed with the best interpretation; do not request further clarification.]"
-	spec, _, _, usage, err := p.perceive(ctx, finalInput, "")
+	result, _, _, usage, err := p.perceive(ctx, finalInput, "")
 	totalUsage.PromptTokens += usage.PromptTokens
 	totalUsage.CompletionTokens += usage.CompletionTokens
 	totalUsage.TotalTokens += usage.TotalTokens
 	totalUsage.ElapsedMs += usage.ElapsedMs
 	if err != nil {
-		return "", totalUsage, fmt.Errorf("perceiver: %w", err)
+		return ProcessResult{Usage: totalUsage}, fmt.Errorf("perceiver: %w", err)
 	}
-	taskID, err := p.publish(spec)
-	return taskID, totalUsage, err
+	if result.DirectResponse != "" {
+		return ProcessResult{DirectResponse: result.DirectResponse, Usage: totalUsage}, nil
+	}
+	taskID, err := p.publish(result.Spec)
+	return ProcessResult{TaskID: taskID, Usage: totalUsage}, err
 }
 
 func (p *Perceiver) publish(spec types.TaskSpec) (string, error) {
@@ -122,30 +146,45 @@ func (p *Perceiver) publish(spec types.TaskSpec) (string, error) {
 	return spec.TaskID, nil
 }
 
-func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) (types.TaskSpec, bool, string, llm.Usage, error) {
+// perceiveResult holds the parsed LLM output — exactly one of Spec or DirectResponse is set.
+type perceiveResult struct {
+	Spec           types.TaskSpec
+	DirectResponse string
+}
+
+func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) (perceiveResult, bool, string, llm.Usage, error) {
 	userPrompt := input
 	if sessionContext != "" {
 		userPrompt = "Recent session history:\n" + sessionContext + "\n\nNew input: " + input
 	}
 	raw, usage, err := p.llm.Chat(ctx, systemPrompt, userPrompt)
 	if err != nil {
-		return types.TaskSpec{}, false, "", usage, err
+		return perceiveResult{}, false, "", usage, err
 	}
 
 	raw = llm.StripFences(raw)
 
-	// Check for clarification request
+	// Check for direct response (fast path — no pipeline needed).
+	var directCheck struct {
+		DirectResponse string `json:"direct_response"`
+	}
+	if err := json.Unmarshal([]byte(raw), &directCheck); err == nil && directCheck.DirectResponse != "" {
+		slog.Info("[R1] direct response (fast path)", "length", len(directCheck.DirectResponse))
+		return perceiveResult{DirectResponse: directCheck.DirectResponse}, false, "", usage, nil
+	}
+
+	// Check for clarification request.
 	var clarCheck struct {
 		NeedsClarification bool   `json:"needs_clarification"`
 		Question           string `json:"question"`
 	}
 	if err := json.Unmarshal([]byte(raw), &clarCheck); err == nil && clarCheck.NeedsClarification {
-		return types.TaskSpec{}, true, clarCheck.Question, usage, nil
+		return perceiveResult{}, true, clarCheck.Question, usage, nil
 	}
 
 	var spec types.TaskSpec
 	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
-		return types.TaskSpec{}, false, "", usage, fmt.Errorf("parse TaskSpec: %w (raw: %s)", err, raw)
+		return perceiveResult{}, false, "", usage, fmt.Errorf("parse TaskSpec: %w (raw: %s)", err, raw)
 	}
 
 	if spec.TaskID == "" {
@@ -153,5 +192,5 @@ func (p *Perceiver) perceive(ctx context.Context, input, sessionContext string) 
 	}
 	spec.RawInput = input
 
-	return spec, false, "", usage, nil
+	return perceiveResult{Spec: spec}, false, "", usage, nil
 }

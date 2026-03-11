@@ -423,10 +423,18 @@ func runTask(ctx context.Context, b *bus.Bus, llmClient *llm.Client, input strin
 	}
 
 	p := perceiver.New(b, llmClient, clarifyFn)
-	_, perceiverUsage, err := p.Process(ctx, input, "")
+	pr, err := p.Process(ctx, input, "")
 	if err != nil {
 		return fmt.Errorf("perceiver: %w", err)
 	}
+
+	// Fast path — R1 answered directly, no pipeline needed.
+	if pr.DirectResponse != "" {
+		fmt.Println(pr.DirectResponse)
+		return nil
+	}
+
+	perceiverUsage := pr.Usage
 
 	// Wait for final result
 	select {
@@ -791,7 +799,7 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 
 		disp.Resume() // lift post-abort suppression before the new pipeline starts
 		p := perceiver.New(b, llmClient, clarifyFn)
-		taskID, perceiverUsage, err := p.Process(taskCtx, input, buildSessionContext(history))
+		pr, err := p.Process(taskCtx, input, buildSessionContext(history))
 		if err != nil {
 			taskMu.Lock()
 			taskCancel = nil
@@ -807,6 +815,25 @@ func runREPL(ctx context.Context, b *bus.Bus, llmClient *llm.Client, resultCh <-
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			continue
 		}
+
+		// Fast path — R1 answered directly, no pipeline needed.
+		if pr.DirectResponse != "" {
+			fmt.Println(pr.DirectResponse)
+			history = append(history, sessionEntry{Input: input, Summary: pr.DirectResponse})
+			if len(history) > maxHistory {
+				history = history[len(history)-maxHistory:]
+			}
+			taskMu.Lock()
+			taskCancel = nil
+			currentTaskID = ""
+			taskMu.Unlock()
+			tCancel()
+			rl.Refresh()
+			continue
+		}
+
+		taskID := pr.TaskID
+		perceiverUsage := pr.Usage
 		// Register task ID so the signal handler can send it to the dispatcher on abort.
 		taskMu.Lock()
 		currentTaskID = taskID

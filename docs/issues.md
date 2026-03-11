@@ -2854,3 +2854,25 @@ closes the task log.
    directive (after computing full D, P, Ω, L, ∇L). Add `logReg.Close()` on both abandon
    and success paths in `process()` so the task log is always flushed on terminal states.
 3. `internal/roles/metaval/metaval_test.go` — Remove 5 `safetyNetLoss` tests (dead code).
+
+
+## Issue #106 — Simple conversational queries go through full pipeline (36s for "who are you")
+
+**Symptom**
+"who are you" takes 36.7s and traverses R1→R2→R3→R4a→R4b→R7 — the full 7-role pipeline
+with subtask dispatch, executor tool chain, validator scoring, and GGS loss computation.
+Simple greetings, identity questions, and general knowledge Q&A should be instant.
+
+**Root cause**
+R1 (Perceiver) always emits a `TaskSpec`, which unconditionally enters the pipeline.
+There is no fast path for inputs that need no tools, no file access, and no multi-step execution.
+
+**Fix**
+1. `internal/roles/perceiver/perceiver.go` — Add `{"direct_response": "..."}` as a third
+   output option in R1's system prompt. When the LLM determines the input is simple
+   conversational (greetings, identity, chitchat, factual Q&A, math, translations), it
+   returns a direct response. `Process()` returns `ProcessResult` struct with either
+   `TaskID` (pipeline) or `DirectResponse` (fast path).
+2. `cmd/artoo/main.go` — Both one-shot and REPL callers check `pr.DirectResponse`; if set,
+   print it immediately and skip the pipeline entirely. REPL fast path also records the
+   response in session history for context continuity.
